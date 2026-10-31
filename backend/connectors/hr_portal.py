@@ -111,6 +111,8 @@ def push_employee(eid: str):
         if not iid:
             return
         e = q1("MATCH (e:Employee {id:$e}) RETURN e", e=eid)["e"]
+        if e.get("integration_id"):  # the integration creates this employee after HR approval
+            return
         mgr = q1("MATCH (m) WHERE (m:Owner OR m:Employee) AND toLower(m.email)=$m RETURN m.name AS n", m=e.get("manager_email", ""))
         first, _, last = e["name"].partition(" ")
         values = {"first_name": first, "last_name": last or first, "work_email": e["email"], "job_title": e["role"],

@@ -4,6 +4,7 @@ from datetime import date
 import re
 
 import llm
+import logging_setup as ls
 from graph import q, new_id, event
 
 
@@ -103,6 +104,7 @@ async def _stream(messages: list, fallback_contact: str, log_to: str | None, lab
     if not said:
         yield f"Sorry, I couldn't put an answer together just now. Please try rephrasing, or contact {fallback_contact}."
     event(log_to, "ai", f"{label} answered via {model} ({tokens or '?'} tokens)")
+    ls.log_event(ls.get("assistant"), "assistant.answered", assistant=label.replace(" ", "_"), model=model, tokens=tokens)
 
 
 def _convo(history: list[dict]) -> list[dict]:

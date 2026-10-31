@@ -4,9 +4,10 @@ import json
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
-from connectors import registry, sync
+from connectors import registry
 from connectors.candidates import CandidateImport
 from connectors.hr_portal import HrPortal
+import audit
 from graph import q, q1
 
 router = APIRouter(prefix="/api")
@@ -72,7 +73,9 @@ def add_attribute(cid: str, body: AttributeBody):
     if not isinstance(impl, HrPortal):
         raise HTTPException(400, f"{inst['name']} does not support custom fields")
     try:
-        return impl.add_field(cid, body.label, body.data_type, body.is_required).dict()
+        spec = impl.add_field(cid, body.label, body.data_type, body.is_required).dict()
+        audit.record_audit("connector.field_added", "connector", cid, f"Added custom field {spec['label']} to {inst['name']}")
+        return spec
     except KeyError as ex:
         raise HTTPException(409, ex.args[0])
     except ValueError as ex:
@@ -119,37 +122,6 @@ async def onboard_candidate(cid: str, rid: str, body: StartOnboarding):
          "location": body.location or v.get("location", ""), "joining_date": body.joining_date or v.get("joining_date", ""),
          "date_of_birth": v.get("date_of_birth", "")}
     return await create_joiner(f, body.template_id, body.send, f"started from {inst['name']}", candidate_record=rid)
-
-
-@router.get("/integrations/mapping")
-def integration_mapping(source: str, target: str):
-    (_, s_impl), (_, t_impl) = _conn(source), _conn(target)
-    s_schema, t_schema = s_impl.describe_schema(source), t_impl.describe_schema(target)
-    return {"source_schema": [f.dict() for f in s_schema], "target_schema": [f.dict() for f in t_schema],
-            "mapping": sync.suggest_mapping([f.key for f in s_schema], [f.key for f in t_schema])}
-
-
-class RunBody(BaseModel):
-    source_id: str
-    target_id: str
-    mapping: dict[str, str]
-    duplicate_policy: str = "update"
-    statuses: list[str] | None = None
-
-
-@router.post("/integrations/run")
-def integration_run(body: RunBody):
-    try:
-        return sync.run(body.source_id, body.target_id, body.mapping, body.duplicate_policy, body.statuses)
-    except LookupError as ex:
-        raise HTTPException(404, str(ex))
-    except ValueError as ex:
-        raise HTTPException(400, str(ex))
-
-
-@router.get("/integrations/runs")
-def integration_runs():
-    return sync.runs()
 
 
 @router.get("/employees/{eid}/links")

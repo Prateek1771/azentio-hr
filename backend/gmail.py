@@ -11,10 +11,12 @@ from googleapiclient.discovery import build
 from jinja2 import Environment
 from markupsafe import Markup
 
+import logging_setup as ls
 import pipeline
 from graph import q, q1, event
 
 LABEL = "azentio-processed"
+_log = ls.get("gmail")
 _env = Environment(autoescape=True)
 
 
@@ -42,6 +44,9 @@ def employee_ctx(emp: dict) -> dict:
 
 
 def _send_sync(to: str, subject: str, html: str, thread_id: str | None) -> dict:
+    redirect = os.getenv("EMAIL_REDIRECT_TO", "").strip()
+    if redirect and redirect.lower() != to.lower():  # demo mode: fake seed addresses go to one real inbox
+        subject, to = f"[to {to}] {subject}", redirect
     msg = MIMEText(html, "html", "utf-8")
     msg["To"], msg["Subject"] = to, subject
     if os.getenv("HR_MAILBOX"):
@@ -116,8 +121,11 @@ def _fetch_new(senders: list[str]) -> list[dict]:
 async def poll() -> int:
     """Process unread reply attachments. Matches by Gmail thread, falls back to sender address."""
     senders = sorted({r["m"] for r in q("MATCH (e:Employee) WHERE e.email <> '' RETURN toLower(e.email) AS m")})
+    if os.getenv("EMAIL_REDIRECT_TO"):
+        senders = sorted({*senders, os.environ["EMAIL_REDIRECT_TO"].strip().lower()})
     messages = await asyncio.to_thread(_fetch_new, senders)
     processed = 0
+    ls.log_event(_log, "gmail.poll", senders=len(senders), messages=len(messages))
     for m in messages:
         emp = q1("MATCH (e:Employee) WHERE e.thread_id=$t RETURN e", t=m["thread_id"]) or \
               q1("MATCH (e:Employee) WHERE toLower(e.email)=$f RETURN e", f=m["from"])

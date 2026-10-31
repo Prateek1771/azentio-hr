@@ -8,12 +8,14 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile  # noqa: E402
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import FileResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
+import audit  # noqa: E402
 import chat  # noqa: E402
+import logging_setup as ls  # noqa: E402
 import checklist  # noqa: E402
 import gmail  # noqa: E402
 import ingest  # noqa: E402
@@ -21,16 +23,49 @@ import pipeline  # noqa: E402
 from graph import q, q1, event  # noqa: E402
 
 
+ls.setup()
+_log = ls.get("api")
+
+
+async def _scheduler(interval: int = 30):
+    """Runs integrations whose schedule is due."""
+    from integrations.engine import run_due
+    while True:
+        try:
+            await run_due()
+        except Exception as e:
+            ls.log_event(_log, "scheduler.error", error=type(e).__name__)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app):
     await ingest.seed()
-    task = asyncio.create_task(gmail.poll_forever(60))
+    tasks = [asyncio.create_task(gmail.poll_forever(60)), asyncio.create_task(_scheduler())]
+    ls.log_event(_log, "startup", gmail=gmail.configured())
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
 
 
 app = FastAPI(title="Azentio HR Onboarding Agent", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def request_log(request: Request, call_next):
+    """One console line per API call; the request id ties together every line the call produces."""
+    token = ls.request_id.set(ls.new_request_id())
+    with ls.Timer() as t:
+        try:
+            response = await call_next(request)
+        except Exception:
+            ls.log_event(_log, "request", method=request.method, path=ls.safe_path(request.url.path), status=500, ms=t.ms)
+            _log.exception("request.error")
+            raise
+    ls.log_event(_log, "request", method=request.method, path=ls.safe_path(request.url.path), status=response.status_code, ms=t.ms)
+    ls.request_id.reset(token)
+    return response
 
 
 # ---------- helpers ----------
@@ -205,6 +240,7 @@ def patch_employee(eid: str, body: EmployeePatch):
     q("MATCH (e:Employee {id:$id}) SET e += $p", id=eid, p=changes)
     desc = ", ".join(f"{k.replace('_', ' ')} {e.get(k)} → {v}" for k, v in changes.items())
     event(eid, "change", f"Profile updated: {desc}")
+    audit.record_audit("employee.updated", "employee", eid, f"Changed {', '.join(changes)} for joiner {eid}")
     checklist.regenerate(eid, reason=desc)
     return employee_detail(eid)
 
@@ -254,6 +290,10 @@ async def set_item_status(item_id: str, body: ItemStatus):
         emp = get_emp(it["employee_id"])
         await gmail.send_correction(emp, it, [body.note or "Please re-submit a clearer, valid copy."])
     checklist.recompute(it["employee_id"])
+    audit.record_audit("checklist.item_status", "item", item_id, f"Set '{it['name']}' to {body.status}", metadata={"note": body.note} if body.note else None)
+    if it["kind"] == "document":
+        from integrations.engine import on_documents_changed
+        on_documents_changed(it["employee_id"])
     return employee_detail(it["employee_id"])
 
 
@@ -336,6 +376,7 @@ class Template(BaseModel):
 
 @app.put("/api/templates/{tid}")
 def save_template(tid: str, t: Template):
+    audit.record_audit("template.saved", "email_template", tid, f"Saved email template {t.name}")
     q("MERGE (x:EmailTemplate {id:$id}) SET x.name=$n, x.subject=$s, x.body=$b", id=tid, n=t.name, s=t.subject, b=t.body)
     return t
 
@@ -364,6 +405,7 @@ class Rule(BaseModel):
 
 @app.put("/api/rules/{rid}")
 def save_rule(rid: str, r: Rule):
+    audit.record_audit("rule.saved", "rule", rid, f"Saved requirement rule {rid}")
     existing = q1("MATCH (x:Rule {id:$id}) RETURN x.ord AS o", id=rid)
     nxt = q1("MATCH (x:Rule) RETURN coalesce(max(x.ord), 0) + 1 AS o")["o"]
     ingest.save_rule(r.model_dump(), ord_=existing["o"] if existing else nxt)
@@ -374,6 +416,7 @@ def save_rule(rid: str, r: Rule):
 
 @app.delete("/api/rules/{rid}")
 def delete_rule(rid: str):
+    audit.record_audit("rule.deleted", "rule", rid, f"Removed requirement rule {rid}")
     q("MATCH (r:Rule {id:$id}) DELETE r", id=rid)
     for e in q("MATCH (e:Employee) RETURN e.id AS id"):
         checklist.regenerate(e["id"], f"rule {rid} removed")
@@ -473,6 +516,7 @@ async def create_joiner(f: dict, template_id: str, send: bool, reason: str, cand
     if errors:
         raise HTTPException(400, {"message": "Please fix the highlighted fields", "errors": errors})
     eid = ingest.upsert_employee(valid[0], reason)
+    audit.record_audit("employee.created", "employee", eid, f"Started onboarding for joiner {eid} ({reason})")
     if candidate_record:
         q("MATCH (e:Employee {id:$e}), (r:Record {id:$r}) MERGE (e)-[:FROM_CANDIDATE]->(r)", e=eid, r=candidate_record)
     out = {"id": eid, "sent": False}
@@ -501,3 +545,7 @@ async def hr_chat(body: HrChatBody):
 import connector_routes  # noqa: E402
 
 app.include_router(connector_routes.router)
+
+import integration_routes  # noqa: E402
+
+app.include_router(integration_routes.router)

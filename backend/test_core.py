@@ -116,4 +116,126 @@ try:
 except KeyError:
     pass
 
+# ---- Integration workflow (pure rules) ----
+import asyncio  # noqa: E402
+from datetime import datetime as _dt, timezone as _tz  # noqa: E402
+from integrations.mapping import apply_mapping as wf_apply, transform  # noqa: E402
+from integrations.run_log import mask_record, snapshot_mapping, display_name  # noqa: E402
+from integrations import store as wf_store  # noqa: E402
+
+assert transform("  Ana Maria Lopez ", "first_word") == "Ana" and transform("Ana Maria Lopez", "after_first_word") == "Maria Lopez"
+assert transform(" X@Y.COM ", "lowercase") == " x@y.com " and transform(" a ", "trim") == "a"
+rules = [{"source_field": "email", "target_field": "work_email", "transform": "lowercase"},
+         {"source_field": None, "target_field": "employment_status", "default_value": "active"},
+         {"source_field": "designation", "target_field": "job_title", "default_value": "Engineer"}]
+assert wf_apply(rules, {"email": "A@B.COM", "designation": ""}) == {"work_email": "a@b.com", "employment_status": "active", "job_title": "Engineer"}
+snap = snapshot_mapping(rules, {"email": "a@b.com", "designation": "SE"}, {"work_email"}, set())
+assert next(e for e in snap if e["target_field"] == "work_email")["value"] is None  # excluded → never stored
+assert next(e for e in snap if e["target_field"] == "employment_status")["from_default"] is True
+assert snapshot_mapping(rules, {}, set(), {"mapping"}) == []
+rec = {"candidate_name": "Ana Lopez", "candidate_ref": "C-1", "actions": [{"section": "offers", "message": "Sent offer"},
+       {"section": "documents", "message": "Requested"}], "mapping": [{"target_field": "job_title", "source_field": "designation", "value": "SE"}]}
+masked = mask_record(rec, {"designation", "first_name"}, {"offers"})
+assert masked["candidate_name"] == "C-1" and [a["section"] for a in masked["actions"]] == ["documents"]  # older runs masked too
+assert masked["mapping"][0]["value"] is None and masked["mapping"][0]["excluded"]
+assert display_name("Ana Lopez", "C-1", set()) == "Ana Lopez"
+fixed = _dt(2026, 10, 31, 8, 0, tzinfo=_tz.utc)
+assert wf_store.next_run_time({"kind": "interval", "interval_minutes": 360}, fixed) == fixed.timestamp() + 6 * 3600
+assert _dt.fromtimestamp(wf_store.next_run_time({"kind": "daily", "time": "09:00", "timezone": "UTC"}, fixed), _tz.utc).hour == 9
+assert wf_store.next_run_time({"kind": "daily", "time": "07:00", "timezone": "UTC"}, fixed) > fixed.timestamp() + 20 * 3600  # tomorrow
+assert wf_store.next_run_time({"kind": "manual"}, fixed) is None
+
+# ---- Integration workflow (graph-backed, simulated delivery, no LLM) ----
+import os  # noqa: E402
+# Present-but-empty, so main's load_dotenv() can't refill them: tests never email anyone or call an LLM.
+for _k in ("GMAIL_REFRESH_TOKEN", "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "LLM_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "EMAIL_REDIRECT_TO"):
+    os.environ[_k] = ""
+import llm  # noqa: E402
+llm.API_KEY = ""  # rule-based agent only
+from integrations import chat as wf_chat, engine as wf_engine, service as wf_service  # noqa: E402
+import logging_setup as _ls  # noqa: E402
+_ls.setup()
+from integrations.store import SetupError  # noqa: E402
+
+gq("MATCH (n) WHERE n:Integration OR n:IntegrationCandidate OR n:WorkflowRun OR n:IntegrationLogRecord OR n:AgentMessage OR n:OutboundMessage DETACH DELETE n")
+gq("MERGE (c:Config {key:'locations'}) SET c.value=$v", v=json.dumps(cfg["locations"]))
+gq("MERGE (c:Config {key:'doc_types'}) SET c.value=$v", v=json.dumps(cfg["doc_types"]))
+gq("MERGE (c:Config {key:'roles'}) SET c.value=$v", v=json.dumps(cfg["roles"]))
+import ingest as _ingest  # noqa: E402
+if not gq1("MATCH (r:Rule) RETURN r LIMIT 1"):
+    _ingest.import_requirements("requirements.json", (Path(__file__).parent / "seed" / "requirements.json").read_bytes())
+if not gq1("MATCH (o:Owner {type:'manager'}) RETURN o LIMIT 1"):
+    _ingest.import_owners("owners.csv", (Path(__file__).parent / "seed" / "owners.csv").read_bytes())
+cp_id = gq1("MATCH (i:ConnectorInstance {key:'candidate_portal'}) RETURN i.id AS id")["id"]
+
+
+async def _wf():
+    it = wf_service.create("WF test", "", cp_id, hr_id)
+    assert wf_store.get(it["id"])["setup_step"] == "records"
+    try:
+        wf_service.create("wf TEST", "", cp_id, hr_id)
+        raise AssertionError("duplicate name must be refused")
+    except SetupError:
+        pass
+    # Human-only gate: the agent can't approve unless HR's own words ask for it
+    tools = wf_chat.Tools(it["id"], "map designation to job title", None)
+    assert (await tools.execute("approve_mapping", {}))["ok"] is False
+    assert (await tools.execute("run_now", {}))["ok"] is False
+    # Setup through the rule-based agent, exactly as HR would type it
+    for msg in ["Hired candidates in Engineering, update existing employees", "approve", "Notify HR Operations about failures",
+                "No, skip verification", "No offer letter", "Only when I run it"]:
+        await wf_chat.run_chat_turn(it["id"], msg, "UTC")
+    it = wf_store.get(it["id"])
+    assert it["source_filter"] == {"statuses": ["hired"], "departments": ["Engineering"]}, it["source_filter"]
+    assert it["mapping_approved_at"] and it["doc_verification_enabled"] is False and it["offer_enabled"] is False
+    assert it["setup_step"] == "review" and not wf_store.problems(it), (it["setup_step"], wf_store.problems(it))
+    await wf_chat.run_chat_turn(it["id"], "activate", "UTC")
+    assert wf_store.get(it["id"])["status"] == "active"
+    run = await wf_engine.run_integration(it["id"])
+    assert run["counts"]["enrolled"] == 1 and sum(run["counts"][k] for k in ("employee_created", "employee_updated", "employee_skipped")) == 1, run["counts"]
+    again = await wf_engine.run_integration(it["id"])
+    assert again["counts"]["enrolled"] == 0 and again["counts"]["advanced"] == 0  # repeat-safe
+    logs = gq("MATCH (l:IntegrationLogRecord {run_id:$r}) RETURN l", r=run["id"])
+    assert len(logs) == 1 and json.loads(logs[0]["l"]["mapping"])  # per-candidate log with mapping snapshot
+    # Changing an approved mapping pauses a live integration
+    wf_service.save_mapping(it["id"], [r for r in wf_store.get(it["id"])["mapping"] if r["target_field"] != "job_title"])
+    assert wf_store.get(it["id"])["status"] == "paused"
+
+    # Document verification ON: real document step (simulated delivery here), AI verdict callback, HR approval
+    it2 = wf_service.create("WF docs", "", cp_id, hr_id)
+    wf_service.save_records(it2["id"], ["offer_accepted"], ["Engineering"], "update")
+    wf_service.save_mapping(it2["id"], await wf_service.suggest_mapping(it2["id"]))
+    wf_service.approve_mapping(it2["id"])
+    wf_service.save_notifications(it2["id"], [], [], False, False, False)
+    wf_service.save_documents(it2["id"], True)
+    await wf_service.save_offer_choice(it2["id"], True)
+    wf_service.decide_offer(it2["id"], True)
+    wf_service.save_schedule(it2["id"], "manual")
+    wf_service.activate(it2["id"])
+    r1 = await wf_engine.run_integration(it2["id"])
+    items = wf_store.items(it2["id"])
+    asked = [i for i in items if i["stage"] == "documents_requested"]
+    assert asked and r1["counts"]["documents_requested"] == len(asked), (r1["counts"], [(i["name"], i["stage"], i.get("last_error")) for i in items])
+    first = asked[0]
+    for i in _cl.employee_items(first["joiner_id"]):
+        if i["kind"] == "document":
+            gq("MATCH (x:Item {id:$id}) SET x.status='Accepted'", id=i["id"])
+    assert wf_engine.on_documents_changed(first["joiner_id"]) == "applied"
+    assert wf_store.item(first["id"])["stage"] == "awaiting_hr_approval"
+    try:
+        wf_service.decide_candidate(it2["id"], first["id"], False, "")
+        raise AssertionError("rejecting needs a reason")
+    except SetupError:
+        pass
+    wf_service.decide_candidate(it2["id"], first["id"], True, None)
+    r2 = await wf_engine.run_integration(it2["id"])
+    assert wf_store.item(first["id"])["stage"] == "completed" and r2["counts"]["offer_sent"] >= 1 and r2["counts"]["approval_used"] >= 1
+    kinds = {m["kind"] for m in gq("MATCH (m:OutboundMessage {integration_id:$i}) RETURN m", i=it2["id"]) for m in [m["m"]]}
+    assert {"document_request", "offer_letter"} <= kinds
+
+
+import gmail as _gmail  # noqa: E402
+assert not _gmail.configured(), "tests must never use real Gmail"
+asyncio.run(_wf())
+
 print("all checks passed")

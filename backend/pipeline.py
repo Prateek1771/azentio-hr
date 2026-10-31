@@ -6,6 +6,7 @@ from pathlib import Path
 
 import checklist
 import extract
+import logging_setup as ls
 import validate
 from graph import q, q1, new_id, event
 
@@ -66,6 +67,8 @@ async def intake(eid: str, filename: str, data: bytes, mime: str | None, source:
       id=doc_id, s=result["status"], x=json.dumps(ex), iss=json.dumps(result["issues"]),
       c=float(ex.get("confidence") or 0), k=key)
     q("MATCH (e:Employee {id:$e}), (d:Document {id:$id}) CREATE (e)-[:SUBMITTED]->(d)", e=eid, id=doc_id)
+    ls.log_event(ls.get("documents"), "document.checked", doc=doc_id, employee=eid, source=source, status=result["status"],
+                 issues=len(result["issues"]), model=ex.get("_model"), tokens=ex.get("_tokens"))
     for m in result["mismatches"]:
         q("MATCH (e:Employee {id:$e}), (d:Document {id:$id}) CREATE (d)-[m:MISMATCH]->(e) SET m = $p", e=eid, id=doc_id, p=m)
 
@@ -84,4 +87,9 @@ async def intake(eid: str, filename: str, data: bytes, mime: str | None, source:
         except Exception as e:
             event(eid, "error", f"Could not send correction email: {e}")
     checklist.recompute(eid)
+    try:  # tell an integration waiting on this joiner's documents, like a document-service webhook
+        from integrations.engine import on_documents_changed
+        on_documents_changed(eid)
+    except Exception as e:
+        event(eid, "error", f"Integration update after document check failed: {e}")
     return {"document_id": doc_id, "item": label, **result, "extracted": ex}

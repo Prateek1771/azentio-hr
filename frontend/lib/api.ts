@@ -90,3 +90,60 @@ export interface IntegrationRun {
   mapping: Record<string, string>; counts: { created: number; updated: number; skipped: number; rejected: number };
   results: { record: string; outcome: string; reason?: string; target_id?: string }[];
 }
+
+// ---- Integration workflow ----
+export interface MappingRule {
+  source_field: string | null; target_field: string; transform: string; default_value: string | null;
+  confidence?: number | null; rationale?: string | null; origin?: "agent" | "hr";
+}
+export interface AgentMessage { id: string; role: "agent" | "user"; content: string; ts: number }
+export interface Schedule { kind: "manual" | "interval" | "daily"; interval_minutes: number | null; time: string | null; timezone: string }
+export interface IntegrationSummary {
+  id: string; name: string; description: string; status: "draft" | "active" | "paused"; setup_step: string;
+  schedule: Schedule; next_run_at: number | null; last_run_at: number | null; created: number;
+  source_id: string; target_id: string; source_name: string; target_name: string; candidates: number;
+}
+export interface IntegrationDetail extends IntegrationSummary {
+  source_filter: { statuses: string[]; departments: string[] }; duplicate_policy: "update" | "skip";
+  mapping: MappingRule[]; mapping_approved_at: number | null; notify_members: string[]; notify_emails: string[];
+  notify_on_created: boolean; notify_on_success: boolean; notify_on_failure: boolean;
+  doc_verification_enabled: boolean | null; offer_enabled: boolean | null; offer_template: string;
+  offer_template_status: "none" | "pending_approval" | "approved" | "rejected"; offer_placeholders: string[];
+  log_exclusions: { fields: string[]; sections: string[] }; source_fields: FieldSpec[]; target_fields: FieldSpec[];
+  recipients: { email: string; name: string }[]; quick_replies: string[]; connectors_locked: boolean; messages: AgentMessage[];
+  problems: string[]; agent_name: string; agent_is_simulated: boolean; delivery_is_simulated: boolean;
+  owners: { name: string; email: string }[]; departments: string[];
+}
+export interface WfCandidate {
+  id: string; record_id: string; name: string; email: string; stage: string; candidate_ref: string;
+  document_results: { name: string; status: "verified" | "rejected" | "missing"; reason: string | null }[];
+  rejection_reason?: string; last_error?: string; joiner_id?: string; employee_record_id?: string; updated: number;
+}
+export interface OutboundMessage {
+  id: string; kind: "document_request" | "offer_letter" | "notification"; to: string; subject: string; content: string;
+  attempt: number; delivered_by: "gmail" | "simulated"; candidate: string; ts: number;
+}
+export interface LogRun {
+  id: string; integration_id: string; integration_name: string; trigger: string; status: string; started: number; finished: number;
+  fetched_count: number; enrolled_count: number; advanced_count: number; waiting_count: number; failed_count: number;
+  employees_created_count: number; employees_updated_count: number; documents_requested_count: number | null;
+  documents_verified_count: number | null; approvals_pending_count: number | null; approvals_used_count: number | null;
+  offers_sent_count: number | null; excluded_fields: string[]; excluded_sections: string[];
+  failures: { candidate: string; message: string }[];
+}
+export interface LogRecord {
+  id: string; candidate_name: string; outcome: "advanced" | "waiting" | "failed"; stage_before: string; stage_after: string;
+  actions: { section: string; kind: string; message: string }[]; mapping_hidden: boolean; error: string;
+  mapping: { source_field: string | null; target_field: string; transform: string; from_default: boolean; excluded: boolean; value: string | null }[];
+}
+export interface AuditEntry { id: string; action: string; entity_type: string; entity_id: string; summary: string; actor: string; ts: number; metadata: Record<string, unknown> }
+
+export const describeSchedule = (s?: Schedule) => {
+  if (!s || s.kind === "manual") return "Run now only";
+  if (s.kind === "interval") {
+    const m = s.interval_minutes ?? 0;
+    return m === 60 ? "Every hour" : m % 60 === 0 ? `Every ${m / 60} hours` : `Every ${m} minutes`;
+  }
+  return `Daily at ${s.time} (${s.timezone})`;
+};
+export const fmtTs = (ts?: number | null) => ts ? new Date(ts * 1000).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—";

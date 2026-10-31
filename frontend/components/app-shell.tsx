@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
-import { Activity, ArrowLeftRight, FileStack, LayoutDashboard, ListChecks, Mail, Moon, Plug, Sparkles, Sun, Upload } from "lucide-react";
+import { Activity, ArrowLeftRight, CheckCheck, FileStack, LayoutDashboard, ListChecks, Mail, Moon, Plug, ScrollText, Sparkles, Sun, Upload } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api, type Stats } from "@/lib/api";
 import { HrAssistant } from "@/components/hr-assistant";
@@ -16,6 +16,8 @@ const NAV = [
   { href: "/rules", label: "Requirement rules", Icon: ListChecks },
   { href: "/connectors", label: "Connectors", Icon: Plug },
   { href: "/integrations", label: "Integrations", Icon: ArrowLeftRight },
+  { href: "/approvals", label: "Approvals", Icon: CheckCheck },
+  { href: "/logs", label: "Logs", Icon: ScrollText },
   { href: "/activity", label: "Activity", Icon: Activity },
 ];
 
