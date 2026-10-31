@@ -549,3 +549,7 @@ app.include_router(connector_routes.router)
 import integration_routes  # noqa: E402
 
 app.include_router(integration_routes.router)
+
+import quality_routes  # noqa: E402
+
+app.include_router(quality_routes.router)

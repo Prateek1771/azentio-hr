@@ -1,4 +1,6 @@
 """Self-checks for the pure logic: rule matching, blocking, validation, ingestion. Run: uv run python test_core.py"""
+import os
+os.environ["FALKORDB_GRAPH"] = "test"  # before anything imports graph: these checks wipe integrations, never touch the live graph
 import json
 from datetime import date
 from pathlib import Path
@@ -86,7 +88,8 @@ assert vals is None and any("email" in p for p in probs)
 vals, probs = normalise({"candidate_id": "C1", "first_name": "A", "last_name": "B", "email": "A@B.COM", "status": "hired", "education": "BSc; MSc"})
 assert not probs and vals["email"] == "a@b.com" and vals["education"] == ["BSc", "MSc"]
 
-from graph import q as gq, q1 as gq1, ensure_indexes  # noqa: E402
+from graph import q as gq, q1 as gq1, ensure_indexes, G as _G  # noqa: E402
+assert _G.name == "test", "test_core must run on the test graph"
 from connectors.seed import seed_connectors  # noqa: E402
 import checklist as _cl  # noqa: E402
 ensure_indexes()
@@ -157,6 +160,8 @@ import logging_setup as _ls  # noqa: E402
 _ls.setup()
 from integrations.store import SetupError  # noqa: E402
 
+gq("MATCH (e:Employee) WHERE e.integration_id IS NOT NULL OPTIONAL MATCH (e)-[:HAS_ITEM]->(i:Item) DETACH DELETE i, e")
+gq("MATCH (r:Record)-[:IN]->(:ConnectorInstance)-[:OF]->(:Connector {role:'app'}) DETACH DELETE r")
 gq("MATCH (n) WHERE n:Integration OR n:IntegrationCandidate OR n:WorkflowRun OR n:IntegrationLogRecord OR n:AgentMessage OR n:OutboundMessage DETACH DELETE n")
 gq("MERGE (c:Config {key:'locations'}) SET c.value=$v", v=json.dumps(cfg["locations"]))
 gq("MERGE (c:Config {key:'doc_types'}) SET c.value=$v", v=json.dumps(cfg["doc_types"]))
@@ -183,7 +188,7 @@ async def _wf():
     assert (await tools.execute("run_now", {}))["ok"] is False
     # Setup through the rule-based agent, exactly as HR would type it
     for msg in ["Hired candidates in Engineering, update existing employees", "approve", "Notify HR Operations about failures",
-                "No, skip verification", "No offer letter", "Only when I run it"]:
+                "No, skip verification", "No offer letter", "No app access", "Only when I run it"]:
         await wf_chat.run_chat_turn(it["id"], msg, "UTC")
     it = wf_store.get(it["id"])
     assert it["source_filter"] == {"statuses": ["hired"], "departments": ["Engineering"]}, it["source_filter"]
@@ -208,14 +213,31 @@ async def _wf():
     wf_service.approve_mapping(it2["id"])
     wf_service.save_notifications(it2["id"], [], [], False, False, False)
     wf_service.save_documents(it2["id"], True)
+    assert wf_store.get(it2["id"])["setup_step"] == "documents"  # still needs the per-role document set
+    wf_service.save_role_documents(it2["id"], "all roles", ["photo_id", "address_proof"])
+    wf_service.save_role_documents(it2["id"], "Software Engineer", ["photo_id"])
+    # Custom expression + unique company email in the mapping
+    rules = [r for r in wf_store.get(it2["id"])["mapping"] if r["target_field"] not in ("work_email", "job_title")]
+    rules += [{"target_field": "work_email", "transform": "unique_email", "expression": 'slug(first_name) + "." + slug(last_name)',
+               "email_domain": "azentio.example"},
+              {"target_field": "job_title", "transform": "expression", "expression": 'coalesce(designation, "Associate") + " (" + grade + ")"'}]
+    wf_service.save_mapping(it2["id"], rules)
+    wf_service.approve_mapping(it2["id"])
+    try:
+        wf_service.test_expression(it2["id"], "__import__('os')")
+        raise AssertionError("unsafe expression must be refused")
+    except SetupError:
+        pass
     await wf_service.save_offer_choice(it2["id"], True)
     wf_service.decide_offer(it2["id"], True)
+    assert wf_store.get(it2["id"])["setup_step"] == "access"
+    wf_service.save_access_rules(it2["id"], wf_service.suggested_access(wf_store.get(it2["id"])))
     wf_service.save_schedule(it2["id"], "manual")
     wf_service.activate(it2["id"])
     r1 = await wf_engine.run_integration(it2["id"])
     items = wf_store.items(it2["id"])
     asked = [i for i in items if i["stage"] == "documents_requested"]
-    assert asked and r1["counts"]["documents_requested"] == len(asked), (r1["counts"], [(i["name"], i["stage"], i.get("last_error")) for i in items])
+    assert asked and r1["counts"]["documents_requested"] == len(asked), (wf_store.get(it2["id"])["role_documents"], r1["counts"], [(i["name"], i["stage"], i.get("last_error")) for i in items])
     first = asked[0]
     for i in _cl.employee_items(first["joiner_id"]):
         if i["kind"] == "document":
@@ -232,10 +254,36 @@ async def _wf():
     assert wf_store.item(first["id"])["stage"] == "completed" and r2["counts"]["offer_sent"] >= 1 and r2["counts"]["approval_used"] >= 1
     kinds = {m["kind"] for m in gq("MATCH (m:OutboundMessage {integration_id:$i}) RETURN m", i=it2["id"]) for m in [m["m"]]}
     assert {"document_request", "offer_letter"} <= kinds
+    # Documents were limited to the role's set (Software Engineer -> photo ID only, others -> 2)
+    for i in wf_store.items(it2["id"]):
+        if i.get("joiner_id"):
+            docs = {x["key"] for x in _cl.employee_items(i["joiner_id"]) if x["kind"] == "document"}
+            assert docs <= {"photo_id", "address_proof"}, (i["name"], docs)
+    done = wf_store.item(first["id"])
+    email = json.loads(done["generated_values"])["work_email"]
+    assert email.endswith("@azentio.example"), email
+    apps_done = {(a["app"], a["action"]) for a in done["access"]}
+    assert ("Google Workspace", "create_account") in apps_done and ("ServiceNow", "create_ticket") in apps_done, apps_done
+    assert all(a["email"] == email for a in done["access"])  # accounts use the generated company email
+    assert r2["counts"]["access_granted"] >= 2
+    # Repeat run: same email, no duplicate grants
+    await wf_engine.run_integration(it2["id"])
+    assert json.loads(wf_store.item(first["id"])["generated_values"])["work_email"] == email
+    # HR asks the agent for one-off access for this candidate (rule-based agent, gated on HR's words)
+    first_name = done["name"].split()[0]
+    await wf_chat.run_chat_turn(it2["id"], f"Add {first_name} to #platform in Slack", "UTC")
+    assert any(a["resource"] == "#platform" for a in wf_store.item(first["id"])["access"]), wf_store.item(first["id"])["access"]
+    tools = wf_chat.Tools(it2["id"], "what's the schedule", None)
+    assert (await tools.execute("grant_access", {"candidate": first_name, "app": "Jira", "resource": "PAY"}))["ok"] is False
 
 
 import gmail as _gmail  # noqa: E402
 assert not _gmail.configured(), "tests must never use real Gmail"
 asyncio.run(_wf())
+
+# Langfuse export must never carry document scans
+import llm as _llm  # noqa: E402
+_masked = _llm._mask(data=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0K+/="}}]}])
+assert "base64" not in str(_masked) and "redacted" in str(_masked)
 
 print("all checks passed")

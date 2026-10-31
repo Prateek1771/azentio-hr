@@ -60,6 +60,9 @@ def build_items(emp: dict, rules: list[dict], doc_types: dict, locations: dict, 
             "owner_name": owner.get("name", ""),
             "owner_email": owner.get("email", ""),
         })
+    scope = set(emp.get("doc_scope") or [])
+    if scope:  # an integration asked this role for a limited document set
+        items = [i for i in items if i["kind"] != "document" or i["key"] in scope]
     keys = {i["key"] for i in items}
     for i in items:  # a dependency that doesn't apply to this employee is simply dropped
         i["depends"] = [d for d in i["depends"] if d in keys]

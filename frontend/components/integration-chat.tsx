@@ -3,9 +3,10 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { ArrowRight, Bot, Check, Pencil, Send } from "lucide-react";
+import { ArrowRight, Bot, Braces, Check, Mail, Pencil, Send } from "lucide-react";
 import { API, api, describeSchedule, type IntegrationDetail, type MappingRule } from "@/lib/api";
 import { StepBar } from "@/components/integration-bits";
+import { AccessCard, DocumentsCard, ExpressionEditor } from "@/components/integration-setup-cards";
 import { SimpleSelect } from "@/components/simple-select";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -28,6 +29,8 @@ export function IntegrationChat({ it, onChange }: { it: IntegrationDetail; onCha
   const [pending, setPending] = useState<string | null>(null);
   const [showMapping, setShowMapping] = useState(false);
   const [showOffer, setShowOffer] = useState(false);
+  const [showDocs, setShowDocs] = useState(false);
+  const [showAccess, setShowAccess] = useState(false);
   const end = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLInputElement>(null);
   useEffect(() => { end.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }); }, [it.messages.length, pending]);
@@ -47,6 +50,8 @@ export function IntegrationChat({ it, onChange }: { it: IntegrationDetail; onCha
 
   const mappingCard = (it.setup_step === "mapping" && it.mapping.length > 0 && !it.mapping_approved_at) || showMapping;
   const offerCard = (it.setup_step === "offer" && it.offer_enabled) || showOffer;
+  const docsCard = (it.setup_step === "documents" && !!it.doc_verification_enabled) || (showDocs && !!it.doc_verification_enabled);
+  const accessCard = it.setup_step === "access" || showAccess;
   const change = (prefix: string) => { setText(prefix); input.current?.focus(); };
 
   return (
@@ -68,7 +73,9 @@ export function IntegrationChat({ it, onChange }: { it: IntegrationDetail; onCha
           )}
           {mappingCard && <MappingCard it={it} onChange={onChange} />}
           {offerCard && <OfferCard it={it} onChange={onChange} />}
-          {it.setup_step === "documents" && (
+          {docsCard && <DocumentsCard it={it} onChange={onChange} />}
+          {accessCard && <AccessCard key={it.access_rules.length + String(it.access_saved)} it={it} onChange={onChange} />}
+          {it.setup_step === "documents" && !it.doc_verification_enabled && (
             <p className="rounded-lg border border-dashed px-3 py-2 text-xs text-muted-foreground">
               Documents come from your <Link href="/rules" className="font-medium text-primary underline">Requirement rules</Link>.
               Candidates get a Gmail request; each reply is checked by AI and the rules before it reaches you.
@@ -91,7 +98,8 @@ export function IntegrationChat({ it, onChange }: { it: IntegrationDetail; onCha
           </form>
         </div>
       </Card>
-      <SetupAside it={it} change={change} openMapping={() => setShowMapping(true)} openOffer={() => setShowOffer(true)} />
+      <SetupAside it={it} change={change} openMapping={() => setShowMapping(true)} openOffer={() => setShowOffer(true)}
+        openDocs={() => setShowDocs(true)} openAccess={() => setShowAccess(true)} />
     </div>
   );
 }
@@ -111,8 +119,11 @@ function Row({ label, value, done, onChange, onView }: { label: string; value: R
   );
 }
 
-function SetupAside({ it, change, openMapping, openOffer }: { it: IntegrationDetail; change: (s: string) => void; openMapping: () => void; openOffer: () => void }) {
-  const steps = ["records", "mapping", "notifications", "documents", "offer", "schedule", "review"];
+function SetupAside({ it, change, openMapping, openOffer, openDocs, openAccess }: {
+  it: IntegrationDetail; change: (s: string) => void; openMapping: () => void; openOffer: () => void; openDocs: () => void; openAccess: () => void;
+}) {
+  const steps = ["records", "mapping", "notifications", "documents", "offer", "access", "schedule", "review"];
+  const roleDocs = Object.entries(it.role_documents);
   const at = steps.indexOf(it.setup_step);
   const notif = [...it.recipients.map((r) => r.name), ...it.notify_emails];
   const events = [it.notify_on_created && "created", it.notify_on_success && "success", it.notify_on_failure && "failure"].filter(Boolean).join(", ");
@@ -133,15 +144,19 @@ function SetupAside({ it, change, openMapping, openOffer }: { it: IntegrationDet
           value={it.mapping.length ? `${it.mapping.length} fields, ${it.mapping_approved_at ? "approved" : "not approved"}` : null} />
         <Row label="Notifications" done={at > 2} onChange={() => change("Notify ")}
           value={at > 2 ? (notif.length ? `${notif.join(", ")} (${events || "no events"})` : "Nobody") : null} />
-        <Row label="Document verification" done={it.doc_verification_enabled !== null} onChange={() => change("Document verification ")}
-          value={it.doc_verification_enabled === null ? null : it.doc_verification_enabled ? "Yes — Gmail request + AI checks" : "No"} />
+        <Row label="Document verification" done={it.doc_verification_enabled === false || roleDocs.length > 0} onChange={() => change("Document verification ")}
+          onView={it.doc_verification_enabled ? openDocs : undefined}
+          value={it.doc_verification_enabled === null ? null : !it.doc_verification_enabled ? "No"
+            : roleDocs.length ? roleDocs.map(([r, d]) => `${r === "*" ? "Other roles" : r}: ${d.length} docs`).join("; ") : "Yes — which documents per role?"} />
         <Row label="Offer letter" done={it.offer_enabled === false || it.offer_template_status === "approved"} onChange={() => change("Offer letter ")}
           onView={it.offer_enabled ? openOffer : undefined}
           value={it.offer_enabled === null ? null : it.offer_enabled ? `Yes, format ${it.offer_template_status === "approved" ? "approved" : "not approved"}` : "No"} />
-        <Row label="Schedule" done={at > 5} onChange={() => change("Change the schedule to ")} value={at > 5 ? describeSchedule(it.schedule) : null} />
+        <Row label="App access" done={it.access_saved} onChange={() => change("Give new joiners ")} onView={openAccess}
+          value={it.access_saved ? (it.access_rules.length ? `${it.access_rules.length} item(s): ${[...new Set(it.access_rules.map((r) => r.app))].join(", ")}` : "None") : null} />
+        <Row label="Schedule" done={at > 6} onChange={() => change("Change the schedule to ")} value={at > 6 ? describeSchedule(it.schedule) : null} />
         <Row label="Integration log" done onChange={() => change("Exclude ")} value={excluded.length ? `Leaving out: ${excluded.join(", ")}` : "Records everything"} />
       </div>
-      {it.status !== "active" && at >= 5 && it.problems.length > 0 && (
+      {it.status !== "active" && at >= 6 && it.problems.length > 0 && (
         <p className="rounded-md bg-amber-50 px-2.5 py-2 text-xs text-amber-800 dark:bg-amber-500/10 dark:text-amber-300">{it.problems[0]}</p>
       )}
       {it.delivery_is_simulated && (
@@ -153,18 +168,21 @@ function SetupAside({ it, change, openMapping, openOffer }: { it: IntegrationDet
 
 function MappingCard({ it, onChange }: { it: IntegrationDetail; onChange: (d: IntegrationDetail) => void }) {
   const [open, setOpen] = useState<string | null>(null);
+  const [editing, setEditing] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ candidate: string; values: Record<string, unknown>; error: string | null }[] | null>(null);
   const [busy, setBusy] = useState(false);
   const label = (fields: { key: string; label: string }[], k: string | null) => fields.find((f) => f.key === k)?.label ?? k;
   const byTarget = Object.fromEntries(it.mapping.map((r) => [r.target_field, r]));
-  const rows = it.target_fields.filter((f) => f.required || byTarget[f.key]);
+  const rows = it.target_fields.filter((f) => f.required || byTarget[f.key] || open === f.key);
   const unmapped = it.target_fields.filter((f) => !f.required && !byTarget[f.key]);
   const missing = it.target_fields.filter((f) => f.required && !f.generated && !byTarget[f.key]);
 
   const save = async (target: string, patch: Partial<MappingRule>) => {
     const cur = byTarget[target] ?? { target_field: target, source_field: null, default_value: null, transform: "none" };
     const next = { ...cur, ...patch, origin: "hr" as const, confidence: null, rationale: null };
-    const rules = [...it.mapping.filter((r) => r.target_field !== target), ...(next.source_field || next.default_value ? [next] : [])];
+    if (patch.source_field && !patch.transform && (cur.transform === "expression" || cur.transform === "unique_email")) next.transform = "none";
+    const keep = next.source_field || next.default_value || ((next.transform === "expression" || next.transform === "unique_email") && next.expression);
+    const rules = [...it.mapping.filter((r) => r.target_field !== target), ...(keep ? [next] : [])];
     try { onChange(await call(`/api/integrations/${it.id}/mapping`, "PUT", { rules })); } catch (e) { toast.error((e as Error).message); }
   };
   const approve = async () => {
@@ -189,7 +207,9 @@ function MappingCard({ it, onChange }: { it: IntegrationDetail; onChange: (d: In
             <div key={f.key}>
               <button onClick={() => setOpen(open === f.key ? null : f.key)} className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-muted/40">
                 <span className="min-w-0 flex-1 truncate">
-                  {r?.source_field ? label(it.source_fields, r.source_field) : r?.default_value ? <i>Always “{r.default_value}”</i>
+                  {r?.transform === "unique_email" ? <span className="inline-flex items-center gap-1 text-primary"><Mail className="size-3.5" /> Unique email @{r.email_domain}</span>
+                    : r?.transform === "expression" ? <code className="inline-flex items-center gap-1 font-mono text-xs text-primary"><Braces className="size-3.5" />{r.expression}</code>
+                    : r?.source_field ? label(it.source_fields, r.source_field) : r?.default_value ? <i>Always “{r.default_value}”</i>
                     : f.generated ? <span className="text-muted-foreground">Generated automatically</span> : <span className="text-amber-600">Needs a value</span>}
                 </span>
                 <ArrowRight className="size-3.5 shrink-0 text-muted-foreground" />
@@ -200,13 +220,25 @@ function MappingCard({ it, onChange }: { it: IntegrationDetail; onChange: (d: In
                   </span>
                 ) : <Pencil className="size-3.5 text-muted-foreground" />}
               </button>
-              {open === f.key && (
+              {open === f.key && (editing === f.key ? (
+                <div className="bg-muted/30 px-3 py-2">
+                  <ExpressionEditor it={it} rule={r} target={f.label} onCancel={() => setEditing(null)}
+                    onSave={(patch) => { save(f.key, patch); setEditing(null); }} />
+                </div>
+              ) : (
                 <div className="grid gap-2 bg-muted/30 px-3 py-2 sm:grid-cols-2">
-                  <SimpleSelect value={r?.source_field ?? ""} onChange={(v) => save(f.key, { source_field: v || null })} placeholder="No source" className="w-full"
+                  <SimpleSelect value={r?.transform === "expression" || r?.transform === "unique_email" ? "" : r?.source_field ?? ""}
+                    onChange={(v) => save(f.key, { source_field: v || null })} placeholder="No source" className="w-full"
                     options={it.source_fields.map((s) => ({ value: s.key, label: s.label }))} />
                   <Input defaultValue={r?.default_value ?? ""} placeholder="Default value" onBlur={(e) => e.target.value !== (r?.default_value ?? "") && save(f.key, { default_value: e.target.value || null })} />
+                  <div className="flex flex-wrap gap-2 sm:col-span-2">
+                    <Button size="sm" variant="outline" onClick={() => setEditing(f.key)}><Braces className="size-3.5" /> {r?.transform === "expression" || r?.transform === "unique_email" ? "Edit custom rule" : "Custom expression or email rule"}</Button>
+                    {(r?.transform === "expression" || r?.transform === "unique_email") && (
+                      <Button size="sm" variant="ghost" onClick={() => save(f.key, { transform: "none", expression: null, email_domain: null })}>Remove custom rule</Button>
+                    )}
+                  </div>
                 </div>
-              )}
+              ))}
             </div>
           );
         })}

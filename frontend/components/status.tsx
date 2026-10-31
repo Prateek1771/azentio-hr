@@ -82,12 +82,21 @@ export function SegmentBar({ s }: { s: { completed: number; pending: number; blo
   );
 }
 
-export function RoleBadge({ role, className }: { role: "source" | "target"; className?: string }) {
+export function RoleBadge({ role, className }: { role: "source" | "target" | "app"; className?: string }) {
+  const cls = { source: ["bg-source-soft text-source", "bg-source", "Source"], target: ["bg-target-soft text-target", "bg-target", "Target"],
+    app: ["bg-violet-50 text-violet-700 dark:bg-violet-500/10 dark:text-violet-300", "bg-violet-500", "App"] }[role];
   return (
-    <span className={cn("inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium",
-      role === "source" ? "bg-source-soft text-source" : "bg-target-soft text-target", className)}>
-      <span className={cn("size-1.5 rounded-full", role === "source" ? "bg-source" : "bg-target")} />
-      {role === "source" ? "Source" : "Target"}
+    <span className={cn("inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium", cls[0], className)}>
+      <span className={cn("size-1.5 rounded-full", cls[1])} />
+      {cls[2]}
     </span>
   );
+}
+
+export function ConnectionBadge({ status }: { status?: "not_configured" | "untested" | "connected" }) {
+  if (!status) return null;
+  const [label, cls] = { connected: ["Connected", "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300"],
+    untested: ["Not tested", "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300"],
+    not_configured: ["Not configured", "bg-muted text-muted-foreground"] }[status];
+  return <span className={cn("rounded-full px-2 py-0.5 text-[11px] font-medium", cls)}>{label}</span>;
 }

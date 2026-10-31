@@ -14,7 +14,7 @@ from connectors import registry
 from connectors.candidates import CANDIDATE_FIELDS
 from .run_log import LOG_SECTIONS
 
-STEPS = ("records", "mapping", "notifications", "documents", "offer", "schedule", "review")
+STEPS = ("records", "mapping", "notifications", "documents", "offer", "access", "schedule", "review")
 CANDIDATE_STATUSES = ("applied", "interviewing", "offer_accepted", "hired", "rejected")
 STAGES = ("pending", "documents_requested", "documents_rejected", "awaiting_hr_approval", "hr_rejected",
           "approved", "offer_sent", "completed", "skipped")
@@ -28,6 +28,11 @@ QUESTIONS = {
     "notifications": "Who should get a notification about this integration's runs, and for which events?",
     "documents": "Should candidates go through document verification? If yes, I email each candidate the documents their role needs through Gmail, "
                  "check every reply with AI and the requirement rules, and you approve the result before anything else happens.",
+    "documents_roles": "Which role are these candidates joining as? I'll ask each role only for the documents the Requirement rules need "
+                       "for it, and you can trim the list.",
+    "access": "Which apps should new joiners get once their employee record exists? I can create Slack, Jira and Google Workspace "
+              "accounts, add them to channels or projects (or ask the channel or project admin), and raise ServiceNow requests. "
+              "My suggestion follows your Requirement rules.",
     "offer": "Should an offer letter be sent once a candidate is approved?",
     "schedule": "When should this integration run? You can also start it with Run now at any time.",
     "review": "Everything is configured. Review it and activate the integration when you're ready.",
@@ -42,7 +47,14 @@ DEFAULT_CONFIG = {
     "schedule": {"kind": "manual", "interval_minutes": None, "time": None, "timezone": "UTC"},
     "last_run_at": None, "activated_at": None, "records_saved": False, "notifications_saved": False, "schedule_saved": False,
     "log_exclusions": {"fields": [], "sections": []},
+    "role_documents": {}, "access_rules": [], "access_saved": False,
 }
+
+
+def question(it: dict) -> str:
+    if it["setup_step"] == "documents" and it["doc_verification_enabled"]:
+        return QUESTIONS["documents_roles"]
+    return QUESTIONS[it["setup_step"]]
 
 
 class SetupError(Exception):
@@ -113,10 +125,12 @@ def current_step(it: dict) -> str:
         return "mapping"
     if not it["notifications_saved"]:
         return "notifications"
-    if it["doc_verification_enabled"] is None:
+    if it["doc_verification_enabled"] is None or (it["doc_verification_enabled"] and not it["role_documents"]):
         return "documents"
     if it["offer_enabled"] is None or (it["offer_enabled"] and it["offer_template_status"] != "approved"):
         return "offer"
+    if not it["access_saved"]:
+        return "access"
     if not it["schedule_saved"]:
         return "schedule"
     return "review"
@@ -133,6 +147,8 @@ def problems(it: dict) -> list[str]:
         out.append("Approve the field mapping.")
     if it["doc_verification_enabled"] is None:
         out.append("Choose whether to use document verification.")
+    elif it["doc_verification_enabled"] and not it["role_documents"]:
+        out.append("Choose which documents each role needs.")
     if it["offer_enabled"] is None:
         out.append("Choose whether to send an offer letter.")
     elif it["offer_enabled"] and it["offer_template_status"] != "approved":
@@ -160,11 +176,15 @@ def quick_replies(it: dict) -> list[str]:
         return (["Approve"] if not missing_required(it) else []) + ["Suggest again"]
     if step == "offer" and it["offer_enabled"]:
         return ["Approve", "Write it again", "No offer letter"]
+    if step == "documents" and it["doc_verification_enabled"]:
+        from .service import roles  # roles come from the source records and the rules
+        return [*roles(it)[:4], "All roles"]
     return {
         "records": ["Yes, accepted offers in all departments", "Only Engineering candidates", "Hired candidates, leave existing employees unchanged"],
         "notifications": ["Notify HR Operations about everything", "Notify only about failures"],
         "documents": ["Yes, verify documents", "No, skip verification"],
         "offer": ["Yes, send an offer letter", "No offer letter"],
+        "access": ["Use the suggested access", "No app access"],
         "schedule": ["Every 6 hours", "Daily at 9am", "Only when I run it"],
         "review": ["Activate"],
     }.get(step, [])
@@ -219,7 +239,7 @@ def item_for_joiner(eid: str) -> dict | None:
 
 
 def _item(c: dict) -> dict:
-    return {**c, "document_results": json.loads(c.get("document_results") or "[]")}
+    return {**c, "document_results": json.loads(c.get("document_results") or "[]"), "access": json.loads(c.get("access_results") or "[]")}
 
 
 def set_item(item_id: str, **values) -> None:

@@ -3,7 +3,7 @@
 Exclusions apply twice: excluded values are never written, and reading applies the current exclusions
 too, so excluding a field also hides what older runs recorded. The audit log is never affected.
 """
-LOG_SECTIONS = ("mapping", "documents", "approvals", "offers")
+LOG_SECTIONS = ("mapping", "documents", "approvals", "offers", "access")
 _NAME_FIELDS = {"first_name", "last_name"}
 _MAX_VALUE = 500
 
@@ -13,19 +13,35 @@ def exclusions_of(integration: dict) -> tuple[set[str], set[str]]:
     return set(ex.get("fields") or []), set(ex.get("sections") or [])
 
 
-def snapshot_mapping(rules: list[dict], source: dict, excluded_fields: set[str], excluded_sections: set[str]) -> list[dict]:
-    """How each attribute was filled for one candidate, minus anything HR excluded."""
+def snapshot_mapping(rules: list[dict], source: dict, excluded_fields: set[str], excluded_sections: set[str],
+                     generated: dict | None = None) -> list[dict]:
+    """How each attribute was filled for one candidate, minus anything HR excluded.
+
+    Expression rows show what the expression produced; unique-email rows show the address this candidate
+    was given (empty until the employee step generates it)."""
+    from .expr import ExpressionError, evaluate
     if "mapping" in excluded_sections:
         return []
     out = []
     for rule in sorted(rules, key=lambda r: r["target_field"]):
         src = rule.get("source_field")
-        raw = source.get(src) if src else None
+        kind = rule.get("transform", "none")
+        if kind == "expression":
+            try:
+                raw = evaluate(rule.get("expression") or "", source) if source else None
+            except ExpressionError as e:
+                raw = f"(error: {e})"
+            src = f"= {rule.get('expression')}"
+        elif kind == "unique_email":
+            raw = (generated or {}).get(rule["target_field"])
+            src = f"unique email @{rule.get('email_domain')}"
+        else:
+            raw = source.get(src) if src else None
         from_default = raw in (None, "", [])
         value = rule.get("default_value") if from_default else raw
         if isinstance(value, list):
             value = ", ".join(map(str, value))
-        hidden = rule["target_field"] in excluded_fields or (src in excluded_fields if src else False)
+        hidden = rule["target_field"] in excluded_fields or (rule.get("source_field") in excluded_fields if rule.get("source_field") else False)
         out.append({"source_field": src, "target_field": rule["target_field"], "transform": rule.get("transform", "none"),
                     "from_default": from_default, "excluded": hidden,
                     "value": None if hidden or value in (None, "") else str(value)[:_MAX_VALUE]})

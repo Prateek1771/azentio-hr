@@ -1,5 +1,6 @@
 """Connector key → implementation. Every key in the catalog needs an entry here."""
 from graph import q1
+from .apps import APPS
 from .base import Connector
 from .candidates import CandidateImport, CandidatePortal
 from .hr_portal import HrPortal
@@ -8,6 +9,7 @@ _REGISTRY: dict[str, type[Connector]] = {
     CandidatePortal.key: CandidatePortal,
     CandidateImport.key: CandidateImport,
     HrPortal.key: HrPortal,
+    **APPS,
 }
 
 

@@ -4,5 +4,8 @@ services:
     image: falkordb/falkordb:latest
     ports: ["6379:6379", "3001:3000"]
     volumes: ["falkor-data:/var/lib/falkordb/data"]
+    # Append-only log on top of snapshots: every write (integrations, runs, audit) survives a restart within ~1s.
+    environment:
+      REDIS_ARGS: "--appendonly yes --appendfsync everysec"
 volumes:
   falkor-data:

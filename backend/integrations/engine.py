@@ -94,8 +94,17 @@ async def _ensure_joiner(it: dict, item: dict, cand: dict) -> str:
         raise CandidateNotReady("Can't request documents yet: " + "; ".join(f"{e['field']} — {e['message']}" for e in errs or [{"field": "candidate", "message": str(ex.detail)}]))
     eid = out["id"]
     q("MATCH (e:Employee {id:$e}) SET e.integration_id=$i", e=eid, i=it["id"])
+    scope = _documents_for(it, f["role"])
+    if scope:  # ask this role only for the documents HR chose for it
+        q("MATCH (e:Employee {id:$e}) SET e.doc_scope=$s", e=eid, s=list(scope))
+        checklist.regenerate(eid, f"document set for {f['role'] or 'this role'} chosen in integration {it['name']}")
     store.set_item(item["id"], joiner_id=eid)
     return eid
+
+
+def _documents_for(it: dict, role: str) -> list[str] | None:
+    from .service import documents_for
+    return documents_for(it, role)
 
 
 async def _request_documents(it: dict, item: dict) -> str:
@@ -171,7 +180,13 @@ def _create_employee(it: dict, item: dict) -> tuple[str, str]:
     if not tgt:
         raise RecordRejected("The target connector no longer exists.")
     _, target = tgt
-    values = apply_mapping(it["mapping"], cand)
+    from .service import target_email_lookup
+    generated = json.loads(item.get("generated_values") or "{}")
+    values = apply_mapping(it["mapping"], cand, email_taken=target_email_lookup(it), generated=generated)
+    minted = {r["target_field"]: values[r["target_field"]] for r in it["mapping"]
+              if r.get("transform") == "unique_email" and r["target_field"] in values}
+    if minted != generated:
+        store.set_item(item["id"], generated_values=json.dumps(minted))
     check_required(it["mapping"], target.describe_schema(it["target_id"]), values)
     rid, outcome = target.upsert_record(it["target_id"], values, it["duplicate_policy"])
     store.set_item(item["id"], stage="completed", employee_record_id=rid)
@@ -221,9 +236,54 @@ async def _advance(it: dict, item_id: str) -> list[dict]:
             case "offer_sent":
                 message, outcome = _create_employee(it, item)
                 did("employee", f"employee_{outcome}", message)
+                for r in _provision_access(it, store.item(item_id)):
+                    did("access", {"requested": "access_requested", "failed": "access_failed"}.get(r["status"], "access_granted"),
+                        f"{r['app']}: {r['message']}" + (" (already done)" if r.get("repeat") else ""))
             case _:
                 return actions
     return actions
+
+
+# ---------- app access (Slack, Jira, ServiceNow, Google Workspace) ----------
+
+def _access_email(it: dict, item: dict, cand: dict) -> str:
+    """The joiner's company email once the employee step generated one, else their own address."""
+    generated = json.loads(item.get("generated_values") or "{}")
+    return generated.get("work_email") or next(iter(generated.values()), "") or cand.get("email", "")
+
+
+def perform_access(it: dict, item: dict, rule: dict, actor: str) -> dict:
+    """Run one access action for one candidate and remember it on the candidate. Repeat-safe."""
+    found = registry.get(rule["app_id"])
+    if not found:
+        raise RecordRejected(f"The {rule.get('app', 'app')} connector no longer exists.")
+    cand = _candidate(it, item)
+    email = _access_email(it, item, cand)
+    name = f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip()
+    res = found[1].perform(rule["app_id"], rule["action"], name, email, rule.get("resource", ""), rule.get("mode", "direct"),
+                           requested_by=actor)
+    res["app"] = rule.get("app") or found[0]["name"]
+    fresh = store.item(item["id"])  # earlier grants in this same pass are already saved
+    results = [r for r in json.loads(fresh.get("access_results") or "[]") if r.get("id") != res["id"]]
+    results.append({k: res.get(k) for k in ("id", "app", "action", "resource", "mode", "status", "reference", "message", "email")})
+    store.set_item(item["id"], access_results=json.dumps(results))
+    if item.get("joiner_id"):
+        event(item["joiner_id"], "access", f"{res['app']}: {res['message']}")
+    ls.log_event(log, "access.performed", item=item["id"], app=res["app"], action=rule["action"], status=res["status"])
+    return res
+
+
+def _provision_access(it: dict, item: dict) -> list[dict]:
+    from .service import access_rule_applies
+    cand = _candidate(it, item)
+    done = []
+    for rule in it.get("access_rules") or []:
+        if access_rule_applies(rule, cand):
+            try:
+                done.append(perform_access(it, item, rule, f"Integration {it['name']}"))
+            except RecordRejected as exc:  # one app failing mustn't undo the employee; HR can grant it by hand
+                done.append({"app": rule.get("app", ""), "status": "failed", "message": str(exc)})
+    return done
 
 
 # ---------- runs ----------
@@ -305,7 +365,6 @@ async def run_integration(iid: str, trigger: str = "manual", actor: str = "HR") 
                 source_values = _candidate(it, item)
             except RecordRejected:
                 source_values = {}
-            mapping = snapshot_mapping(it["mapping"], source_values, ex_fields, ex_sections)
             error, actions = None, []
             try:
                 actions = await _advance(it, item["id"])
@@ -317,7 +376,9 @@ async def run_integration(iid: str, trigger: str = "manual", actor: str = "HR") 
             if error:
                 store.set_item(item["id"], last_error=error)
                 details.append({"candidate": name, "outcome": "failed", "message": error})
-            stage = store.item(item["id"])["stage"]
+            after = store.item(item["id"])
+            stage = after["stage"]
+            mapping = snapshot_mapping(it["mapping"], source_values, ex_fields, ex_sections, json.loads(after.get("generated_values") or "{}"))
             outcome = "failed" if error else "advanced" if actions else "waiting"
             counts[outcome] += 1
             counts.update(a["kind"] for a in actions)
@@ -350,7 +411,7 @@ async def run_integration(iid: str, trigger: str = "manual", actor: str = "HR") 
 async def _finish(it: dict, run_id: str, status: str, counts: Counter, details: list[dict]) -> dict:
     c = {k: counts[k] for k in ("enrolled", "advanced", "waiting", "failed", "fetched", "documents_requested", "documents_verified",
                                  "documents_rejected", "approvals_pending", "approval_used", "offer_sent", "employee_created",
-                                 "employee_updated", "employee_skipped")}
+                                 "employee_updated", "employee_skipped", "access_granted", "access_requested")}
     now = time.time()
     q("MATCH (r:WorkflowRun {id:$id}) SET r.status=$s, r.counts=$c, r.details=$d, r.finished=$f",
       id=run_id, s=status, c=json.dumps(c), d=json.dumps(details), f=now)

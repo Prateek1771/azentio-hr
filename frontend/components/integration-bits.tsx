@@ -34,7 +34,7 @@ export function IntegrationStatus({ status }: { status: string }) {
   return <span className={cn("inline-flex rounded-full px-2 py-0.5 text-xs font-medium capitalize", STATUS[status])}>{status}</span>;
 }
 
-const STEPS = ["records", "mapping", "notifications", "documents", "offer", "schedule", "review"];
+const STEPS = ["records", "mapping", "notifications", "documents", "offer", "access", "schedule", "review"];
 export function StepBar({ step, className }: { step: string; className?: string }) {
   const at = STEPS.indexOf(step);
   return (

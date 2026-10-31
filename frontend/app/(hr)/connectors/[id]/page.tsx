@@ -4,9 +4,9 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { ArrowLeft, ChevronLeft, ChevronRight, ExternalLink, FileSpreadsheet, Plus, Rocket, Search, UploadCloud } from "lucide-react";
-import { API, api, fmtDate, timeAgo, type ConnRecord, type Connector, type FieldSpec, type Template } from "@/lib/api";
-import { RoleBadge } from "@/components/status";
+import { ArrowLeft, CheckCircle2, ChevronLeft, ChevronRight, ExternalLink, FileSpreadsheet, KeyRound, Loader2, Plug, Plus, Rocket, Search, UploadCloud } from "lucide-react";
+import { API, api, fmtDate, fmtTs, timeAgo, type ConnRecord, type ConnectionSettings, type Connector, type FieldSpec, type Template } from "@/lib/api";
+import { ConnectionBadge, RoleBadge } from "@/components/status";
 import { SimpleSelect } from "@/components/simple-select";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -22,10 +22,13 @@ const PAGE = 20;
 const COLUMNS: Record<string, string[]> = {
   candidate: ["candidate_id", "first_name", "last_name", "email", "designation", "location", "joining_date", "status"],
   employee: ["employee_number", "first_name", "last_name", "work_email", "job_title", "department_name", "start_date", "employment_status"],
+  activity: ["action", "person", "email", "resource", "mode", "status", "reference", "message"],
 };
 const STATUS_CLS: Record<string, string> = {
   hired: "bg-emerald-50 text-emerald-700", offer_accepted: "bg-sky-50 text-sky-700", interviewing: "bg-violet-50 text-violet-700",
   applied: "bg-zinc-100 text-zinc-700", rejected: "bg-rose-50 text-rose-700", active: "bg-emerald-50 text-emerald-700",
+  added: "bg-emerald-50 text-emerald-700", created: "bg-emerald-50 text-emerald-700", invited: "bg-emerald-50 text-emerald-700",
+  posted: "bg-sky-50 text-sky-700", open: "bg-sky-50 text-sky-700", requested: "bg-amber-50 text-amber-700",
   on_leave: "bg-amber-50 text-amber-700", terminated: "bg-rose-50 text-rose-700",
 };
 
@@ -44,6 +47,7 @@ export default function ConnectorPage() {
   const [c, setC] = useState<Connector | null>(null);
   const [schema, setSchema] = useState<FieldSpec[]>([]);
   const [sample, setSample] = useState<Record<string, unknown>>({});
+  const [tab, setTab] = useState<string | null>(null);
 
   const loadMeta = useCallback(() => {
     api<Connector>(`/api/connectors/${id}`).then(setC).catch((e) => toast.error(e.message));
@@ -60,32 +64,122 @@ export default function ConnectorPage() {
       <Link href="/connectors" className="mb-4 inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
         <ArrowLeft className="size-4" /> Connectors
       </Link>
-      <Card className={cn("mb-4 flex-row flex-wrap items-center gap-4 border-l-4 p-5", c.role === "source" ? "border-l-source" : "border-l-target")}>
+      <Card className={cn("mb-4 flex-row flex-wrap items-center gap-4 border-l-4 p-5", c.role === "source" ? "border-l-source" : c.role === "app" ? "border-l-violet-500" : "border-l-target")}>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="text-xl font-semibold tracking-tight">{c.name}</h1>
             <RoleBadge role={c.role} />
             {c.demo && <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground uppercase">Demo</span>}
+            {!isImport && <ConnectionBadge status={c.connection_status} />}
           </div>
           <p className="mt-1 text-sm text-muted-foreground">{c.description}</p>
         </div>
         <div className="text-right">
           <div className="text-2xl font-semibold tabular-nums">{c.record_count}</div>
-          <div className="text-xs text-muted-foreground">{c.record_kind === "candidate" ? "candidates" : "employees"} · {schema.length} fields</div>
+          <div className="text-xs text-muted-foreground">{{ candidate: "candidates", employee: "employees", activity: "actions" }[c.record_kind]} · {schema.length} fields</div>
         </div>
       </Card>
 
-      <Tabs defaultValue={isImport && c.record_count === 0 ? "imports" : "records"}>
+      <Tabs value={tab ?? (isImport && c.record_count === 0 ? "imports" : !isImport && c.connection_status === "not_configured" ? "connection" : "records")}
+        onValueChange={(v) => setTab(String(v))}>
         <TabsList>
-          <TabsTrigger value="records">Records</TabsTrigger>
-          <TabsTrigger value="fields">Fields</TabsTrigger>
+          <TabsTrigger value="records">{c.role === "app" ? "Activity" : "Records"}</TabsTrigger>
+          {c.role !== "app" && <TabsTrigger value="fields">Fields</TabsTrigger>}
+          {!isImport && <TabsTrigger value="connection">Connection</TabsTrigger>}
           {isImport && <TabsTrigger value="imports">Import history</TabsTrigger>}
         </TabsList>
         <TabsContent value="records" className="mt-4"><RecordsTab c={c} schema={schema} /></TabsContent>
         <TabsContent value="fields" className="mt-4"><FieldsTab c={c} schema={schema} sample={sample} onAdded={loadMeta} /></TabsContent>
+        {!isImport && <TabsContent value="connection" className="mt-4"><ConnectionTab c={c} onSaved={loadMeta} /></TabsContent>}
         {isImport && <TabsContent value="imports" className="mt-4"><ImportsTab c={c} onImported={loadMeta} /></TabsContent>}
       </Tabs>
     </>
+  );
+}
+
+function ConnectionTab({ c, onSaved }: { c: Connector; onSaved: () => void }) {
+  const [cfg, setCfg] = useState<ConnectionSettings | null>(null);
+  const [form, setForm] = useState({ tenant: "", auth_type: "token" as "basic" | "token", username: "", password: "", token: "" });
+  const [busy, setBusy] = useState<"save" | "test" | null>(null);
+  useEffect(() => {
+    api<ConnectionSettings>(`/api/connectors/${c.id}/connection`).then((d) => {
+      setCfg(d);
+      setForm({ tenant: d.tenant, auth_type: d.auth_type, username: d.username, password: "", token: "" });
+    });
+  }, [c.id]);
+  if (!cfg) return <Skeleton className="h-64 rounded-xl" />;
+  const set = (k: keyof typeof form, v: string) => setForm((f) => ({ ...f, [k]: v }));
+  const save = async () => {
+    setBusy("save");
+    try {
+      const d = await api<ConnectionSettings>(`/api/connectors/${c.id}/connection`, { method: "PUT", json: form });
+      setCfg(d); setForm((f) => ({ ...f, password: "", token: "" }));
+      toast.success("Connection settings saved");
+      onSaved();
+    } catch (e) { toast.error((e as Error).message); } finally { setBusy(null); }
+  };
+  const test = async () => {
+    setBusy("test");
+    try {
+      const r = await api<NonNullable<ConnectionSettings["last_test"]>>(`/api/connectors/${c.id}/connection/test`, { method: "POST" });
+      setCfg((x) => x && { ...x, last_test: r });
+      toast.success(r.message);
+      onSaved();
+    } catch (e) { toast.error((e as Error).message); } finally { setBusy(null); }
+  };
+  const secretKey = form.auth_type === "basic" ? "password" : "token";
+  return (
+    <div className="grid gap-4 lg:grid-cols-[1fr_320px]">
+      <Card className="gap-4 p-5">
+        <div className="flex items-center gap-2 font-semibold"><Plug className="size-4 text-primary" /> Connection to {c.name}</div>
+        <div className="grid gap-1.5">
+          <Label htmlFor="tenant">{cfg.tenant_label}</Label>
+          <Input id="tenant" value={form.tenant} onChange={(e) => set("tenant", e.target.value)} placeholder={cfg.tenant_example} />
+        </div>
+        <div className="grid gap-1.5">
+          <Label>Authentication</Label>
+          <div className="inline-flex w-fit rounded-lg border p-0.5">
+            {(["token", "basic"] as const).map((t) => (
+              <button key={t} type="button" onClick={() => set("auth_type", t)}
+                className={cn("rounded-md px-3 py-1 text-sm", form.auth_type === t ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>
+                {t === "token" ? "API token" : "Username & password"}</button>
+            ))}
+          </div>
+        </div>
+        {form.auth_type === "basic" && (
+          <div className="grid gap-1.5">
+            <Label htmlFor="username">Username</Label>
+            <Input id="username" value={form.username} onChange={(e) => set("username", e.target.value)} autoComplete="off" placeholder="integration.user@azentio.com" />
+          </div>
+        )}
+        <div className="grid gap-1.5">
+          <Label htmlFor="secret">{form.auth_type === "basic" ? "Password" : "API token"}</Label>
+          <Input id="secret" type="password" autoComplete="new-password" value={form[secretKey]} onChange={(e) => set(secretKey, e.target.value)}
+            placeholder={cfg.secret_set && cfg.auth_type === form.auth_type ? `Saved (${cfg.secret_hint}). Leave blank to keep it` : "Paste it here"} />
+          <p className="text-[11px] text-muted-foreground">Stored on the server and never shown again.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button onClick={save} disabled={!!busy || form.tenant.trim().length < 2}>{busy === "save" ? <Loader2 className="size-4 animate-spin" /> : <KeyRound className="size-4" />} Save settings</Button>
+          <Button variant="outline" onClick={test} disabled={!!busy || !cfg.secret_set}>{busy === "test" ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />} Test connection</Button>
+        </div>
+      </Card>
+      <Card className="h-fit gap-2 p-4 text-sm">
+        <div className="font-semibold">Status</div>
+        {!cfg.secret_set ? <p className="text-muted-foreground">Not configured yet. Save the {cfg.tenant_label.toLowerCase()} and credentials, then test.</p> : (
+          <>
+            <div className="flex justify-between"><span className="text-muted-foreground">{cfg.tenant_label}</span><span className="font-medium">{cfg.tenant}</span></div>
+            <div className="flex justify-between"><span className="text-muted-foreground">Auth</span><span>{cfg.auth_type === "basic" ? `${cfg.username} / ${cfg.secret_hint}` : `Token ${cfg.secret_hint}`}</span></div>
+            <div className="flex justify-between"><span className="text-muted-foreground">Saved</span><span>{fmtTs(cfg.configured_at)}</span></div>
+            {cfg.last_test ? (
+              <div className="mt-1 rounded-md bg-emerald-50 px-2.5 py-2 text-xs text-emerald-800 dark:bg-emerald-500/10 dark:text-emerald-300">
+                <CheckCircle2 className="mr-1 inline size-3.5" />{cfg.last_test.message} · {cfg.last_test.ms} ms · {timeAgo(cfg.last_test.at)}
+              </div>
+            ) : <p className="text-xs text-amber-700">Saved but not tested yet.</p>}
+          </>
+        )}
+        {c.demo && <p className="mt-1 text-[11px] text-muted-foreground">Demo connector: the test always succeeds and no external call is made.</p>}
+      </Card>
+    </div>
   );
 }
 

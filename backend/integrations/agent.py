@@ -129,7 +129,11 @@ class SimulatedAgent:
             self._schedule(ctx, lowered, call)
             self._notifications(ctx, text, lowered, call)
             self._toggles(ctx, lowered, call)
-            if ctx.step == "records" or "candidates" in lowered:
+            granted = self._access(ctx, text, lowered, call)
+            self._role_documents(ctx, lowered, call)
+            if granted:
+                pass
+            elif ctx.step == "records" or "candidates" in lowered:
                 self._records(ctx, lowered, call)
             self._mapping(ctx, text, lowered, call)
             if ctx.step == "offer" and ctx.state.get("offer_enabled"):
@@ -206,6 +210,41 @@ class SimulatedAgent:
             elif _YES.search(lowered) or says_offer:
                 call("set_offer_letter", enabled=True)
 
+    def _role_documents(self, ctx, lowered, call):
+        if ctx.step != "documents" or not ctx.state.get("doc_verification_enabled"):
+            return
+        if re.search(r"\b(all|every|any)\s+roles?\b", lowered):
+            call("set_role_documents", role="*")
+            return
+        for role in sorted(ctx.state.get("roles") or [], key=len, reverse=True):  # longest first: "Senior Software Engineer"
+            if role.lower() in lowered:
+                call("set_role_documents", role=role)
+                return
+
+    def _access(self, ctx, text, lowered, call) -> bool:
+        """App access: the setup answer, and one-off grants like 'add Sneha to #engineering in Slack'."""
+        apps = ctx.state.get("apps") or {}
+        app = next((a for a in apps if a.lower() in lowered), None)
+        if app is None and re.search(r"\bgmail|mailbox|google\b", lowered):
+            app = next((a for a in apps if a.startswith("Google")), None)
+        person = next((c for c in ctx.state.get("candidates") or [] if c and (c.lower() in lowered or c.split()[0].lower() in lowered.split())), None)
+        if app and person and re.search(r"\b(give|grant|add|invite|create|access|notify|request|raise)\b", lowered):
+            res = re.search(r"(#[\w-]+)", text) or re.search(r"\b(?:project|group|channel)\s+([A-Za-z0-9_-]+)", text) \
+                or re.search(r"\bfor (?:a |an )?([a-z][\w ]+?)(?:\.|$)", lowered) if app == "ServiceNow" else \
+                re.search(r"(#[\w-]+)", text) or re.search(r"\b(?:project|group|channel)\s+([A-Za-z0-9_-]+)", text)
+            resource = res[1] if res else ("Laptop" if app == "ServiceNow" else "")
+            action = "create_account" if re.search(r"\b(account|invite|mailbox|create)\b", lowered) and not res else ""
+            mode = "request" if re.search(r"\b(admin|ask|request)\b", lowered) and app != "ServiceNow" else "direct"
+            call("grant_access", candidate=person, app=app, action=action, resource=resource, mode=mode)
+            return True
+        if ctx.step == "access":
+            if _NO.search(lowered):
+                call("set_app_access", none=True)
+            elif re.search(r"\b(suggest\w*|yes|ok|okay|sure|default|rules?)\b", lowered):
+                call("set_app_access", use_suggested=True)
+            return True
+        return False
+
     def _records(self, ctx, lowered, call):
         args: dict[str, Any] = {}
         statuses = [k for k, label in ctx.statuses.items() if label.lower() in lowered or k.replace("_", " ") in lowered]
@@ -236,6 +275,16 @@ class SimulatedAgent:
             if f:
                 call("remove_mapping_field", target_field=f.key)
                 return
+        if re.search(r"\b(generate|unique|create)\b.*\bemail", lowered):
+            dom = re.search(r"@?([a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,})\b", lowered)
+            pattern = next((p for p in ("first.last", "firstlast", "f.last", "first.l", "first_last") if p in lowered), "first.last")
+            call("generate_unique_email", target_field="work_email", pattern=pattern, domain=dom[1] if dom else "azentio.com")
+            return
+        if m := re.search(r"(.+?)\s*=\s*(.+)", text):
+            t = _match_field(m[1], ctx.target_fields)
+            if t:
+                call("set_mapping_field", target_field=t.key, transform="expression", expression=m[2].strip())
+                return
         if m := re.search(r"\bmap\s+(.+?)\s+to\s+(.+)", text, re.I):
             s, t = _match_field(m[1], ctx.source_fields), _match_field(m[2], ctx.target_fields)
             if s and t:
@@ -260,7 +309,8 @@ SYSTEM_PROMPT = """You are the setup assistant inside an HR onboarding platform.
 integration by talking with an HR person and calling tools.
 
 Setup steps, in order: records (which candidates), mapping (fields), notifications, documents \
-(verification yes or no), offer (offer letter yes or no), schedule, review (activate).
+(verification yes or no, then which documents each role needs), offer (offer letter yes or no), access \
+(which apps new joiners get), schedule, review (activate).
 
 Rules:
 - Act on what HR says by calling tools straight away. Don't ask for confirmation of a clear request.
@@ -271,7 +321,13 @@ only when HR's latest message clearly asks for that. Never assume it.
 - HR can keep fields or sections out of this integration's log with set_log_exclusions. Excluding never \
 affects the audit log.
 - Document verification uses the platform's Gmail + AI document checks and the Requirement rules. \
-Never invent document requirements.
+Never invent document requirements. Once verification is on, ask which role the candidates are joining as \
+(state.roles) and call set_role_documents for it; omit documents to use what the rules need for that role.
+- App access (Slack, Jira, ServiceNow, Google Workspace) works like Requirement rules: set_app_access \
+(use_suggested or none), add_access_rule, remove_access_rule. For one named candidate, grant_access. Slack \
+and Jira can add people directly (mode direct) or ask the channel/project admin (mode request).
+- Mapping can compute values: set_mapping_field with transform expression, or generate_unique_email for a \
+unique company address like first.last@domain.
 - After using tools, reply in one or two short plain sentences saying what changed. Don't ask the next \
 setup question: the application adds it for you.
 - If a tool returns an error, explain it plainly.
@@ -286,7 +342,7 @@ class LlmAgent(SimulatedAgent):
     async def _complete(self, messages: list, max_tokens: int = 1200, **extra) -> Any:
         with ls.Timer() as t:
             try:
-                resp, model = await llm.complete(messages, max_tokens=max_tokens, **extra)
+                resp, model = await llm.complete(messages, max_tokens=max_tokens, name="integration-agent", **extra)
             except Exception as e:
                 ls.log_event(log, "llm.call", ok=False, error=type(e).__name__, ms=t.ms)
                 raise AgentUnavailable from e

@@ -36,8 +36,19 @@ HR_EMPLOYEES = [
 ]
 
 
+def seed_apps():
+    """App connectors arrived after the first seed, so add any that are missing to existing workspaces too."""
+    from .apps import CATALOG as APP_CATALOG
+    for c in APP_CATALOG:
+        if not q1("MATCH (c:Connector {key:$k}) RETURN c", k=c["key"]):
+            q("CREATE (c:Connector) SET c = $p", p=c)
+            q("MATCH (c:Connector {key:$k}) CREATE (i:ConnectorInstance {id:$id, key:$k, name:$n, created:$t})-[:OF]->(c)",
+              k=c["key"], id=new_id("ci"), n=c["name"], t=time.time())
+
+
 def seed_connectors():
-    if q1("MATCH (c:Connector) RETURN c LIMIT 1"):
+    seed_apps()
+    if q1("MATCH (c:Connector) WHERE c.role <> 'app' RETURN c LIMIT 1"):
         return
     now = time.time()
     ids = {}

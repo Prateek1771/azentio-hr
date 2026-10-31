@@ -3,6 +3,7 @@ import json
 from datetime import date
 import re
 
+import guardrails
 import llm
 import logging_setup as ls
 from graph import q, new_id, event
@@ -87,23 +88,30 @@ def build_context(emp: dict, items: list[dict], chunks: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _stream(messages: list, fallback_contact: str, log_to: str | None, label: str):
-    """Stream an answer; yields text. Logs model + tokens to the activity feed."""
+async def _stream(messages: list, fallback_contact: str, log_to: str | None, label: str, chunks: list[dict] = (), log_activity: bool = True):
+    """Stream an answer; yields text. Logs model + tokens to the activity feed, then runs the output guardrails."""
     try:
-        stream, model = await llm.complete(messages, max_tokens=2500, stream=True, stream_options={"include_usage": True})
+        stream, model = await llm.complete(messages, max_tokens=2500, name=f"assistant:{label}", stream=True, stream_options={"include_usage": True})
     except Exception as e:
         yield f"Sorry, the assistant is unavailable right now ({type(e).__name__}). Please try again shortly or contact {fallback_contact}."
         return
-    tokens, said = None, False
+    tokens, parts = None, []
     async for chunk in stream:
         if chunk.usage:
             tokens = chunk.usage.total_tokens
         if chunk.choices and chunk.choices[0].delta.content:
-            said = True
-            yield chunk.choices[0].delta.content
-    if not said:
+            parts.append(chunk.choices[0].delta.content)
+            yield parts[-1]
+    if not parts:
         yield f"Sorry, I couldn't put an answer together just now. Please try rephrasing, or contact {fallback_contact}."
-    event(log_to, "ai", f"{label} answered via {model} ({tokens or '?'} tokens)")
+    # ponytail: output is checked after streaming, so a bad answer gets a visible note rather than being withheld
+    issues = guardrails.check_output("".join(parts), list(chunks), messages[0]["content"]) if parts else []
+    for rule in issues:
+        guardrails.record(label, rule, "flagged")
+    if issues:
+        yield guardrails.OUTPUT_NOTE.format(contact=fallback_contact)
+    if log_activity:
+        event(log_to, "ai", f"{label} answered via {model} ({tokens or '?'} tokens)")
     ls.log_event(ls.get("assistant"), "assistant.answered", assistant=label.replace(" ", "_"), model=model, tokens=tokens)
 
 
@@ -115,13 +123,24 @@ def _sources(chunks: list[dict]) -> str:
     return "__SOURCES__" + json.dumps([{"source": c["source"], "section": c["section"], "title": c["title"]} for c in chunks[:3]]) + "\n"
 
 
+def _blocked(label: str, message: str, history: list[dict]) -> str | None:
+    hit = guardrails.check_input(message, history)
+    if hit:
+        guardrails.record(label, hit[0], "blocked")
+        return hit[1]
+    return None
+
+
 async def answer_stream(emp: dict, items: list[dict], message: str, history: list[dict]):
+    if reply := _blocked("Assistant", message, history):
+        yield _sources([]) + reply
+        return
     chunks = await retrieve(message, k=4)
     yield _sources(chunks)
     hr = next((i["owner_email"] for i in items if i["category"] == "HR" and i.get("owner_email")), "your HR partner")
     messages = [{"role": "system", "content": SYSTEM.format(hr=hr) + "\n\nCONTEXT:\n" + build_context(emp, items, chunks)},
                 *_convo(history), {"role": "user", "content": message}]
-    async for part in _stream(messages, hr, emp["id"], "Assistant"):
+    async for part in _stream(messages, hr, emp["id"], "Assistant", chunks):
         yield part
 
 
@@ -188,6 +207,9 @@ def hr_context(question: str, chunks: list[dict], focus_id: str | None) -> str:
 
 
 async def hr_answer_stream(message: str, history: list[dict], focus_id: str | None):
+    if reply := _blocked("HR co-pilot", message, history):
+        yield _sources([]) + reply
+        return
     chunks = await retrieve(message, k=4)
     yield _sources(chunks)
     ctx = hr_context(message, chunks, focus_id)
@@ -196,5 +218,5 @@ async def hr_answer_stream(message: str, history: list[dict], focus_id: str | No
     if focus:
         system += f"\nHR is currently viewing {focus[0]['n']}'s record; 'they' or 'this person' refers to them."
     messages = [{"role": "system", "content": system + "\n\nCONTEXT:\n" + ctx}, *_convo(history), {"role": "user", "content": message}]
-    async for part in _stream(messages, "the onboarding admin", focus_id, "HR co-pilot"):
+    async for part in _stream(messages, "the onboarding admin", focus_id, "HR co-pilot", chunks):
         yield part

@@ -70,7 +70,7 @@ async def extract(data: bytes, mime: str, filename: str, doc_types: dict, hint: 
         f"Reply with ONLY a flat JSON object with exactly these keys (example of the shape): {SKELETON}"
     )
     content = [{"type": "text", "text": prompt}] + [{"type": "image_url", "image_url": {"url": u}} for u in to_images(data, mime)]
-    resp, model = await llm.complete([{"role": "user", "content": content}], max_tokens=1500,
+    resp, model = await llm.complete([{"role": "user", "content": content}], max_tokens=1500, name="document-extraction",
                                      response_format={"type": "json_object"})
     out = _parse(resp.choices[0].message.content)
     out["_model"], out["_tokens"] = model, getattr(resp.usage, "total_tokens", None)

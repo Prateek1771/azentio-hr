@@ -4,13 +4,16 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { ArrowLeft, ChevronRight, ExternalLink, Mail, Pause, Play, RefreshCw } from "lucide-react";
+import { ArrowLeft, ChevronRight, ExternalLink, KeyRound, Mail, Pause, Play, Plus, RefreshCw } from "lucide-react";
 import { api, describeSchedule, fmtTs, timeAgo, type IntegrationDetail, type OutboundMessage, type WfCandidate } from "@/lib/api";
 import { DecisionButtons, IntegrationStatus, StageBadge } from "@/components/integration-bits";
 import { IntegrationChat } from "@/components/integration-chat";
 import { IntegrationLog } from "@/components/integration-log";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { SimpleSelect } from "@/components/simple-select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
@@ -90,6 +93,7 @@ export default function IntegrationPage() {
 
 function CandidatesTab({ it, refreshKey }: { it: IntegrationDetail; refreshKey: number }) {
   const [rows, setRows] = useState<WfCandidate[] | null>(null);
+  const [granting, setGranting] = useState<WfCandidate | null>(null);
   const load = useCallback(() => { api<WfCandidate[]>(`/api/integrations/${it.id}/candidates`).then(setRows); }, [it.id]);
   useEffect(load, [load, refreshKey]);
   const check = async (c: WfCandidate) => {
@@ -111,7 +115,7 @@ function CandidatesTab({ it, refreshKey }: { it: IntegrationDetail; refreshKey: 
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-muted/40 text-left text-xs text-muted-foreground">
-            <tr><th className="px-4 py-2.5 font-medium">Candidate</th><th className="px-4 font-medium">Progress</th><th className="px-4 font-medium">Documents (AI checks)</th><th className="px-4 font-medium">Action</th></tr>
+            <tr><th className="px-4 py-2.5 font-medium">Candidate</th><th className="px-4 font-medium">Progress</th><th className="px-4 font-medium">Documents (AI checks)</th><th className="px-4 font-medium">App access</th><th className="px-4 font-medium">Action</th></tr>
           </thead>
           <tbody>
             {rows.map((c) => (
@@ -133,6 +137,15 @@ function CandidatesTab({ it, refreshKey }: { it: IntegrationDetail; refreshKey: 
                     </div>
                   )) : <span className="text-muted-foreground">—</span>}
                 </td>
+                <td className="px-4 py-3 text-xs">
+                  {c.access.map((a) => (
+                    <div key={a.id} title={`${a.message} · ${a.reference}`} className="flex gap-1">
+                      <span className={cn("font-medium", a.status === "requested" ? "text-amber-600" : "text-emerald-600")}>{a.app}</span>
+                      <span className="truncate text-muted-foreground">{a.action.replace(/_/g, " ")}{a.resource && ` ${a.resource}`}{a.status === "requested" && " (asked admin)"}</span>
+                    </div>
+                  ))}
+                  <button onClick={() => setGranting(c)} className="mt-1 inline-flex items-center gap-1 text-primary hover:underline"><Plus className="size-3" /> Grant access</button>
+                </td>
                 <td className="px-4 py-3">
                   {c.stage === "awaiting_hr_approval" && <DecisionButtons integrationId={it.id} itemId={c.id} name={c.name} onDone={load} />}
                   {c.stage === "documents_requested" && <Button size="sm" variant="outline" onClick={() => check(c)}><RefreshCw className="size-3.5" /> Check documents</Button>}
@@ -145,7 +158,52 @@ function CandidatesTab({ it, refreshKey }: { it: IntegrationDetail; refreshKey: 
           </tbody>
         </table>
       </div>
+      {granting && <GrantDialog it={it} cand={granting} onClose={() => setGranting(null)} onDone={() => { setGranting(null); load(); }} />}
     </Card>
+  );
+}
+
+function GrantDialog({ it, cand, onClose, onDone }: { it: IntegrationDetail; cand: WfCandidate; onClose: () => void; onDone: () => void }) {
+  const [appId, setAppId] = useState(it.apps[0]?.id ?? "");
+  const app = it.apps.find((a) => a.id === appId);
+  const [action, setAction] = useState(app?.actions[0]?.key ?? "");
+  const [resource, setResource] = useState("");
+  const [mode, setMode] = useState("direct");
+  const [busy, setBusy] = useState(false);
+  const needs = app?.actions.find((a) => a.key === action)?.needs_resource;
+  const grant = async () => {
+    setBusy(true);
+    try {
+      const r = await api<{ result: { message: string; reference: string } }>(`/api/integrations/${it.id}/candidates/${cand.id}/access`,
+        { method: "POST", json: { app_id: appId, action, resource, mode } });
+      toast.success(`${r.result.message} (${r.result.reference})`);
+      onDone();
+    } catch (e) { toast.error((e as Error).message); } finally { setBusy(false); }
+  };
+  return (
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2"><KeyRound className="size-4" /> Grant access to {cand.name}</DialogTitle>
+          <DialogDescription>Runs now in the app connector (demo: recorded, no external call). Uses their generated company email once it exists.</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-2">
+          <SimpleSelect value={appId} onChange={(v) => { const a = it.apps.find((x) => x.id === v); setAppId(v); setAction(a?.actions[0]?.key ?? ""); }}
+            className="w-full" options={it.apps.map((a) => ({ value: a.id, label: a.name }))} />
+          <SimpleSelect value={action} onChange={setAction} className="w-full" options={(app?.actions ?? []).map((a) => ({ value: a.key, label: a.label }))} />
+          {needs && <Input value={resource} onChange={(e) => setResource(e.target.value)}
+            placeholder={app?.key === "slack" ? "#channel" : app?.key === "jira" ? "Project key, e.g. ENG" : app?.key === "servicenow" ? "What to request, e.g. Laptop" : "Group"} />}
+          {(app?.key === "slack" || app?.key === "jira") && needs && (
+            <SimpleSelect value={mode} onChange={(v) => setMode(v || "direct")} className="w-full"
+              options={[{ value: "direct", label: "Add them directly" }, { value: "request", label: "Ask the channel/project admin" }]} />
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>Cancel</Button>
+          <Button onClick={grant} disabled={busy || !action || (needs && !resource.trim())}>{busy ? "Granting…" : "Grant access"}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

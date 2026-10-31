@@ -7,6 +7,7 @@ from . import service, store
 from .agent import RUN_REQUEST, AgentUnavailable, SimulatedAgent, TurnContext, get_agent
 from .engine import AlreadyRunning, run_integration
 from .run_log import LOG_SECTIONS
+from .expr import EMAIL_PRESETS, FUNCTIONS
 from .store import SetupError
 
 log = ls.get("agent")
@@ -19,6 +20,7 @@ _HUMAN_ONLY = {
     "approve_offer_letter": re.compile(r"\b(approve\w*|looks good|lgtm|confirm|yes|ok|okay)\b"),
     "activate": re.compile(r"\b(activate|go live|resume|start it|turn it on)\b"),
     "run_now": RUN_REQUEST,
+    "grant_access": re.compile(r"\b(give|grant|add|invite|create|provision|access|notify|request|raise|onboard)\b"),
 }
 
 
@@ -34,9 +36,16 @@ TOOLS = [
           {"statuses": {"type": "array", "items": {"enum": list(store.CANDIDATE_STATUSES)}},
            "departments": {**_LIST, "description": "Names. An empty list means all."}, "duplicate_policy": {"enum": ["update", "skip"]}}),
     _tool("suggest_mapping", "Propose a new field mapping, replacing the current one."),
-    _tool("set_mapping_field", "Set how one target field is filled.",
+    _tool("set_mapping_field", "Set how one target field is filled. Use transform 'expression' with an expression over source "
+          "field names, e.g. lower(first_name) + \".\" + slug(last_name). Functions: " + ", ".join(FUNCTIONS) + ".",
           {"target_field": {**_TEXT, "description": "Target field key."}, "source_field": {**_TEXT, "description": "Source field key."},
-           "default_value": _TEXT, "transform": {"enum": ["none", "trim", "lowercase", "uppercase", "first_word", "after_first_word"]}}),
+           "default_value": _TEXT, "transform": {"enum": ["none", "trim", "lowercase", "uppercase", "first_word", "after_first_word", "expression"]},
+           "expression": _TEXT}),
+    _tool("generate_unique_email", "Fill a target email field with a generated company address that is unique in the target "
+          "(john.doe, then john.doe2 on a clash).",
+          {"target_field": {**_TEXT, "description": "Usually work_email."}, "pattern": {"enum": list(EMAIL_PRESETS)},
+           "expression": {**_TEXT, "description": "Custom local-part expression instead of a pattern."},
+           "domain": {**_TEXT, "description": "e.g. azentio.com"}}),
     _tool("remove_mapping_field", "Stop filling a target field.", {"target_field": _TEXT}),
     _tool("approve_mapping", "Approve the field mapping. Only when HR clearly says so."),
     _tool("set_notifications", "Change who gets notified about runs, and for which events.",
@@ -44,7 +53,23 @@ TOOLS = [
            "add_emails": {**_LIST, "description": "Any email addresses."}, "remove_emails": _LIST,
            "on_created": _FLAG, "on_success": _FLAG, "on_failure": _FLAG}),
     _tool("set_document_verification", "Turn document verification (Gmail request + AI checks) on or off.", {"enabled": _FLAG}),
+    _tool("set_role_documents", "Choose which documents candidates in one role are asked for. Leave documents out to use what the "
+          "Requirement rules need for that role. role '*' means every role.",
+          {"role": _TEXT, "documents": {**_LIST, "description": "Document type keys or names."}}),
     _tool("set_offer_letter", "Turn the offer letter on or off.", {"enabled": _FLAG}),
+    _tool("set_app_access", "Choose the app access new joiners get after their employee record exists. "
+          "use_suggested follows the Requirement rules; none gives no app access.",
+          {"use_suggested": _FLAG, "none": _FLAG}),
+    _tool("add_access_rule", "Add one app access item for matching new joiners, like a Requirement rule.",
+          {"app": {**_TEXT, "description": "Slack, Jira, ServiceNow or Google Workspace."}, "action": _TEXT,
+           "resource": {**_TEXT, "description": "Channel, project, group or request name."},
+           "mode": {"enum": ["direct", "request"], "description": "direct adds them; request asks the channel or project admin."},
+           "roles": _LIST, "departments": _LIST}),
+    _tool("remove_access_rule", "Remove app access items for an app (and optionally one resource).", {"app": _TEXT, "resource": _TEXT}),
+    _tool("grant_access", "Give one candidate app access now, e.g. add them to a Slack channel or Jira project, create an account, "
+          "notify a channel/project admin or raise a ServiceNow request. Only when HR asks.",
+          {"candidate": {**_TEXT, "description": "Candidate name or email."}, "app": _TEXT, "action": _TEXT, "resource": _TEXT,
+           "mode": {"enum": ["direct", "request"]}}),
     _tool("redraft_offer_letter", "Write a new offer letter format."),
     _tool("update_offer_letter", "Replace the offer letter format. It then needs approving again.", {"content": _TEXT}),
     _tool("approve_offer_letter", "Approve the offer letter format. Only when HR clearly says so."),
@@ -107,17 +132,94 @@ class Tools:
         service.save_mapping(self.id, rules, speak=False)
         return f"I've proposed a mapping for {len(rules)} fields."
 
-    async def _do_set_mapping_field(self, target_field, source_field=None, default_value=None, transform=None):
+    async def _do_set_mapping_field(self, target_field, source_field=None, default_value=None, transform=None, expression=None):
+        if expression or transform == "expression":
+            rules = [r for r in self._it()["mapping"] if r["target_field"] != target_field]
+            rules.append({"target_field": target_field, "transform": "expression", "expression": expression or "", "origin": "hr"})
+            service.save_mapping(self.id, rules, speak=False)
+            return f"{target_field} is now calculated as {expression}."
+        return await self._set_plain_field(target_field, source_field, default_value, transform)
+
+    async def _set_plain_field(self, target_field, source_field=None, default_value=None, transform=None):
         it = self._it()
         rules = {r["target_field"]: r for r in it["mapping"]}
         rule = rules.get(target_field, {"target_field": target_field, "transform": "none"})
         rules[target_field] = {**rule, "source_field": source_field or rule.get("source_field"),
                                "default_value": default_value or rule.get("default_value"),
-                               "transform": transform or rule.get("transform", "none"), "origin": "hr", "confidence": None, "rationale": None}
+                               "transform": transform or (rule.get("transform", "none") if rule.get("transform") not in ("expression", "unique_email") else "none"),
+                               "origin": "hr", "confidence": None, "rationale": None}
         service.save_mapping(self.id, list(rules.values()), speak=False)
         _, t_fields, _, _ = store.schemas(it)
         label = next((f.label for f in t_fields if f.key == target_field), target_field)
         return f"{label} now defaults to {default_value}." if default_value else f"{label} now comes from {source_field}."
+
+    async def _do_generate_unique_email(self, target_field="work_email", pattern=None, expression=None, domain=None):
+        expr = expression or EMAIL_PRESETS.get(pattern or "first.last", EMAIL_PRESETS["first.last"])
+        domain = (domain or "azentio.com").strip().lower().lstrip("@")
+        rules = [r for r in self._it()["mapping"] if r["target_field"] != target_field]
+        rules.append({"target_field": target_field, "transform": "unique_email", "expression": expr, "email_domain": domain, "origin": "hr"})
+        service.save_mapping(self.id, rules, speak=False)
+        sample = service.test_expression(self.id, expr, "unique_email", domain)[:1]
+        eg = f" For example {sample[0]['candidate']} gets {sample[0]['value']}." if sample and sample[0]["value"] else ""
+        return f"{target_field} is now generated as a unique @{domain} address.{eg}"
+
+    async def _do_set_role_documents(self, role, documents=None):
+        it = service.save_role_documents(self.id, role, documents, speak=False)
+        key = "*" if role.strip().lower() in ("all", "all roles", "any", "any role", "everyone", "*") else \
+            next((k for k in it["role_documents"] if k.lower() == role.strip().lower()), role)
+        names = {d["key"]: d["name"] for d in service.document_options(it, key)}
+        docs = it["role_documents"].get(key, [])
+        return f"{'Every role' if key == '*' else key} will be asked for {len(docs)} document(s): {', '.join(names.get(d, d) for d in docs)}."
+
+    def _app(self, name):
+        apps = service.apps()
+        hit = next((a for a in apps if a["name"].lower() == (name or "").lower() or a["key"] == (name or "").lower().replace(" ", "_")), None)
+        if not hit:
+            raise SetupError(f"There's no app called {name}. Apps: {', '.join(a['name'] for a in apps)}")
+        return hit
+
+    def _action(self, app, action, resource):
+        keys = [a["key"] for a in app["actions"]]
+        act = (action or "").lower().replace(" ", "_")
+        if act in keys:
+            return act
+        if any(w in act for w in ("account", "invite", "create", "mailbox")) and "create_account" in keys:
+            return "create_account"
+        if resource:
+            return next(k for k in keys if k != "create_account")
+        return keys[0]
+
+    async def _do_set_app_access(self, use_suggested=None, none=None):
+        it = self._it()
+        rules = [] if none else service.suggested_access(it)
+        service.save_access_rules(self.id, rules, speak=False, actor="HR (via agent)")
+        if not rules:
+            return "New joiners won't get any app access from this integration."
+        return "New joiners will get: " + "; ".join(_describe_rule(r) for r in rules) + "."
+
+    async def _do_add_access_rule(self, app, action=None, resource="", mode="direct", roles=None, departments=None):
+        a = self._app(app)
+        rule = {"app_id": a["id"], "action": self._action(a, action, resource), "resource": resource or "", "mode": mode,
+                "match": {"role": roles or [], "department": departments or []}}
+        it = self._it()
+        service.save_access_rules(self.id, [*it["access_rules"], rule], speak=False, actor="HR (via agent)")
+        return f"Added: {_describe_rule({**rule, 'app': a['name']})}."
+
+    async def _do_remove_access_rule(self, app, resource=None):
+        a = self._app(app)
+        it = self._it()
+        keep = [r for r in it["access_rules"] if not (r["app_id"] == a["id"] and (not resource or r["resource"].lstrip("#") == resource.lstrip("#")))]
+        if len(keep) == len(it["access_rules"]):
+            raise SetupError(f"There's no {a['name']} access item like that.")
+        service.save_access_rules(self.id, keep, speak=False, actor="HR (via agent)")
+        return f"Removed {len(it['access_rules']) - len(keep)} {a['name']} access item(s)."
+
+    async def _do_grant_access(self, candidate, app, action=None, resource="", mode="direct"):
+        item = service.find_item(self.id, candidate)
+        a = self._app(app)
+        out = service.grant_access(self.id, item["id"], a["id"], self._action(a, action, resource), resource or "", mode, actor="HR (via agent)")
+        r = out["result"]
+        return f"{a['name']}: {r['message']} (ref {r['reference']})." + (" It was already done before." if r.get("repeat") else "")
 
     async def _do_remove_mapping_field(self, target_field):
         service.save_mapping(self.id, [r for r in self._it()["mapping"] if r["target_field"] != target_field], speak=False)
@@ -229,7 +331,7 @@ def next_prompt(it: dict) -> str:
         p = store.problems(it)
         if p:
             return f"Before activating: {' '.join(p)}"
-    return store.QUESTIONS[step]
+    return store.question(it)
 
 
 def _state(it: dict) -> dict:
@@ -240,7 +342,21 @@ def _state(it: dict) -> dict:
             "notify_on_success": it["notify_on_success"], "notify_on_failure": it["notify_on_failure"],
             "doc_verification_enabled": it["doc_verification_enabled"], "offer_enabled": it["offer_enabled"],
             "offer_template": it["offer_template"], "offer_template_status": it["offer_template_status"],
-            "schedule": it["schedule"], "log_exclusions": it["log_exclusions"], "problems": store.problems(it)}
+            "schedule": it["schedule"], "log_exclusions": it["log_exclusions"], "problems": store.problems(it),
+            "roles": service.roles(it), "role_documents": it["role_documents"],
+            "access_rules": [_describe_rule(r) for r in it["access_rules"]], "access_saved": it["access_saved"],
+            "apps": {a["name"]: [x["key"] for x in a["actions"]] for a in service.apps()},
+            "candidates": [i["name"] for i in store.items(it["id"])][:50],
+            "mapping_rules": [{k: r.get(k) for k in ("target_field", "transform", "expression", "email_domain") if r.get(k)}
+                              for r in it["mapping"] if r.get("transform") in ("expression", "unique_email")]}
+
+
+def _describe_rule(r: dict) -> str:
+    m = r.get("match") or {}
+    who = " and ".join(", ".join(v) if isinstance(v, list) else str(v) for k, v in m.items() if v and k in ("role", "department", "country", "location"))
+    what = r["action"].replace("_", " ") + (f" {r['resource']}" if r.get("resource") else "")
+    how = " (ask the admin)" if r.get("mode") == "request" else ""
+    return f"{r.get('app', '')} {what}{how}" + (f" for {who}" if who else "")
 
 
 async def run_chat_turn(iid: str, message: str, timezone: str | None, opening: bool = False) -> dict:

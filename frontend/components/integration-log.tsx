@@ -88,6 +88,8 @@ function RunCard({ run, showName }: { run: LogRun; showName: boolean }) {
         <Count label="Offers sent" value={run.offers_sent_count} />
         <Count label="Employees created" value={run.employees_created_count} />
         <Count label="Employees updated" value={run.employees_updated_count} />
+        <Count label="Access granted" value={run.access_granted_count ?? 0} />
+        <Count label="Admin requests" value={run.access_requested_count ?? 0} />
         <Count label="Failed" value={run.failed_count} danger />
       </div>
       {open && (

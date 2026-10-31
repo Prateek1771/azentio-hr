@@ -80,8 +80,8 @@ export const timeAgo = (ts: number) => {
 export const daysUntil = (iso: string) => Math.round((new Date(iso + "T00:00:00").getTime() - Date.now()) / 86400000);
 
 export interface Connector {
-  id: string; name: string; key: string; role: "source" | "target"; record_kind: "candidate" | "employee";
-  demo: boolean; description: string; type_name: string; record_count: number;
+  id: string; name: string; key: string; role: "source" | "target" | "app"; record_kind: "candidate" | "employee" | "activity";
+  demo: boolean; description: string; type_name: string; record_count: number; connection_status?: "not_configured" | "untested" | "connected";
 }
 export interface FieldSpec { key: string; label: string; type: string; required: boolean; description: string; is_custom: boolean; generated: boolean }
 export interface ConnRecord { id: string; instance_id: string; kind: string; values: Record<string, unknown>; created: number; updated: number; employee_id?: string | null }
@@ -95,6 +95,7 @@ export interface IntegrationRun {
 export interface MappingRule {
   source_field: string | null; target_field: string; transform: string; default_value: string | null;
   confidence?: number | null; rationale?: string | null; origin?: "agent" | "hr";
+  expression?: string | null; email_domain?: string | null;
 }
 export interface AgentMessage { id: string; role: "agent" | "user"; content: string; ts: number }
 export interface Schedule { kind: "manual" | "interval" | "daily"; interval_minutes: number | null; time: string | null; timezone: string }
@@ -113,11 +114,27 @@ export interface IntegrationDetail extends IntegrationSummary {
   recipients: { email: string; name: string }[]; quick_replies: string[]; connectors_locked: boolean; messages: AgentMessage[];
   problems: string[]; agent_name: string; agent_is_simulated: boolean; delivery_is_simulated: boolean;
   owners: { name: string; email: string }[]; departments: string[];
+  role_documents: Record<string, string[]>; access_rules: AccessRule[]; access_saved: boolean; roles: string[];
+  doc_types: { key: string; name: string }[]; apps: AppConnector[]; suggested_access: AccessRule[];
+  expression_functions: { name: string; example: string }[]; email_presets: { key: string; expression: string }[];
+}
+export interface AppConnector { id: string; name: string; key: string; actions: { key: string; label: string; needs_resource: boolean }[] }
+export interface AccessRule {
+  id: string; app_id: string; app: string; action: string; resource: string; mode: "direct" | "request";
+  match: { role?: string[]; department?: string[]; location?: string[]; country?: string[]; grade_min?: number; grade_max?: number }; from_rule: string;
+}
+export interface AccessResult { id: string; app: string; action: string; resource: string; mode: string; status: string; reference: string; message: string; email: string }
+export interface DocOption { key: string; name: string; suggested: boolean; reason: string }
+export interface ConnectionSettings {
+  tenant: string; auth_type: "basic" | "token"; username: string; secret_set: boolean; secret_hint: string;
+  configured_at: number | null; last_test: { ok: boolean; at: number; ms: number; message: string } | null;
+  supported: boolean; tenant_label: string; tenant_example: string;
 }
 export interface WfCandidate {
   id: string; record_id: string; name: string; email: string; stage: string; candidate_ref: string;
   document_results: { name: string; status: "verified" | "rejected" | "missing"; reason: string | null }[];
   rejection_reason?: string; last_error?: string; joiner_id?: string; employee_record_id?: string; updated: number;
+  access: AccessResult[]; generated_values?: string;
 }
 export interface OutboundMessage {
   id: string; kind: "document_request" | "offer_letter" | "notification"; to: string; subject: string; content: string;
@@ -128,7 +145,7 @@ export interface LogRun {
   fetched_count: number; enrolled_count: number; advanced_count: number; waiting_count: number; failed_count: number;
   employees_created_count: number; employees_updated_count: number; documents_requested_count: number | null;
   documents_verified_count: number | null; approvals_pending_count: number | null; approvals_used_count: number | null;
-  offers_sent_count: number | null; excluded_fields: string[]; excluded_sections: string[];
+  offers_sent_count: number | null; access_granted_count: number | null; access_requested_count: number | null; excluded_fields: string[]; excluded_sections: string[];
   failures: { candidate: string; message: string }[];
 }
 export interface LogRecord {

@@ -9,6 +9,7 @@ import audit
 from graph import q, q1
 from integrations import chat, delivery, engine, service, store
 from integrations.run_log import exclusions_of, mask_record
+from connectors.base import RecordRejected
 from integrations.store import SetupError
 
 router = APIRouter(prefix="/api")
@@ -21,7 +22,7 @@ def errors(fn):
         try:
             out = fn(*a, **kw)
             return await out if hasattr(out, "__await__") else out
-        except SetupError as ex:
+        except (SetupError, RecordRejected, engine.CandidateNotReady) as ex:
             raise HTTPException(422, str(ex))
         except LookupError as ex:
             raise HTTPException(404, str(ex))
@@ -160,6 +161,70 @@ class YesNo(BaseModel):
 def put_documents(iid: str, b: YesNo):
     service.save_documents(iid, b.enabled)
     return service.detail(iid)
+
+
+@router.get("/integrations/{iid}/documents/options")
+@errors
+def document_options(iid: str, role: str = "*"):
+    it = store.get(iid)
+    if not it:
+        raise LookupError("Integration not found")
+    return service.document_options(it, role)
+
+
+class RoleDocs(BaseModel):
+    role: str = Field(min_length=1, max_length=200)
+    documents: list[str] | None = None
+
+
+@router.put("/integrations/{iid}/documents/roles")
+@errors
+def put_role_documents(iid: str, b: RoleDocs):
+    service.save_role_documents(iid, b.role, b.documents)
+    return service.detail(iid)
+
+
+@router.delete("/integrations/{iid}/documents/roles")
+@errors
+def delete_role_documents(iid: str, role: str):
+    service.remove_role_documents(iid, role)
+    return service.detail(iid)
+
+
+class AccessBody(BaseModel):
+    rules: list[dict] = Field(default_factory=list, max_length=50)
+
+
+@router.put("/integrations/{iid}/access")
+@errors
+def put_access(iid: str, b: AccessBody):
+    service.save_access_rules(iid, b.rules)
+    return service.detail(iid)
+
+
+class GrantBody(BaseModel):
+    app_id: str
+    action: str
+    resource: str = ""
+    mode: str = "direct"
+
+
+@router.post("/integrations/{iid}/candidates/{item_id}/access")
+@errors
+def grant_access(iid: str, item_id: str, b: GrantBody):
+    return service.grant_access(iid, item_id, b.app_id, b.action, b.resource, b.mode)
+
+
+class ExpressionBody(BaseModel):
+    expression: str = Field(max_length=500)
+    transform: str = "expression"
+    email_domain: str = ""
+
+
+@router.post("/integrations/{iid}/mapping/test-expression")
+@errors
+def test_expression(iid: str, b: ExpressionBody):
+    return service.test_expression(iid, b.expression, b.transform, b.email_domain)
 
 
 @router.put("/integrations/{iid}/offer")
@@ -318,6 +383,7 @@ def _run(r: dict, it: dict | None) -> dict:
             "approvals_pending_count": hide("approvals", c.get("approvals_pending", 0)),
             "approvals_used_count": hide("approvals", c.get("approval_used", 0)),
             "offers_sent_count": hide("offers", c.get("offer_sent", 0)),
+            "access_granted_count": hide("access", c.get("access_granted", 0)), "access_requested_count": hide("access", c.get("access_requested", 0)),
             "excluded_fields": sorted(fields), "excluded_sections": sorted(sections),
             "failures": [d for d in run["details"] if d.get("outcome") == "failed"]}
 
