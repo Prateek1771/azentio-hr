@@ -1,0 +1,3 @@
+techstack - next.js, tailwind, fastapi, python, flakordb, docs verify - https://awaithumans.dev/awaitverify/ , gmail
+
+platform -> employee document collection email template (customisable by hr) -> hr fills the name roles and selects the template and hits send to the person -> person receves the email reads/goes through it and send the email with the required attachments (docs) -> platform will read the email of the employee/person extract the docs/attachments -> send notification to the hr that received the docs and running verification -> the platform will create the flakordb entity relation graph and evaluate it if there are missing info or some dat is not matching it will flag in the dashboard -> the complete info will be shown in the dashboard. 
