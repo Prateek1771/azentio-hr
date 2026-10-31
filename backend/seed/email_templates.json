@@ -1,0 +1,26 @@
+[
+  {
+    "id": "standard",
+    "name": "Standard document request",
+    "subject": "Welcome to Azentio, {{name}}! Documents needed before {{joining_date}}",
+    "body": "<p>Hi {{first_name}},</p><p>We're delighted you're joining us as <b>{{role}}</b> in <b>{{location}}</b> on <b>{{joining_date}}</b>.</p><p>To get your laptop, accounts and employee record ready for day one, please <b>reply to this email</b> with the following documents attached (PDF, JPG or PNG):</p>{{doc_list}}<p>You can also upload them, track progress and ask questions in your onboarding portal: <a href=\"{{portal_link}}\">{{portal_link}}</a></p><p>Warm regards,<br/>People Team, Azentio</p>"
+  },
+  {
+    "id": "intern",
+    "name": "Intern document request",
+    "subject": "Your internship at Azentio starts {{joining_date}} - quick document check",
+    "body": "<p>Hey {{first_name}} 👋</p><p>Excited to have you as a <b>{{role}}</b>! Just reply to this email with these documents attached:</p>{{doc_list}}<p>Questions? Your portal has an assistant that knows our policies: <a href=\"{{portal_link}}\">open portal</a>.</p><p>See you soon,<br/>Campus Hiring, Azentio</p>"
+  },
+  {
+    "id": "correction",
+    "name": "Correction request (system)",
+    "subject": "Action needed: please re-submit your {{item_name}}",
+    "body": "<p>Hi {{first_name}},</p><p>Thanks for sending your <b>{{item_name}}</b>. We couldn't accept it because:</p><ul>{{issues}}</ul><p>Please reply to this email with a corrected copy, or upload it in your portal: <a href=\"{{portal_link}}\">{{portal_link}}</a></p><p>People Team, Azentio</p>"
+  },
+  {
+    "id": "escalation",
+    "name": "Overdue escalation (system)",
+    "subject": "Overdue onboarding task: {{item_name}} for {{name}}",
+    "body": "<p>Hi {{owner_name}},</p><p>The onboarding task <b>{{item_name}}</b> for <b>{{name}}</b> ({{role}}, joining {{joining_date}}) was due on <b>{{due}}</b> and is still open.</p><p>Blocked downstream: {{blocked}}</p><p>Please action it or reply with an update.</p><p>Azentio Onboarding Agent</p>"
+  }
+]

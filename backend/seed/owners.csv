@@ -1,0 +1,9 @@
+name,email,department,type
+Anita Desai,anita.desai@azentio.example,Human Resources,manager
+Priya Menon,priya.menon@azentio.example,Engineering,manager
+Vikram Rao,vikram.rao@azentio.example,Sales,manager
+Sarah Kim,sarah.kim@azentio.example,Engineering,manager
+HR Operations,{HR+hr},Human Resources,owner:HR
+IT Service Desk,{HR+it},IT,owner:IT
+Facilities Desk,{HR+facilities},Facilities,owner:Facilities
+Compliance Team,{HR+compliance},Compliance,owner:Compliance
