@@ -383,6 +383,38 @@ async def run(base: str, shots: Path) -> int:
                 await p.goto(f"{base}/employees/{emp}")
                 expect(await p.wait_for("document.body.innerText.toLowerCase().includes('accepted by approver@azentio.local')"),
                        "review: the employee page shows who accepted it")
+
+            # Auto-accept and spot check: a low-risk document the policy accepted, then an approver checks the sample.
+            print("[auto-accept + spot check]")
+            await sign_in("approver@azentio.local", "approver-dev-pass")
+            await p.goto(f"{base}/employees/E1004")
+            expect(await p.wait_for("document.body.innerText.toLowerCase().includes('auto-accepted')"),
+                   "auto-accept: Meera's utility bill shows it was auto-accepted, with confidence and policy version")
+            spots = (await p.api("GET", "/api/review-queue?kind=doc.spot_check")).get("items", [])
+            if spots:
+                sd = spots[0]["document"]["id"]
+                await p.goto(f"{base}/review/{sd}")
+                await p.wait_for("!!document.querySelector('input[placeholder^=\"Why\"]')")
+                await p.settle()
+                await p.shot(shots / "review-spot-check.png")
+                await p.fill('input[placeholder^="Why"]', "Smoke test: the bill matches the joiner's address")
+                await asyncio.sleep(0.3)
+                await p.click_text("Correct", "button")
+                passed = False
+                for _ in range(20):
+                    det = await p.api("GET", f"/api/documents/{sd}")
+                    if any(x["kind"] == "spot_check_pass" for x in det["decisions"]):
+                        passed = True
+                        break
+                    await asyncio.sleep(0.5)
+                expect(passed and det["document"]["status"] == "Accepted",
+                       "spot check: the approver's 'Correct' verdict is recorded and the acceptance stands")
+            else:  # a re-run: the seeded sample was already checked
+                acc = await p.api("GET", "/api/quality/ai-accuracy")
+                expect(acc["spot_checks"] >= 1, "spot check: an earlier verdict is recorded")
+            await p.goto(f"{base}/quality")
+            expect(await p.wait_for("document.body.innerText.includes('AI document decisions')"),
+                   "quality: the AI document decisions card renders")
     finally:
         proc.terminate()
         shutil.rmtree(profile, ignore_errors=True)

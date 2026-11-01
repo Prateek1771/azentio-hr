@@ -177,8 +177,11 @@ export const REASON_CODE_LABEL: Record<string, string> = {
 export function decisionLine(d: Doc): string {
   const x = d.decision;
   if (!x) return "";
-  if (!x.by) return [DECISION_LABEL[x.kind] ?? x.kind, d.confidence > 0 ? `${Math.round(d.confidence * 100)}%` : "",
-    x.policy_version ? `v${x.policy_version}` : ""].filter(Boolean).join(" · ");
+  const facts = [d.confidence > 0 ? `${Math.round(d.confidence * 100)}%` : "", x.policy_version ? `v${x.policy_version}` : ""];
+  if (x.kind === "demo_seed") return "Sample data (demo)";
+  if (!x.by) return [DECISION_LABEL[x.kind] ?? x.kind, ...facts].filter(Boolean).join(" · ");
+  // A passed spot check confirms the automatic acceptance: show both, so who decided stays visible.
+  if (x.kind === "spot_check_pass") return ["Auto-accepted", ...facts, `spot-checked ✓ by ${x.by}`].filter(Boolean).join(" · ");
   return `${(DECISION_LABEL[x.kind] ?? x.kind).toLowerCase()} by ${x.by}${x.reason ? ` · ${x.reason}` : ""}`;
 }
 export const STATE_LABEL: Record<VersionState, string> = {
