@@ -89,6 +89,27 @@ class Page:
     async def text(self):
         return await self.js("document.body.innerText")
 
+    async def fill(self, selector, value):
+        """Set a React-controlled input/textarea (native setter + input event)."""
+        await self.js(f"""(() => {{ const el = document.querySelector({json.dumps(selector)});
+            const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, {json.dumps(str(value))});
+            el.dispatchEvent(new Event('input', {{ bubbles: true }})); return true; }})()""")
+
+    async def click_text(self, text, scope="button, a"):
+        """Click the first visible element in `scope` whose text includes `text`."""
+        ok = await self.js(f"""(() => {{ const el = [...document.querySelectorAll({json.dumps(scope)})]
+            .filter(e => e.getClientRects().length > 0 && !e.disabled)  /* offsetParent is null inside fixed dialogs */.sort((a, b) => (b.innerText.trim() === {json.dumps(text)}) - (a.innerText.trim() === {json.dumps(text)}))
+            .find(e => e.innerText.includes({json.dumps(text)}));  /* exact text first: "Approver" contains "Approve" */
+            if (!el) return false; el.click(); return true; }})()""")
+        if not ok:
+            raise RuntimeError(f"no clickable '{text}'")
+
+    async def api(self, method, path, body=None):
+        """Call the API from the page (same origin, session cookie)."""
+        return await self.js(f"""fetch({json.dumps(path)}, {{ method: {json.dumps(method)}, headers: {{'content-type': 'application/json'}},
+            body: {json.dumps(json.dumps(body)) if body is not None else 'undefined'} }}).then(r => r.json())""")
+
     async def shot(self, path: Path):
         data = (await self.send("Page.captureScreenshot", format="png"))["data"]
         path.write_bytes(base64.b64decode(data))
@@ -136,21 +157,20 @@ async def run(base: str, shots: Path) -> int:
             expect(await p.wait_for("location.pathname === '/login'"), "signed out: /dashboard redirects to /login")
             await p.shot(shots / "login.png")
 
-            for role, (email, pw, nav, allowed, forbidden) in ROLES.items():
-                print(f"[{role}]")
+            async def sign_in(email, pw):
                 await p.send("Network.clearBrowserCookies")
                 await p.goto(f"{base}/login?next=/dashboard")
-                # Fill the real form (React-controlled inputs need the native setter + an input event)
-                await p.js(f"""(() => {{
-                    const set = (el, v) => {{ Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
-                                             el.dispatchEvent(new Event('input', {{ bubbles: true }})); }};
-                    set(document.querySelector('#email'), {json.dumps(email)});
-                    set(document.querySelector('#password'), {json.dumps(pw)});
-                    return true; }})()""")
+                await p.fill("#email", email)
+                await p.fill("#password", pw)
                 await asyncio.sleep(0.2)
                 await p.js("document.querySelector('form button[type=submit]').click()")
-                expect(await p.wait_for("location.pathname === '/dashboard'"), f"{role}: login form signs in")
+                signed = await p.wait_for("location.pathname === '/dashboard'")
                 await p.settle()
+                return signed
+
+            for role, (email, pw, nav, allowed, forbidden) in ROLES.items():
+                print(f"[{role}]")
+                expect(await sign_in(email, pw), f"{role}: login form signs in")
 
                 got = await p.js("[...document.querySelectorAll('aside nav a')].map(a => a.innerText.trim())")
                 expect(got == nav, f"{role}: nav is {nav}" + ("" if got == nav else f" (got {got})"))
@@ -203,6 +223,70 @@ async def run(base: str, shots: Path) -> int:
                 await p.wait_for("[...document.querySelectorAll('[role=menuitem]')].some(m => m.innerText.includes('Sign out'))", 5)
                 await p.js("[...document.querySelectorAll('[role=menuitem]')].find(m => m.innerText.includes('Sign out')).click()")
                 expect(await p.wait_for("location.pathname === '/login'"), f"{role}: sign out returns to /login")
+
+            # Policy governance (Phase 1): draft -> preview -> submit -> approve -> published
+            print("[policy]")
+            approvers = [("approver@azentio.local", "approver-dev-pass"), ("approver2@azentio.local", "approver2-dev-pass")]
+            await sign_in("hrops@azentio.local", "hrops-dev-pass")
+            vs = await p.api("GET", "/api/policy/versions")
+            pending = next((v for v in vs["versions"] if v["state"] == "pending_approval"), None)
+            if pending:  # finish whatever is waiting first, so the flow below has the draft slot
+                for em, pw2 in approvers:
+                    await sign_in(em, pw2)
+                    await p.api("POST", f"/api/policy/versions/{pending['id']}/approve", {"reason": "smoke: clear queue"})
+                for _ in range(40):
+                    if (await p.api("GET", f"/api/policy/versions/{pending['id']}"))["state"] == "active":
+                        break
+                    await asyncio.sleep(1)
+                await sign_in("hrops@azentio.local", "hrops-dev-pass")
+            before = (await p.api("GET", "/api/rules"))["version"]["number"]
+            await p.goto(f"{base}/rules")
+            expect(f"Version {before} active" in await p.text(), f"policy: rules page shows active version {before}")
+            await p.shot(shots / "rules.png")
+            pan = next(r for r in (await p.api("GET", "/api/rules"))["rules"] if r["id"] == "R-PAN")
+            new_offset = -8 if pan["offset_days"] != -8 else -7
+            await p.click_text("Continue draft" if "Continue draft" in await p.text() else "Propose changes")
+            expect(await p.wait_for("location.pathname === '/rules/draft' && !!document.querySelector('[aria-label=\"Edit R-PAN\"]')"),
+                   "policy: HR Ops opens a draft")
+            await p.js("document.querySelector('[aria-label=\"Edit R-PAN\"]').click()")
+            await p.wait_for("!!document.querySelector('#rf-due')")
+            await p.fill("#rf-due", new_offset)
+            await p.click_text("Save to draft", "[role=dialog] button")
+            expect(await p.wait_for("document.body.innerText.includes('Changed')"), "policy: rule edit lands in the draft diff")
+            await p.shot(shots / "rules-draft.png")
+            await p.click_text("Preview impact")
+            expect(await p.wait_for("location.pathname === '/rules/draft/preview' && document.body.innerText.includes('Joiners affected')"),
+                   "policy: impact preview renders")
+            await p.settle()
+            await p.shot(shots / "rules-preview.png")
+            await p.fill("#sub-title", f"PAN deadline {abs(new_offset)} days before joining")
+            await p.fill("#sub-reason", "Smoke test: payroll needs PAN slightly later.")
+            await p.click_text("Submit for approval", "button")
+            expect(await p.wait_for("location.pathname === '/rules/history'"), "policy: submit goes to version history")
+            await p.settle()
+            await p.shot(shots / "rules-history.png")
+            vs = await p.api("GET", "/api/policy/versions")
+            vid = vs["open_id"]
+            expect(vid is not None, "policy: submitted version is open")
+
+            await sign_in(*approvers[0])
+            await p.goto(f"{base}/approvals?tab=policy")
+            await p.wait_for("document.body.innerText.includes('Rule set v')")
+            await p.settle()
+            await p.shot(shots / "approvals-policy.png")
+            await p.click_text("Approve", "button")
+            await p.wait_for("!!document.querySelector('[role=dialog]')")
+            await p.click_text("Approve", "[role=dialog] button")
+            published = False
+            for _ in range(40):
+                v = await p.api("GET", f"/api/policy/versions/{vid}")
+                if v["state"] == "active":
+                    published = True
+                    break
+                await asyncio.sleep(1)
+            expect(published, "policy: approver's approval publishes the version")
+            await p.goto(f"{base}/rules")
+            expect(f"Version {before + 1} active" in await p.text(), f"policy: rules page now shows version {before + 1}")
     finally:
         proc.terminate()
         shutil.rmtree(profile, ignore_errors=True)

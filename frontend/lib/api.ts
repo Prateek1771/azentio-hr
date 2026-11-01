@@ -8,6 +8,8 @@ export interface User { id: number; email: string; name: string; role: Role; act
 export function toLogin() {
   if (typeof window === "undefined" || window.location.pathname.startsWith("/login")) return;
   const next = window.location.pathname + window.location.search;
+  // Full navigation on purpose: drops every client-side cache before sign-in.
+  // eslint-disable-next-line @next/next/no-location-assign-relative-destination
   window.location.href = `/login?next=${encodeURIComponent(next)}`;
 }
 
@@ -77,7 +79,49 @@ export interface Template { id: string; name: string; subject: string; body: str
 export interface Rule {
   id: string; item: string; name: string; kind: string; category: string; match: Record<string, unknown>;
   offset_days: number; depends_on: string[]; description: string; policy_ref: string; auto: string;
+  compliance?: boolean; ord?: number;
 }
+
+// ---------- rule-set governance (Phase 1) ----------
+export type VersionState = "draft" | "pending_approval" | "approved" | "active" | "superseded" | "rejected";
+export interface Approval { email: string; name?: string; decision: "approve" | "reject"; reason: string; ts: string }
+export interface RuleSetVersion {
+  id: number; number: number; state: VersionState; title: string; reason: string; based_on: number | null;
+  rollback_of: number | null; required_approvals: number; author_email: string | null; created_at: string;
+  submitted_at: string | null; published_at: string | null; rule_count?: number; approvals: Approval[];
+}
+export interface PolicyDiff {
+  added: Rule[]; removed: Rule[];
+  changed: { id: string; fields: Record<string, [unknown, unknown]> }[];
+}
+export interface ImpactSummary {
+  joiners: number; added: number; cancelled: number; kept_as_evidence: number; due_moved: number; newly_blocked: number; near_start: number;
+}
+export interface VersionDetail extends RuleSetVersion {
+  rules: Rule[]; diff: PolicyDiff; diff_against: number | null; preview: ImpactSummary | null; author_id: number | null;
+}
+export interface ImpactRow {
+  employee_id: string; name: string; department: string; role: string; location: string; joining_date: string; near_start: boolean;
+  added: number; cancelled: number; kept_as_evidence: number; due_moved: number; newly_blocked: number;
+  detail: {
+    added: { key: string; name: string; due: string }[]; cancelled: { key: string; name: string }[];
+    kept_as_evidence: { key: string; name: string; status: string }[];
+    due_moved: { key: string; name: string; from: string; to: string }[]; newly_blocked: string[];
+  };
+}
+export interface PolicyPreview { summary: ImpactSummary; rows: ImpactRow[] }
+export interface VersionsResp { versions: RuleSetVersion[]; active_id: number | null; open_id: number | null }
+export interface WorkItem {
+  id: number; kind: string; entity_type: string; entity_id: string; reason: string; detail: Record<string, unknown>;
+  assignee_role: Role; status: string; sla_due: string | null; created_at: string; resolution: string | null;
+}
+export const STATE_LABEL: Record<VersionState, string> = {
+  draft: "Draft", pending_approval: "Waiting for approval", approved: "Publishing", active: "Active",
+  superseded: "Superseded", rejected: "Rejected",
+};
+export const fmtWhen = (iso?: string | null) => iso
+  ? new Date(iso).toLocaleString("en-GB", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
+  : "—";
 
 export const fmtDate = (iso: string) =>
   iso ? new Date(iso + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : "—";
