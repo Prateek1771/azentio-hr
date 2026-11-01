@@ -57,7 +57,7 @@ cd backend && uv run python test_phase1.py    # rule-set versions, approvals, sa
 - Both use throwaway databases (`azentio_test*`, plus FalkorDB graph `test`) and never touch live data.
 - Each new phase adds `test_phaseN.py`.
 - `backend/.venv/Scripts/python scripts/smoke.py --base http://localhost:3000` runs headless Chrome against the running stack. For every role it signs in through the real form, checks the navigation, checks that allowed pages render and forbidden ones are gated, runs one workflow, and refreshes `docs/screenshots/`.
-- Frontend: `cd frontend && npx tsc --noEmit && npx eslint app components`.
+- Frontend: `cd frontend && npx next typegen && npx tsc --noEmit && npx eslint app components`.
 
 ## CI/CD
 `.github/workflows/ci.yml` runs all of the above on every PR and push to `main`: `backend` (ruff, guard, the three suites, with Postgres and FalkorDB service containers), `frontend` (tsc, eslint), `smoke` (a **production build**, every role, the policy flow and rollback; screenshots as an artifact), then `images`. Images build on every run and are pushed to `ghcr.io/prateek1771/azentio-hr-{backend,frontend}:{sha,latest}` only on a push to `main`. Nothing deploys automatically. The frontend image bakes `BACKEND_URL` in at build time (Next serialises rewrites), default `http://backend:8000`.
