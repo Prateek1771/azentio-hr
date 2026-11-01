@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import checklist
+import records
 import extract
 import logging_setup as ls
 import validate
@@ -23,7 +24,7 @@ def guess_mime(filename: str, given: str | None) -> str:
 async def intake(eid: str, filename: str, data: bytes, mime: str | None, source: str,
                  item_key: str | None = None, notify=None) -> dict:
     """Save → extract → validate → update graph. `notify(emp, item, issues)` sends a correction email."""
-    emp = q1("MATCH (e:Employee {id:$e}) RETURN e", e=eid)["e"]
+    emp = records.employee(eid)
     mime = guess_mime(filename, mime)
     doc_id = new_id("doc")
     path = UPLOADS / f"{doc_id}_{Path(filename).name}"
@@ -56,8 +57,9 @@ async def intake(eid: str, filename: str, data: bytes, mime: str | None, source:
                 result = validate.evaluate(ex, emp, doc_types.get(key, {}))
 
     key = item_key or ex.get("doc_type") or "unknown"
-    item = q1("MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item {key:$k}) RETURN i", e=eid, k=key)
-    item = item["i"] if item else None
+    item = records.item_by_key(eid, key)
+    if item and (item.get("cancelled_by_version") or item.get("superseded_by_version")):
+        item = None  # no longer on the live checklist
     if item is None and not file_issues:
         result = {"status": "Under Review", "issues": [f"Document classified as '{key}', which is not on this checklist."],
                   "mismatches": result["mismatches"]}
@@ -75,7 +77,7 @@ async def intake(eid: str, filename: str, data: bytes, mime: str | None, source:
     if item:
         q("MATCH (i:Item {id:$i}), (d:Document {id:$d}) CREATE (i)-[:HAS_DOC]->(d)", i=item["id"], d=doc_id)
         if item["status"] != "Accepted":  # a later bad upload never downgrades an accepted item
-            q("MATCH (i:Item {id:$i}) SET i.status=$s", i=item["id"], s=result["status"])
+            records.update_item(item["id"], status=result["status"])
         label = item["name"]
     else:
         label = key

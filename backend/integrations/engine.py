@@ -19,6 +19,7 @@ from collections import Counter
 from fastapi import HTTPException
 
 import audit
+import records
 import checklist
 import gmail
 import logging_setup as ls
@@ -81,7 +82,7 @@ def document_results(eid: str) -> list[dict]:
 
 
 async def _ensure_joiner(it: dict, item: dict, cand: dict) -> str:
-    if item.get("joiner_id") and q1("MATCH (e:Employee {id:$e}) RETURN e", e=item["joiner_id"]):
+    if item.get("joiner_id") and records.employee(item["joiner_id"]):
         return item["joiner_id"]
     from main import create_joiner  # shared with quick onboard / connectors
     f = {"name": f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip(), "email": cand.get("email", ""),
@@ -93,10 +94,10 @@ async def _ensure_joiner(it: dict, item: dict, cand: dict) -> str:
         errs = ex.detail.get("errors", []) if isinstance(ex.detail, dict) else []
         raise CandidateNotReady("Can't request documents yet: " + "; ".join(f"{e['field']} — {e['message']}" for e in errs or [{"field": "candidate", "message": str(ex.detail)}]))
     eid = out["id"]
-    q("MATCH (e:Employee {id:$e}) SET e.integration_id=$i", e=eid, i=it["id"])
+    records.update_employee(eid, integration_id=it["id"])
     scope = _documents_for(it, f["role"])
     if scope:  # ask this role only for the documents HR chose for it
-        q("MATCH (e:Employee {id:$e}) SET e.doc_scope=$s", e=eid, s=list(scope))
+        records.update_employee(eid, doc_scope=list(scope))
         checklist.regenerate(eid, f"document set for {f['role'] or 'this role'} chosen in integration {it['name']}")
     store.set_item(item["id"], joiner_id=eid)
     return eid
@@ -122,7 +123,7 @@ async def _request_documents(it: dict, item: dict) -> str:
         via = "recorded (Gmail not configured — simulated, not sent)"
     else:
         sent = await gmail.send_request(eid, "standard")
-        preview = q1("MATCH (e:Employee {id:$e}) RETURN e.thread_id AS t", e=eid)
+        preview = {"t": (records.employee(eid) or {}).get("thread_id", "")}
         delivery.record(it["id"], item["id"], "document_request", cand.get("email", ""), sent["subject"],
                         "Documents requested: " + ", ".join(d["name"] for d in docs), attempt, "gmail", preview["t"] if preview else "", name)
         via = "emailed through Gmail"

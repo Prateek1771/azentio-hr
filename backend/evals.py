@@ -78,10 +78,10 @@ async def run(rid: str) -> dict:
     questions, attacks = golden["questions"], golden["attacks"]
     q("MATCH (r:EvalRun {id:$id}) SET r.total=$n", id=rid, n=len(questions))
     try:
-        emp = q1("MATCH (e:Employee {email:$m}) RETURN e", m=golden["employee_email"])
+        import records
+        emp = records.employee_by(email=golden["employee_email"])
         if not emp:
             raise RuntimeError(f"seed employee {golden['employee_email']} not found")
-        emp = emp["e"]
         items = checklist.employee_items(emp["id"])
         hr = next((i["owner_email"] for i in items if i["category"] == "HR" and i.get("owner_email")), "your HR partner")
         faith, precision, recall = _metrics()

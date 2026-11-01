@@ -2,7 +2,9 @@
 import json
 from datetime import date, timedelta
 
+import records
 from graph import q, q1, new_id, event
+from shared import db
 
 DONE = {"Accepted", "Completed", "Acknowledged"}
 INITIAL = {"document": "Not Submitted", "task": "Pending", "ack": "Pending"}
@@ -104,39 +106,38 @@ def category_owners() -> dict:
 
 
 def employee_items(eid: str) -> list[dict]:
-    return [r["i"] for r in q("MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item) RETURN i ORDER BY i.due", e=eid)]
+    return records.items(eid)
 
 
 def regenerate(eid: str, reason: str | None = None):
-    """(Re)build an employee's checklist. Keeps progress on items that still apply; recalculates due dates/owners."""
-    emp = q1("MATCH (e:Employee {id:$e}) RETURN e", e=eid)["e"]
+    """(Re)build an employee's checklist. Keeps progress on items that still apply; recalculates due dates/owners.
+
+    ponytail: step 1 of Phase 1 keeps today's semantics (items that no longer apply are deleted); step 2 replaces
+    this with policy.replay, which cancels or keeps them as evidence instead.
+    """
+    emp = records.employee(eid)
     new = build_items(emp, load_rules(), config("doc_types") or {}, config("locations") or {}, category_owners())
     existing = {i["key"]: i for i in employee_items(eid)}
     new_keys = {i["key"] for i in new}
-
-    for key, old in existing.items():
-        if key not in new_keys:
-            q("MATCH (i:Item {id:$id}) DETACH DELETE i", id=old["id"])
+    removed = [old for key, old in existing.items() if key not in new_keys]
+    with db.tx() as c:
+        for old in removed:
+            c.execute("DELETE FROM items WHERE id=%s", (old["id"],))
             if reason:
                 event(eid, "checklist", f"Removed '{old['name']}' ({reason})")
-
-    for it in new:
-        old = existing.get(it["key"])
-        if old:
-            if reason and old.get("due") != it["due"]:
-                event(eid, "checklist", f"'{it['name']}' due date moved {old['due']} → {it['due']} ({reason})")
-            q("MATCH (i:Item {id:$id}) SET i += $p", id=old["id"], p={k: v for k, v in it.items()})
-        else:
-            q("MATCH (e:Employee {id:$e}) CREATE (e)-[:HAS_ITEM]->(i:Item) SET i = $p",
-              e=eid, p={**it, "id": new_id("it"), "employee_id": eid, "status": INITIAL[it["kind"]]})
-            if reason:
-                event(eid, "checklist", f"Added '{it['name']}' ({reason})")
-
-    q("MATCH (:Employee {id:$e})-[:HAS_ITEM]->(:Item)-[d:DEPENDS_ON|OWNED_BY]->() DELETE d", e=eid)
-    q("""MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item) UNWIND i.depends AS dk
-         MATCH (:Employee {id:$e})-[:HAS_ITEM]->(j:Item {key:dk}) CREATE (i)-[:DEPENDS_ON]->(j)""", e=eid)
-    q("""MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item) MATCH (o:Owner {email:i.owner_email})
-         CREATE (i)-[:OWNED_BY]->(o)""", e=eid)
+        for it in new:
+            old = existing.get(it["key"])
+            if old:
+                if reason and old.get("due") != it["due"]:
+                    event(eid, "checklist", f"'{it['name']}' due date moved {old['due']} → {it['due']} ({reason})")
+                records.update_item(old["id"], conn=c, **it)
+            else:
+                records.save_item({**it, "id": new_id("it"), "employee_id": eid, "status": INITIAL[it["kind"]]}, conn=c)
+                if reason:
+                    event(eid, "checklist", f"Added '{it['name']}' ({reason})")
+    for old in removed:
+        q("MATCH (i:Item {id:$id}) DETACH DELETE i", id=old["id"])
+    records.project(eid)
     recompute(eid)
 
 
@@ -153,13 +154,13 @@ def recompute(eid: str):
             if any(by_key[d]["status"] not in DONE for d in it.get("depends", []) if d in by_key):
                 continue
             if it.get("auto") == "complete":
-                q("MATCH (i:Item {id:$id}) SET i.status='Completed'", id=it["id"])
+                records.update_item(it["id"], status="Completed")
                 event(eid, "auto", f"'{it['name']}' completed automatically — all prerequisites met")
                 if it["key"] == "hr_record":  # onboarding → HR Portal target
                     from connectors.hr_portal import push_employee
                     push_employee(eid)
                 changed = True
             elif it["status"] == "Pending":
-                q("MATCH (i:Item {id:$id}) SET i.status='Requested'", id=it["id"])
+                records.update_item(it["id"], status="Requested")
                 event(eid, "auto", f"Request raised to {it['owner_name'] or it['category']}: '{it['name']}'")
                 changed = True

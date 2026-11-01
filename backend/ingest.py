@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 import checklist
+import records
 from graph import q, q1, event
 
 SEED = Path(__file__).parent / "seed"
@@ -82,20 +83,17 @@ def validate_employees(rows: list[dict], departments: list[str], locations: dict
 
 
 def upsert_employee(r: dict, reason: str = "import") -> str:
-    existing = q1("MATCH (e:Employee) WHERE toLower(e.email)=toLower($m) RETURN e", m=r["email"])
-    eid = (existing["e"]["id"] if existing else None) or r.get("employee_id") or f"E{secrets.randbelow(90000) + 10000}"
+    existing = records.employee_by(email=r["email"])
+    eid = (existing["id"] if existing else None) or r.get("employee_id") or f"E{secrets.randbelow(90000) + 10000}"
     props = {k: r.get(k, "") for k in EMP_REQUIRED + ["date_of_birth"]}
     props["email"] = props["email"].lower()
     props["manager_email"] = props["manager_email"].lower()
     if existing:
-        q("MATCH (e:Employee {id:$id}) SET e += $p", id=eid, p=props)
+        records.update_employee(eid, **props)  # also refreshes REPORTS_TO in the graph projection
     else:
-        q("CREATE (e:Employee) SET e = $p", p={**props, "id": eid, "token": secrets.token_urlsafe(16), "thread_id": "",
-                                      "created": datetime.now().isoformat()})
+        records.save_employee({**props, "id": eid, "token": secrets.token_urlsafe(16), "thread_id": "",
+                               "created": datetime.now().isoformat()})
         event(eid, "profile", f"Onboarding record created ({reason})")
-    q("MATCH (e:Employee {id:$id})-[r:REPORTS_TO]->() DELETE r", id=eid)
-    q("MATCH (e:Employee {id:$id}), (m) WHERE (m:Owner OR m:Employee) AND toLower(m.email)=e.manager_email "
-      "CREATE (e)-[:REPORTS_TO]->(m)", id=eid)
     checklist.regenerate(eid)
     return eid
 
@@ -103,7 +101,7 @@ def upsert_employee(r: dict, reason: str = "import") -> str:
 def import_employees(filename: str, data: bytes) -> dict:
     rows = read_table(filename, data)
     managers = {r["m"] for r in q("MATCH (o:Owner {type:'manager'}) RETURN toLower(o.email) AS m")}
-    managers |= {r["m"] for r in q("MATCH (e:Employee) RETURN toLower(e.email) AS m")}
+    managers |= records.emails()
     valid, errors = validate_employees(rows, checklist.config("departments") or [], checklist.config("locations") or {}, managers)
     ids = [upsert_employee(r) for r in valid]
     return {"kind": "employees", "total": len(rows), "imported": len(ids), "errors": errors, "ids": ids}
@@ -148,8 +146,8 @@ def import_requirements(filename: str, data: bytes) -> dict:
             errors += [{"row": i, "field": f, "message": "Missing mandatory field", "name": r.get("id", "")} for f in miss]
             continue
         save_rule(r, ord_=i)
-    for e in q("MATCH (e:Employee) RETURN e.id AS id"):
-        checklist.regenerate(e["id"], "requirements updated")
+    for eid in records.employee_ids():
+        checklist.regenerate(eid, "requirements updated")
     return {"kind": "requirements", "total": len(rules), "imported": len(rules) - len({e['row'] for e in errors}), "errors": errors}
 
 
@@ -195,7 +193,5 @@ DEMO_PROGRESS = {  # employee -> item keys already done, so the dashboard shows 
 
 def demo_progress():
     for eid, keys in DEMO_PROGRESS.items():
-        q("""MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item) WHERE i.key IN $k
-             SET i.status = CASE i.kind WHEN 'document' THEN 'Accepted' WHEN 'ack' THEN 'Acknowledged' ELSE 'Completed' END""",
-          e=eid, k=keys)
+        records.set_items_status(eid, keys, {"document": "Accepted", "ack": "Acknowledged", "task": "Completed"})
         checklist.recompute(eid)

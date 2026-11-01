@@ -157,7 +157,8 @@ Answer ONLY from the CONTEXT: live onboarding data for every new joiner, owners,
 def hr_context(question: str, chunks: list[dict], focus_id: str | None) -> str:
     import checklist
     today = date.today()
-    emps = [r["e"] for r in q("MATCH (e:Employee) RETURN e ORDER BY e.joining_date")]
+    import records
+    emps = records.employees()
     qlow = question.lower()
     # ponytail: full item lists for everyone up to 40 joiners; beyond that only joiners named in the question,
     # starting within 14 days, or in focus. Upgrade path: retrieve per-joiner digests by embedding.
@@ -213,7 +214,9 @@ async def hr_answer_stream(message: str, history: list[dict], focus_id: str | No
     chunks = await retrieve(message, k=4)
     yield _sources(chunks)
     ctx = hr_context(message, chunks, focus_id)
-    focus = q("MATCH (e:Employee {id:$e}) RETURN e.name AS n", e=focus_id) if focus_id else []
+    import records
+    fe = records.employee(focus_id) if focus_id else None
+    focus = [{"n": fe["name"]}] if fe else []
     system = HR_SYSTEM.format(today=date.today().isoformat())
     if focus:
         system += f"\nHR is currently viewing {focus[0]['n']}'s record; 'they' or 'this person' refers to them."

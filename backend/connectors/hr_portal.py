@@ -3,6 +3,7 @@ import json
 import re
 import secrets
 
+import records
 from graph import q, q1, event
 from .base import Connector, FieldSpec, RecordRejected
 
@@ -110,10 +111,11 @@ def push_employee(eid: str):
         iid = instance_id_for("hr_portal")
         if not iid:
             return
-        e = q1("MATCH (e:Employee {id:$e}) RETURN e", e=eid)["e"]
+        e = records.employee(eid)
         if e.get("integration_id"):  # the integration creates this employee after HR approval
             return
-        mgr = q1("MATCH (m) WHERE (m:Owner OR m:Employee) AND toLower(m.email)=$m RETURN m.name AS n", m=e.get("manager_email", ""))
+        mgr = q1("MATCH (m:Owner) WHERE toLower(m.email)=$m RETURN m.name AS n", m=e.get("manager_email", "")) or \
+            ({"n": r["name"]} if (r := records.employee_by(email=e.get("manager_email") or "")) else None)
         first, _, last = e["name"].partition(" ")
         values = {"first_name": first, "last_name": last or first, "work_email": e["email"], "job_title": e["role"],
                   "department_name": e["department"], "grade": e["grade"], "location": e["location"],

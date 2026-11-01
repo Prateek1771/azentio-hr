@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import os
+import time
 from email.mime.text import MIMEText
 from email.utils import parseaddr
 from functools import lru_cache
@@ -13,6 +14,7 @@ from markupsafe import Markup
 
 import logging_setup as ls
 import pipeline
+import records
 from graph import q, q1, event
 
 LABEL = "azentio-processed"
@@ -62,13 +64,12 @@ async def send(to: str, subject: str, html: str, thread_id: str | None = None) -
 
 
 async def send_request(eid: str, template_id: str) -> dict:
-    emp = q1("MATCH (e:Employee {id:$e}) RETURN e", e=eid)["e"]
-    docs = q("""MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item {kind:'document'})
-                WHERE i.status <> 'Accepted' RETURN i.name AS n, i.due AS d ORDER BY i.due""", e=eid)
-    doc_list = "<ul>" + "".join(f"<li><b>{d['n']}</b> — by {d['d']}</li>" for d in docs) + "</ul>"
+    emp = records.employee(eid)
+    docs = [i for i in records.items(eid) if i["kind"] == "document" and i["status"] != "Accepted"]
+    doc_list = "<ul>" + "".join(f"<li><b>{d['name']}</b> — by {d['due']}</li>" for d in docs) + "</ul>"
     subject, html = render(template_id, {**employee_ctx(emp), "doc_list": doc_list})
     sent = await send(emp["email"], subject, html)
-    q("MATCH (e:Employee {id:$e}) SET e.thread_id=$t, e.request_sent=timestamp()", e=eid, t=sent["threadId"])
+    records.update_employee(eid, thread_id=sent["threadId"], request_sent=int(time.time() * 1000))
     event(eid, "email", f"Document request '{subject}' sent to {emp['email']}")
     return {"thread_id": sent["threadId"], "subject": subject}
 
@@ -120,19 +121,18 @@ def _fetch_new(senders: list[str]) -> list[dict]:
 
 async def poll() -> int:
     """Process unread reply attachments. Matches by Gmail thread, falls back to sender address."""
-    senders = sorted({r["m"] for r in q("MATCH (e:Employee) WHERE e.email <> '' RETURN toLower(e.email) AS m")})
+    senders = sorted(records.emails())
     if os.getenv("EMAIL_REDIRECT_TO"):
         senders = sorted({*senders, os.environ["EMAIL_REDIRECT_TO"].strip().lower()})
     messages = await asyncio.to_thread(_fetch_new, senders)
     processed = 0
     ls.log_event(_log, "gmail.poll", senders=len(senders), messages=len(messages))
     for m in messages:
-        emp = q1("MATCH (e:Employee) WHERE e.thread_id=$t RETURN e", t=m["thread_id"]) or \
-              q1("MATCH (e:Employee) WHERE toLower(e.email)=$f RETURN e", f=m["from"])
+        emp = records.employee_by(thread_id=m["thread_id"]) or records.employee_by(email=m["from"])
         if not emp:
             event(None, "email", f"Unmatched email from {m['from']} ('{m['subject']}') ignored")
             continue
-        eid = emp["e"]["id"]
+        eid = emp["id"]
         event(eid, "email", f"Reply received from {m['from']} with {len(m['attachments'])} attachment(s) — running verification")
         for filename, mime, data in m["attachments"]:
             await pipeline.intake(eid, filename, data, mime, "email", notify=send_correction)

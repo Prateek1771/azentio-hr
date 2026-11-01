@@ -163,13 +163,15 @@ import logging_setup as _ls  # noqa: E402
 _ls.setup()
 from integrations.store import SetupError  # noqa: E402
 
-gq("MATCH (e:Employee) WHERE e.integration_id IS NOT NULL OPTIONAL MATCH (e)-[:HAS_ITEM]->(i:Item) DETACH DELETE i, e")
+# Postgres is recreated empty each run; clear the test graph's projection of employees/items to match it.
+gq("MATCH (n) WHERE n:Employee OR n:Item DETACH DELETE n")
 gq("MATCH (r:Record)-[:IN]->(:ConnectorInstance)-[:OF]->(:Connector {role:'app'}) DETACH DELETE r")
 gq("MATCH (n) WHERE n:Integration OR n:IntegrationCandidate OR n:WorkflowRun OR n:IntegrationLogRecord OR n:AgentMessage OR n:OutboundMessage DETACH DELETE n")
 gq("MERGE (c:Config {key:'locations'}) SET c.value=$v", v=json.dumps(cfg["locations"]))
 gq("MERGE (c:Config {key:'doc_types'}) SET c.value=$v", v=json.dumps(cfg["doc_types"]))
 gq("MERGE (c:Config {key:'roles'}) SET c.value=$v", v=json.dumps(cfg["roles"]))
 import ingest as _ingest  # noqa: E402
+import records  # noqa: E402
 if not gq1("MATCH (r:Rule) RETURN r LIMIT 1"):
     _ingest.import_requirements("requirements.json", (Path(__file__).parent / "seed" / "requirements.json").read_bytes())
 if not gq1("MATCH (o:Owner {type:'manager'}) RETURN o LIMIT 1"):
@@ -244,7 +246,7 @@ async def _wf():
     first = asked[0]
     for i in _cl.employee_items(first["joiner_id"]):
         if i["kind"] == "document":
-            gq("MATCH (x:Item {id:$id}) SET x.status='Accepted'", id=i["id"])
+            records.update_item(i["id"], status="Accepted")
     assert wf_engine.on_documents_changed(first["joiner_id"]) == "applied"
     assert wf_store.item(first["id"])["stage"] == "awaiting_hr_approval"
     try:

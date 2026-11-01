@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
@@ -22,6 +23,7 @@ import checklist  # noqa: E402
 import gmail  # noqa: E402
 import ingest  # noqa: E402
 import pipeline  # noqa: E402
+import records  # noqa: E402
 from graph import q, q1, event  # noqa: E402
 from identity import perms, service as identity  # noqa: E402
 from shared import bootstrap, db, jobs  # noqa: E402
@@ -108,24 +110,24 @@ def _visible(e: dict) -> bool:
 
 
 def get_emp(eid: str) -> dict:
-    row = q1("MATCH (e:Employee {id:$e}) RETURN e", e=eid)
-    if not row or not _visible(row["e"]):  # 404, not 403: don't reveal that someone else's report exists
+    e = records.employee(eid)
+    if not e or not _visible(e):  # 404, not 403: don't reveal that someone else's report exists
         raise HTTPException(404, "Employee not found")
-    return row["e"]
+    return e
 
 
 def emp_by_token(token: str) -> dict:
-    row = q1("MATCH (e:Employee {token:$t}) RETURN e", t=token)
-    if not row:
+    e = records.employee_by(token=token)
+    if not e:
         raise HTTPException(404, "Invalid portal link")
-    return row["e"]
+    return e
 
 
 def items_with_state(eid: str) -> list[dict]:
     items = checklist.employee_items(eid)
     by_key = {i["key"]: i for i in items}
-    docs = q("""MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item)-[:HAS_DOC]->(d:Document)
-                RETURN i.id AS item, d ORDER BY d.ts DESC""", e=eid)
+    docs = q("""MATCH (i:Item)-[:HAS_DOC]->(d:Document) WHERE i.id IN $ids
+                RETURN i.id AS item, d ORDER BY d.ts DESC""", ids=[i["id"] for i in items]) if items else []
     for i in items:
         i["state"] = checklist.view_state(i, by_key)
         i["blocked_by"] = [by_key[d]["name"] for d in i.get("depends", []) if d in by_key and by_key[d]["status"] not in checklist.DONE]
@@ -171,8 +173,7 @@ def flags(eid: str, items: list[dict]) -> list[dict]:
 @app.get("/api/employees")
 def list_employees(department: str = "", location: str = "", status: str = "", join_from: str = "", join_to: str = "", search: str = ""):
     out = []
-    for row in q("MATCH (e:Employee) RETURN e ORDER BY e.joining_date"):
-        e = row["e"]
+    for e in records.employees():
         if not _visible(e):
             continue
         if department and e["department"] != department or location and e["location"] != location:
@@ -276,7 +277,7 @@ def patch_employee(eid: str, body: EmployeePatch):
         return employee_detail(eid)
     if "joining_date" in changes and not ingest.norm_date(changes["joining_date"]):
         raise HTTPException(400, "Invalid joining date")
-    q("MATCH (e:Employee {id:$id}) SET e += $p", id=eid, p=changes)
+    records.update_employee(eid, **changes)
     desc = ", ".join(f"{k.replace('_', ' ')} {e.get(k)} → {v}" for k, v in changes.items())
     event(eid, "change", f"Profile updated: {desc}")
     audit.record_audit("employee.updated", "employee", eid, f"Changed {', '.join(changes)} for joiner {eid}")
@@ -302,9 +303,8 @@ async def send_request(eid: str, body: SendBody):
 @app.get("/api/employees/{eid}/preview-email")
 def preview_email(eid: str, template_id: str = "standard"):
     e = get_emp(eid)
-    docs = q("""MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item {kind:'document'}) WHERE i.status <> 'Accepted'
-                RETURN i.name AS n, i.due AS d ORDER BY i.due""", e=eid)
-    doc_list = "<ul>" + "".join(f"<li><b>{d['n']}</b> — by {d['d']}</li>" for d in docs) + "</ul>"
+    docs = [i for i in records.items(eid) if i["kind"] == "document" and i["status"] != "Accepted"]
+    doc_list = "<ul>" + "".join(f"<li><b>{d['name']}</b> — by {d['due']}</li>" for d in docs) + "</ul>"
     subject, html = gmail.render(template_id, {**gmail.employee_ctx(e), "doc_list": doc_list})
     return {"to": e["email"], "subject": subject, "html": html}
 
@@ -316,11 +316,10 @@ class ItemStatus(BaseModel):
 
 @app.post("/api/items/{item_id}/status")
 async def set_item_status(item_id: str, body: ItemStatus):
-    row = q1("MATCH (i:Item {id:$id}) RETURN i", id=item_id)
-    if not row:
+    it = records.item(item_id)
+    if not it or not _visible(records.employee(it["employee_id"]) or {}):
         raise HTTPException(404, "Item not found")
-    it = row["i"]
-    q("MATCH (i:Item {id:$id}) SET i.status=$s", id=item_id, s=body.status)
+    records.update_item(item_id, status=body.status)
     if it["kind"] == "document":
         q("MATCH (i:Item {id:$id})-[:HAS_DOC]->(d:Document) WITH d ORDER BY d.ts DESC LIMIT 1 SET d.status=$s",
           id=item_id, s=body.status)
@@ -340,8 +339,7 @@ async def set_item_status(item_id: str, body: ItemStatus):
 async def escalate():
     """Email the owner of every overdue task that is blocking other work (Scenario 5)."""
     sent = []
-    for row in q("MATCH (e:Employee) RETURN e"):
-        e = row["e"]
+    for e in records.employees():
         items = items_with_state(e["id"])
         for i in items:
             if i["state"] != "overdue" or i["kind"] == "document" or not i.get("owner_email"):
@@ -449,8 +447,8 @@ def save_rule(rid: str, r: Rule):
     existing = q1("MATCH (x:Rule {id:$id}) RETURN x.ord AS o", id=rid)
     nxt = q1("MATCH (x:Rule) RETURN coalesce(max(x.ord), 0) + 1 AS o")["o"]
     ingest.save_rule(r.model_dump(), ord_=existing["o"] if existing else nxt)
-    for e in q("MATCH (e:Employee) RETURN e.id AS id"):
-        checklist.regenerate(e["id"], f"rule {rid} updated")
+    for eid in records.employee_ids():
+        checklist.regenerate(eid, f"rule {rid} updated")
     return rules()
 
 
@@ -458,8 +456,8 @@ def save_rule(rid: str, r: Rule):
 def delete_rule(rid: str):
     audit.record_audit("rule.deleted", "rule", rid, f"Removed requirement rule {rid}")
     q("MATCH (r:Rule {id:$id}) DELETE r", id=rid)
-    for e in q("MATCH (e:Employee) RETURN e.id AS id"):
-        checklist.regenerate(e["id"], f"rule {rid} removed")
+    for eid in records.employee_ids():
+        checklist.regenerate(eid, f"rule {rid} removed")
     return rules()
 
 
@@ -494,11 +492,11 @@ async def portal_upload(token: str, file: UploadFile = File(...), item_key: str 
 @app.post("/api/portal/{token}/ack/{item_id}")
 def portal_ack(token: str, item_id: str):
     e = emp_by_token(token)
-    row = q1("MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item {id:$i, kind:'ack'}) RETURN i", e=e["id"], i=item_id)
-    if not row:
+    it = records.item(item_id)
+    if not it or it["employee_id"] != e["id"] or it["kind"] != "ack":
         raise HTTPException(404, "Item not found")
-    q("MATCH (i:Item {id:$i}) SET i.status='Acknowledged', i.acknowledged_at=timestamp()", i=item_id)
-    event(e["id"], "acknowledgement", f"{e['name']} acknowledged '{row['i']['name']}'")
+    records.update_item(item_id, status="Acknowledged", acknowledged_at=int(time.time() * 1000))
+    event(e["id"], "acknowledgement", f"{e['name']} acknowledged '{it['name']}'")
     checklist.recompute(e["id"])
     return portal(token)
 
@@ -551,7 +549,7 @@ async def create_joiner(f: dict, template_id: str, send: bool, reason: str, cand
            "location": f.get("location", ""), "joining_date": f.get("joining_date", ""),
            "grade": f.get("grade") or preset.get("grade", ""), "department": department, "manager_email": manager,
            "date_of_birth": f.get("date_of_birth") or ""}
-    managers = {r["m"] for r in q("MATCH (m) WHERE m:Owner OR m:Employee RETURN toLower(m.email) AS m")}
+    managers = {r["m"] for r in q("MATCH (m:Owner) RETURN toLower(m.email) AS m")} | records.emails()
     valid, errors = ingest.validate_employees([row], checklist.config("departments") or [], checklist.config("locations") or {}, managers)
     if errors:
         raise HTTPException(400, {"message": "Please fix the highlighted fields", "errors": errors})

@@ -54,12 +54,35 @@ def ensure_users() -> list[str]:
 def ensure_dev_manager_reports() -> None:
     if is_production():
         return
-    try:
-        from graph import q
-        q("MATCH (e:Employee) WHERE e.id IN $ids AND coalesce(e.manager_email,'') <> 'manager@azentio.local' "
-          "SET e.manager_email='manager@azentio.local'", ids=list(DEV_MANAGED))
-    except Exception as e:
-        ls.log_event(_log, "dev_manager.skipped", error=type(e).__name__)
+    import records
+    for eid in DEV_MANAGED:
+        e = records.employee(eid)
+        if e and e.get("manager_email") != "manager@azentio.local":
+            records.update_employee(eid, manager_email="manager@azentio.local")
+
+
+def migrate_records() -> dict:
+    """Employee/Item graph -> Postgres, once: backfill, then switch reads only if parity passes (else refuse to start)."""
+    from shared import bridge
+    import records
+    bridge.load()
+    todo = [t for t in ("Employee", "Item") if bridge.source(t) != "postgres"]
+    if not todo:
+        return {"records": "postgres"}
+    if not graph_ok():
+        raise SystemExit("bootstrap: the graph is unreachable, so employees/items can't be migrated to Postgres yet. "
+                         "Start FalkorDB (`docker compose up -d falkordb`) and restart.")
+    report = records.backfill()
+    for t in todo:
+        g, p = records.parity_rows(t)
+        try:
+            report[t] = bridge.switch(t, g, p)
+        except bridge.ParityError as e:
+            raise SystemExit(f"bootstrap: {e}. Reads stay off Postgres; fix the data and restart.") from None
+    records.rebuild_graph()  # normalise the projection once (edges written by older code paths)
+    ls.log_event(_log, "records.migrated", employees=report["employees"], items=report["items"],
+                 skipped=len(report["skipped_items"]), extra_keys=",".join(report["extra_keys"]))
+    return report
 
 
 def graph_ok() -> bool:
@@ -79,6 +102,7 @@ def run() -> dict:
     from audit_log.service import import_graph_rows
     imported = import_graph_rows() if graph_ok() else 0  # before anything else writes audit rows: history stays first in the chain
     created = ensure_users()
+    migrate_records()
     state = {"migrations": applied, "users_created": created, "audit_imported": imported, "graph": graph_ok()}
     ls.log_event(_log, "done", **{k: (len(v) if isinstance(v, list) else v) for k, v in state.items()})
     if created and not is_production():
