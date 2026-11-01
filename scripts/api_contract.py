@@ -43,17 +43,50 @@ def shape(v):
     return {bool: "bool", int: "int", float: "float", str: "str"}.get(type(v), type(v).__name__)
 
 
+def _split(x):
+    """-> (shape without null, nullable). Nullable objects/lists are wrapped as {"__or_null__": shape}."""
+    if x == "null":
+        return None, True
+    if isinstance(x, dict) and set(x) == {"__or_null__"}:
+        return x["__or_null__"], True
+    if isinstance(x, str) and "null" in x.split("|"):
+        return "|".join(t for t in x.split("|") if t != "null"), True
+    return x, False
+
+
 def merge(a, b):
+    """Union of two shapes. Commutative and order-independent: None means 'no sample', not a null value."""
     if a is None:
         return b
-    if isinstance(a, dict) and isinstance(b, dict):
-        return {k: merge(a.get(k), b.get(k)) if k in a and k in b else (a.get(k) if k in a else b.get(k))
-                for k in sorted(set(a) | set(b))}
-    if isinstance(a, list) and isinstance(b, list):
-        return [merge(a[0] if a else None, b[0] if b else None)] if (a or b) else []
-    if a == b:
+    if b is None:
         return a
-    return "|".join(sorted(set(str(a).split("|")) | set(str(b).split("|"))))
+    (ia, na), (ib, nb) = _split(a), _split(b)
+    if ia is None or ib is None:
+        inner = ib if ia is None else ia
+    elif isinstance(ia, dict) and isinstance(ib, dict):
+        inner = {k: merge(ia.get(k), ib.get(k)) for k in sorted(set(ia) | set(ib))}
+    elif isinstance(ia, list) and isinstance(ib, list):
+        inner = [merge(ia[0] if ia else None, ib[0] if ib else None)] if (ia or ib) else []
+    elif isinstance(ia, str) and isinstance(ib, str):
+        inner = "|".join(sorted(set(ia.split("|")) | set(ib.split("|"))))
+    else:  # an object in one row, a scalar in another: keep both, sorted so order can't matter
+        inner = "|".join(sorted([json.dumps(ia, sort_keys=True), json.dumps(ib, sort_keys=True)]))
+    if inner is None:
+        return "null"
+    if not (na or nb):
+        return inner
+    if isinstance(inner, str):
+        return "|".join(sorted(set(inner.split("|")) | {"null"}))
+    return {"__or_null__": inner}
+
+
+def _selfcheck():
+    import itertools
+    rows = [{"a": None, "b": [], "c": {"x": 1}}, {"a": "s", "b": ["t"], "c": None}, {"a": 1.5, "b": [None], "c": {"y": "z"}}]
+    shapes = {json.dumps(shape(list(p)), sort_keys=True) for p in itertools.permutations(rows)}
+    assert len(shapes) == 1, shapes
+    s = json.loads(shapes.pop())[0]
+    assert s["a"] == "float|null|str" and s["b"] == ["null|str"] and s["c"] == {"__or_null__": {"x": "int", "y": "str"}}, s
 
 
 def diff(old, new, path="") -> list[str]:
@@ -201,6 +234,7 @@ if __name__ == "__main__":
     g.add_argument("--capture", action="store_true")
     g.add_argument("--check", action="store_true")
     a = ap.parse_args()
+    _selfcheck()
     now = capture()
     if a.capture:
         SNAPSHOT.parent.mkdir(exist_ok=True)

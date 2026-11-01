@@ -36,7 +36,7 @@ restore path.**
    features.
 5. **Live rollback drill**
    1. Write through the app: create or edit at least one record of each label in the batch.
-   2. Stop the backend.
+   2. Stop the backend. The rollback tool refuses while any instance's heartbeat is still advancing.
    3. Run `uv run python -m graph_migration rollback <batch>`. It writes the Postgres rows, including the new ones,
       back to the graph, checks parity, and switches the bridge back to `graph`.
    4. Confirm the new records are in the graph and parity is ok in the output.

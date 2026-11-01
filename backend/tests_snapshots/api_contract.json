@@ -78,7 +78,7 @@
      ],
      "email": "str",
      "employment_history": [
-      "None|str"
+      "str"
      ],
      "first_name": "str",
      "grade": "str",
@@ -164,10 +164,41 @@
     "cancelled_by_version": "null",
     "category": "str",
     "depends": [
-     "None|str"
+     "str"
     ],
     "documents": [
-     "None|{'checks': [], 'confidence': 'float', 'current_decision_id': 'int', 'decided_at': 'str', 'decision': {'by': 'null', 'kind': 'str', 'policy_version': 'null', 'reason': 'str', 'reason_code': 'str'}, 'doc_type': 'str', 'employee_id': 'str', 'extracted': {}, 'filename': 'str', 'id': 'str', 'issues': [], 'item_id': 'str', 'mime': 'str', 'model': 'null', 'policy_version_id': 'null', 'prompt_version': 'null', 'received_at': 'str', 'seed': 'str', 'sha256': 'null', 'size': 'int', 'source': 'str', 'status': 'str', 'tier': 'null', 'ts': 'float'}"
+     {
+      "checks": [],
+      "confidence": "float",
+      "current_decision_id": "int",
+      "decided_at": "str",
+      "decision": {
+       "by": "null",
+       "kind": "str",
+       "policy_version": "null",
+       "reason": "str",
+       "reason_code": "str"
+      },
+      "doc_type": "str",
+      "employee_id": "str",
+      "extracted": {},
+      "filename": "str",
+      "id": "str",
+      "issues": [],
+      "item_id": "str",
+      "mime": "str",
+      "model": "null",
+      "policy_version_id": "null",
+      "prompt_version": "null",
+      "received_at": "str",
+      "seed": "str",
+      "sha256": "null",
+      "size": "int",
+      "source": "str",
+      "status": "str",
+      "tier": "null",
+      "ts": "float"
+     }
     ],
     "due": "str",
     "employee_id": "str",
@@ -220,7 +251,7 @@
    "days_to_join": "int",
    "department": "str",
    "doc_scope": [
-    "None|str"
+    "str"
    ],
    "email": "str",
    "flags": "int",
@@ -885,7 +916,7 @@
     "category": "str",
     "compliance": "bool",
     "depends_on": [
-     "None|str"
+     "str"
     ],
     "description": "str",
     "id": "str",

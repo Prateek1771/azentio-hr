@@ -116,9 +116,18 @@ def backfill(spec: LabelSpec, conn) -> int:
 
 # ---------- the report ----------
 
+def label_rx(label: str) -> re.Pattern:
+    lab = re.escape(label)
+    # node pattern `(x:A:Label` (Cypher style here: no space before ':'), or a label test after WHERE/AND/OR/NOT
+    return re.compile(rf"\(\w*(?::\w+)*:{lab}\b|\b(?i:WHERE|AND|OR|NOT)\s+\w+:{lab}\b")
+
+
 def read_paths(label: str, allowed: tuple = ()) -> list[str]:
-    """Code that still reads the label from the graph: `MATCH (x:Label` / `(:Label` in a MATCH, outside the allowed files."""
-    rx = re.compile(rf"MATCH[^\n]*\(\s*\w*\s*:\s*{re.escape(label)}\b")
+    """Code that still touches the label in the graph, outside the allowed files: any node pattern naming it
+    (`(x:Label`, `(:Label`, `(x:Other:Label`, on any line of a multi-line query, read or write) or a label test
+    (`WHERE x:Label`). Per line, so it doesn't need the MATCH on the same line.
+    ponytail: a label built at runtime (f"(n:{label})") can't be seen statically; graph.q()'s runtime check covers it."""
+    rx = label_rx(label)
     hits = []
     for base in (ROOT, ROOT.parent / "scripts"):
         for p in base.rglob("*.py"):
@@ -200,13 +209,7 @@ def cutover(batch: str, watch: float | None = None) -> dict:
     todo = pending(batch)
     if not todo:
         return {"batch": batch, "already": True}
-    with db.pool().connection() as lock:
-        if not lock.execute("SELECT pg_try_advisory_lock(%s) AS ok", (LOCK_KEY,)).fetchone()["ok"]:
-            raise FreezeError(f"batch {batch}: another instance is cutting over right now; restart after it finishes")
-        try:
-            return _cutover(batch, todo, check_freeze(watch))
-        finally:
-            lock.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+    return _exclusive(f"batch {batch}", watch, lambda freeze: _cutover(batch, todo, freeze))
 
 
 def _cutover(batch: str, todo: list[LabelSpec], freeze: dict) -> dict:
@@ -243,9 +246,25 @@ def drift_since_cutover() -> list[dict]:
     return out
 
 
-def rollback(batch: str) -> dict:
+def _exclusive(what: str, watch: float | None, fn):
+    """Run fn(freeze evidence) holding the migration advisory lock, with no other live instance."""
+    with db.pool().connection() as lock:
+        if not lock.execute("SELECT pg_try_advisory_lock(%s) AS ok", (LOCK_KEY,)).fetchone()["ok"]:
+            raise FreezeError(f"{what}: another instance is cutting over or rolling back right now; retry after it finishes")
+        try:
+            return fn(check_freeze(watch))
+        finally:
+            lock.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+
+
+def rollback(batch: str, watch: float | None = None) -> dict:
     """Write the batch's Postgres rows back to the graph (including rows written after cutover), check parity,
-    and switch the bridge back to the graph. Use with the previous release."""
+    and switch the bridge back to the graph. Use with the previous release. Refuses while any instance is live:
+    a running app would keep writing Postgres after the switch back (split brain)."""
+    return _exclusive(f"rollback {batch}", watch, lambda freeze: _rollback(batch, freeze))
+
+
+def _rollback(batch: str, freeze: dict) -> dict:
     from graph import q
     reports = []
     for s in batch_labels(batch):
@@ -259,7 +278,8 @@ def rollback(batch: str) -> dict:
         rep = label_report(s)
         if not rep["ok"]:
             raise bridge.ParityError(f"rollback of {s.label} did not reach parity: {rep['first_mismatch_id']}")
-        _set_state(s.label, "graph", {"rolled_back_at": datetime.now(timezone.utc).isoformat(), "parity": rep})
+        _set_state(s.label, "graph", {"rolled_back_at": datetime.now(timezone.utc).isoformat(), "parity": rep,
+                                       "freeze": freeze})
         reports.append(rep)
     return {"batch": batch, "labels": reports}
 
