@@ -38,13 +38,18 @@ RULES: list[tuple[set, re.Pattern, object]] = [(m, re.compile(p), roles) for m, 
     (R, r"^/api/quality$", STAFF),
     (W, r"^/api/quality/eval$", {ADMIN}),
 
+    # Rule-set governance (Phase 1): HR Ops authors drafts, approvers decide, nobody edits live rules.
+    (R, r"^/api/policy/", STAFF),
+    (W, r"^/api/policy/drafts(/|$)", {HR}),
+    (W, r"^/api/policy/versions/\d+/(approve|reject)$", {APPROVER}),
+    (W, r"^/api/policy/versions/\d+/rollback$", {HR}),
     # A portal link lets the holder act as the joiner, so only the people who send it can fetch it.
     (R, r"^/api/employees/[^/]+/portal-link$", {HR}),
     # Core onboarding. Managers read, scoped to their own reports by main.get_emp / list_employees.
     (R, r"^/api/(employees|stats$|events$|documents/[^/]+/file$)", STAFF | {MANAGER}),
     (R, r"^/api/(templates|rules|policies)(/|$)", STAFF),
     (W, r"^/api/hr/chat$", STAFF),
-    (W, r"^/api/(employees|items|escalate$|gmail/poll$|ingest$|onboard$|templates|rules)(/|$)", {HR}),
+    (W, r"^/api/(employees|items|escalate$|gmail/poll$|ingest$|onboard$|templates)(/|$)", {HR}),
 ]]
 
 

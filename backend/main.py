@@ -50,6 +50,9 @@ async def lifespan(app):
     if state["graph"]:
         await ingest.seed()  # default rule set, templates, sample joiners on first run
         await asyncio.to_thread(bootstrap.ensure_dev_manager_reports)
+        if not bootstrap.is_production():
+            from policy.service import seed_demo
+            await asyncio.to_thread(seed_demo)
     tasks = [asyncio.create_task(jobs.worker()), asyncio.create_task(gmail.poll_forever(60)), asyncio.create_task(_scheduler())]
     ls.log_event(_log, "startup", gmail=gmail.configured(), graph=state["graph"])
     yield
@@ -388,8 +391,9 @@ async def ingest_file(kind: str = Form(...), file: UploadFile = File(...)):
             return ingest.import_employees(file.filename, data)
         if kind == "owners":
             return ingest.import_owners(file.filename, data)
-        if kind == "requirements":
-            return ingest.import_requirements(file.filename, data)
+        if kind == "requirements":  # becomes a draft rule set: it goes live only after approval
+            from identity.service import current_user
+            return ingest.import_requirements_draft(file.filename, data, current_user.get())
         if kind == "policies":
             if not file.filename.lower().endswith((".md", ".txt")):
                 raise ValueError("Policies must be Markdown or text files")
@@ -421,44 +425,15 @@ def save_template(tid: str, t: Template):
 
 @app.get("/api/rules")
 def rules():
+    """The active rule-set version. Rules change only through /api/policy (draft -> approve -> publish)."""
+    from policy import store
+    act = store.ensure_active()
     return {"rules": checklist.load_rules(), "doc_types": checklist.config("doc_types"),
             "departments": checklist.config("departments"), "locations": checklist.config("locations"),
             "roles": checklist.config("roles") or [],
-            "owners": [r["o"] for r in q("MATCH (o:Owner) RETURN o ORDER BY o.type")]}
-
-
-class Rule(BaseModel):
-    id: str
-    item: str
-    name: str = ""
-    kind: str
-    category: str
-    match: dict = {}
-    offset_days: int = 0
-    depends_on: list[str] = []
-    description: str
-    policy_ref: str = ""
-    auto: str = ""
-
-
-@app.put("/api/rules/{rid}")
-def save_rule(rid: str, r: Rule):
-    audit.record_audit("rule.saved", "rule", rid, f"Saved requirement rule {rid}")
-    existing = q1("MATCH (x:Rule {id:$id}) RETURN x.ord AS o", id=rid)
-    nxt = q1("MATCH (x:Rule) RETURN coalesce(max(x.ord), 0) + 1 AS o")["o"]
-    ingest.save_rule(r.model_dump(), ord_=existing["o"] if existing else nxt)
-    for eid in records.employee_ids():
-        checklist.regenerate(eid, f"rule {rid} updated")
-    return rules()
-
-
-@app.delete("/api/rules/{rid}")
-def delete_rule(rid: str):
-    audit.record_audit("rule.deleted", "rule", rid, f"Removed requirement rule {rid}")
-    q("MATCH (r:Rule {id:$id}) DELETE r", id=rid)
-    for eid in records.employee_ids():
-        checklist.regenerate(eid, f"rule {rid} removed")
-    return rules()
+            "owners": [r["o"] for r in q("MATCH (o:Owner) RETURN o ORDER BY o.type")],
+            "version": {"id": act["id"], "number": act["number"], "published_at": act["published_at"],
+                        "author_email": act["author_email"]} if act else None}
 
 
 @app.get("/api/policies")
@@ -602,9 +577,12 @@ def ready():
 
 from identity.routes import router as identity_router  # noqa: E402
 import work_queue  # noqa: E402
+from policy.routes import router as policy_router  # noqa: E402
+import policy.service  # noqa: E402,F401  (registers policy.publish / notify.item_added job handlers)
 
 app.include_router(identity_router)
 app.include_router(work_queue.router)
+app.include_router(policy_router)
 
 import connector_routes  # noqa: E402
 

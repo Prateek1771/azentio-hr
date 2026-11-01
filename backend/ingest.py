@@ -151,6 +151,31 @@ def import_requirements(filename: str, data: bytes) -> dict:
     return {"kind": "requirements", "total": len(rules), "imported": len(rules) - len({e['row'] for e in errors}), "errors": errors}
 
 
+def import_requirements_draft(filename: str, data: bytes, user: dict) -> dict:
+    """An uploaded requirements file becomes a draft rule set (it reaches joiners only once approved and published)."""
+    from policy import store
+    from shared import db
+    obj = json.loads(data) if filename.endswith(".json") else {"rules": read_table(filename, data)}
+    errors, rules = [], []
+    for i, r in enumerate(obj.get("rules", []), start=1):
+        miss = [f for f in ("id", "item", "kind", "category", "description") if not r.get(f)]
+        if miss:
+            errors += [{"row": i, "field": f, "message": "Missing mandatory field", "name": r.get("id", "")} for f in miss]
+            continue
+        rules.append(store.normalise_rule(r))
+    if store.open_version():
+        raise ValueError("A rule-set draft is already open. Finish or discard it before importing requirements.")
+    act = store.ensure_active()
+    config = {**(act["config"] if act else {}), **{k: obj[k] for k in store.CONFIG_KEYS if k in obj}}
+    with db.tx() as c:
+        vid = store.create_version("draft", f"Imported from {filename}", config, rules, user["id"], c,
+                                   based_on=act["id"] if act else None)
+        num = c.execute("SELECT number FROM rule_set_versions WHERE id=%s", (vid,)).fetchone()["number"]
+    return {"kind": "requirements", "total": len(obj.get("rules", [])), "imported": len(rules), "errors": errors,
+            "draft_version": num, "draft_id": vid,
+            "message": f"Saved as draft v{num}. Preview its impact and submit it for approval under Requirement rules."}
+
+
 def save_rule(r: dict, ord_: int | None = None):
     p = {"id": r["id"], "item": r["item"], "name": r.get("name", ""), "kind": r["kind"], "category": r["category"],
          "match": json.dumps(r.get("match") or {}), "offset_days": int(r.get("offset_days") or 0),

@@ -12,6 +12,7 @@ _log = ls.get("bootstrap")
 DEV_USERS = [  # (email, name, role, dev password)
     ("hrops@azentio.local", "Harper Ops", "hr_ops", "hrops-dev-pass"),
     ("approver@azentio.local", "Avery Approver", "approver", "approver-dev-pass"),
+    ("approver2@azentio.local", "Blake Compliance", "approver", "approver2-dev-pass"),  # second sign-off for compliance rules
     ("manager@azentio.local", "Morgan Manager", "manager", "manager-dev-pass"),
     ("auditor@azentio.local", "Ari Auditor", "auditor", "auditor-dev-pass"),
 ]

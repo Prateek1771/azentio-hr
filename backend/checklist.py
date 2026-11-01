@@ -3,8 +3,7 @@ import json
 from datetime import date, timedelta
 
 import records
-from graph import q, q1, new_id, event
-from shared import db
+from graph import q, q1, event
 
 DONE = {"Accepted", "Completed", "Acknowledged"}
 INITIAL = {"document": "Not Submitted", "task": "Pending", "ack": "Pending"}
@@ -85,19 +84,21 @@ def view_state(item: dict, by_key: dict, today: date | None = None) -> str:
 # ---------- graph-backed ----------
 
 def config(key: str):
+    """Engine config comes from the active rule-set version; anything a version doesn't hold stays in the graph."""
+    from policy import store
+    if key in store.CONFIG_KEYS:
+        act = store.ensure_active()
+        if act:
+            return (act["config"] or {}).get(key)
     row = q1("MATCH (c:Config {key:$k}) RETURN c.value AS v", k=key)
     return json.loads(row["v"]) if row else None
 
 
 def load_rules() -> list[dict]:
-    rows = q("MATCH (r:Rule) RETURN r ORDER BY r.ord")
-    out = []
-    for row in rows:
-        r = row["r"]
-        r["match"] = json.loads(r.get("match") or "{}")
-        r["depends_on"] = list(r.get("depends_on") or [])
-        out.append(r)
-    return out
+    """The active rule-set version's rules (ADR 0009). Rules only reach joiners by publishing a version."""
+    from policy import store
+    act = store.ensure_active()
+    return store.rules_of(act["id"]) if act else []
 
 
 def category_owners() -> dict:
@@ -110,35 +111,9 @@ def employee_items(eid: str) -> list[dict]:
 
 
 def regenerate(eid: str, reason: str | None = None):
-    """(Re)build an employee's checklist. Keeps progress on items that still apply; recalculates due dates/owners.
-
-    ponytail: step 1 of Phase 1 keeps today's semantics (items that no longer apply are deleted); step 2 replaces
-    this with policy.replay, which cancels or keeps them as evidence instead.
-    """
-    emp = records.employee(eid)
-    new = build_items(emp, load_rules(), config("doc_types") or {}, config("locations") or {}, category_owners())
-    existing = {i["key"]: i for i in employee_items(eid)}
-    new_keys = {i["key"] for i in new}
-    removed = [old for key, old in existing.items() if key not in new_keys]
-    with db.tx() as c:
-        for old in removed:
-            c.execute("DELETE FROM items WHERE id=%s", (old["id"],))
-            if reason:
-                event(eid, "checklist", f"Removed '{old['name']}' ({reason})")
-        for it in new:
-            old = existing.get(it["key"])
-            if old:
-                if reason and old.get("due") != it["due"]:
-                    event(eid, "checklist", f"'{it['name']}' due date moved {old['due']} → {it['due']} ({reason})")
-                records.update_item(old["id"], conn=c, **it)
-            else:
-                records.save_item({**it, "id": new_id("it"), "employee_id": eid, "status": INITIAL[it["kind"]]}, conn=c)
-                if reason:
-                    event(eid, "checklist", f"Added '{it['name']}' ({reason})")
-    for old in removed:
-        q("MATCH (i:Item {id:$id}) DETACH DELETE i", id=old["id"])
-    records.project(eid)
-    recompute(eid)
+    """Bring one joiner's checklist in line with the active rule set: safe replay, nothing is ever deleted."""
+    from policy.service import replay_one
+    replay_one(eid, reason)
 
 
 def recompute(eid: str):

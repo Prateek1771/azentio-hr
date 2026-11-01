@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 from shared import db
 
 router = APIRouter(prefix="/api/work-queue")
+# kind -> resolver(item, action, user, reason) -> final status. Registered by the module that owns the kind.
+RESOLVERS: dict[str, callable] = {}
 
 
 def open_item(kind: str, entity_type: str, entity_id: str, reason: str, assignee_role: str,
@@ -18,21 +20,28 @@ def open_item(kind: str, entity_type: str, entity_id: str, reason: str, assignee
     return row["id"] if row else None
 
 
-def list_items(role: str, status: str = "open") -> list[dict]:
+def list_items(role: str, status: str = "open", kind: str = "") -> list[dict]:
     see_all = role in ("admin", "auditor")
-    return db.fetch(f"""SELECT * FROM work_queue WHERE status = %s {'' if see_all else 'AND assignee_role = %s'}
-                        ORDER BY sla_due NULLS LAST, created_at""", (status,) if see_all else (status, role))
+    where, params = ["status = %s"], [status]
+    if not see_all:
+        where.append("assignee_role = %s")
+        params.append(role)
+    if kind:
+        where.append("kind = %s")
+        params.append(kind)
+    return db.fetch(f"SELECT * FROM work_queue WHERE {' AND '.join(where)} ORDER BY sla_due NULLS LAST, created_at", params)
 
 
 @router.get("")
-def get_items(status: str = "open"):
+def get_items(status: str = "open", kind: str = ""):
     from identity.service import current_user
-    return list_items(current_user.get()["role"], status)
+    return list_items(current_user.get()["role"], status, kind)
 
 
 class Resolve(BaseModel):
     resolution: str = Field(min_length=3, max_length=2000)
     dismiss: bool = False
+    action: str | None = None  # kind-specific, e.g. 'apply' | 'skip' for policy.near_start
 
 
 @router.post("/{item_id}/resolve")
@@ -49,6 +58,12 @@ def resolve(item_id: int, body: Resolve):
         if it["status"] in ("resolved", "dismissed"):
             raise HTTPException(409, "Already closed")
         status = "dismissed" if body.dismiss else "resolved"
+        if it["kind"] in RESOLVERS:
+            from policy.store import PolicyError
+            try:
+                status = RESOLVERS[it["kind"]](it, body.action or "", user, body.resolution)
+            except PolicyError as e:
+                raise HTTPException(e.status, str(e))
         it = db.fetch1("""UPDATE work_queue SET status=%s, resolution=%s, resolved_by=%s, resolved_at=now()
                           WHERE id=%s RETURNING *""", (status, body.resolution, user["id"], item_id), conn=c)
         audit.record_audit(f"work_queue.{status}", "work_queue", str(item_id), f"{status.title()} '{it['reason']}'",
