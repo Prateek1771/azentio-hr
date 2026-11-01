@@ -2,6 +2,7 @@
 import re
 from typing import Any
 
+import llm
 import logging_setup as ls
 from . import service, store
 from .agent import RUN_REQUEST, AgentUnavailable, SimulatedAgent, TurnContext, get_agent
@@ -365,6 +366,12 @@ async def run_chat_turn(iid: str, message: str, timezone: str | None, opening: b
     before = store.get(iid)
     if not before:
         raise LookupError("Integration not found")
+    if message.strip().lower().rstrip(".!") in ("retry", "try again", "again", "redo"):
+        # "retry" means: do my last request again (e.g. after the AI was unavailable), not a new instruction.
+        prev = next((m["content"] for m in reversed(service.messages(iid)) if m["role"] == "user"
+                     and m["content"].strip().lower().rstrip(".!") not in ("retry", "try again", "again", "redo")), None)
+        if prev or opening is False:
+            message = prev or before.get("description") or message
     s_fields, t_fields, _, _ = store.schemas(before)
     ctx = TurnContext(message=message, step=before["setup_step"], state=_state(before), members=list(service.owners()),
                       departments=service.departments(), statuses=_STATUS_LABELS, source_fields=s_fields, target_fields=t_fields,
@@ -376,7 +383,8 @@ async def run_chat_turn(iid: str, message: str, timezone: str | None, opening: b
         reply = await agent.run_turn(ctx, tools.execute)
     except AgentUnavailable:
         ls.log_event(log, "agent.fallback", integration=iid, level_used="rules")
-        notice = "The AI service didn't respond, so I used simple rules for this one. "
+        why = llm.unavailable_reason() or "The free AI model didn't respond"
+        notice = f"{why}, so I used simple rules for this one. "
         reply = await SimulatedAgent().run_turn(ctx, tools.execute)
     after = store.get(iid)
     if after["setup_step"] == "mapping" and not after["mapping"]:  # reaching mapping is the cue to propose one

@@ -418,6 +418,11 @@ _TASK_ACCESS = {
 }
 
 
+def _as_lists(m: dict) -> dict:
+    """Requirement rules allow `department: "Engineering"` or a list; access rules always use lists."""
+    return {k: v if k.startswith("grade") or isinstance(v, list) else [v] for k, v in m.items()}
+
+
 def suggested_access(it: dict) -> list[dict]:
     by_key = {a["key"]: a for a in apps()}
     out = []
@@ -425,7 +430,7 @@ def suggested_access(it: dict) -> list[dict]:
         for app, action, resource, mode in _TASK_ACCESS.get(r["item"], []):
             if app in by_key:
                 out.append({"id": f"{r['id']}:{app}:{action}", "app_id": by_key[app]["id"], "app": by_key[app]["name"],
-                            "action": action, "resource": resource, "mode": mode, "match": r.get("match") or {},
+                            "action": action, "resource": resource, "mode": mode, "match": _as_lists(r.get("match") or {}),
                             "from_rule": r["id"]})
     if "slack" in by_key:
         out.append({"id": "welcome:slack", "app_id": by_key["slack"]["id"], "app": "Slack", "action": "notify_channel",

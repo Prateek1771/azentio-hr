@@ -403,11 +403,17 @@ class LlmAgent(SimulatedAgent):
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT},
                                 {"role": "system", "content": f"Current state: {json.dumps(state, default=str)}"},
                                 *ctx.history[-12:], {"role": "user", "content": ctx.message}]
-        for _ in range(5):
-            msg = await self._complete(messages, tools=ctx.tools, tool_choice="auto")
+        done: list[str] = []  # summaries of tools that worked, in HR-readable sentences
+        for round_ in range(3):
+            try:
+                msg = await self._complete(messages, tools=ctx.tools, tool_choice="auto")
+            except AgentUnavailable:
+                if done:  # the changes are made; only the wording call failed, so report them ourselves
+                    return " ".join(done)
+                raise
             calls = msg.tool_calls or []
             if not calls:
-                return (msg.content or "").strip()
+                return (msg.content or "").strip() or " ".join(done)
             messages.append({"role": "assistant", "content": msg.content or "",
                              "tool_calls": [{"id": c.id, "type": "function",
                                              "function": {"name": c.function.name, "arguments": c.function.arguments or "{}"}} for c in calls]})
@@ -417,8 +423,14 @@ class LlmAgent(SimulatedAgent):
                 except (TypeError, ValueError):
                     result = {"ok": False, "error": "That tool call wasn't valid."}
                 messages.append({"role": "tool", "tool_call_id": c.id, "content": json.dumps(result)})
-        return "I've made those changes."
+                if result.get("ok") and result.get("summary"):
+                    done.append(result["summary"])
+            # Free models are rate limited, so don't spend a call just to reword what the tools already said.
+            # Go round again only when something failed, so the model can correct its arguments.
+            if all(json.loads(m["content"]).get("ok") for m in messages[-len(calls):]):
+                return " ".join(done) or (msg.content or "").strip()
+        return " ".join(done) or "I've made those changes."
 
 
 def get_agent():
-    return LlmAgent() if llm.API_KEY and llm.API_KEY != "missing" else SimulatedAgent()
+    return LlmAgent() if llm.PROVIDERS else SimulatedAgent()

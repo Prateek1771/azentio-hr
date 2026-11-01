@@ -184,7 +184,8 @@ export function AccessCard({ it, onChange }: { it: IntegrationDetail; onChange: 
       mode: draft.mode as "direct" | "request", match: { ...(draft.role ? { role: [draft.role] } : {}), ...(draft.department ? { department: [draft.department] } : {}) }, from_rule: "" }]);
     setAdding(false); setDraft((d) => ({ ...d, resource: "", role: "", department: "" }));
   };
-  const who = (r: AccessRule) => [...(r.match.role ?? []), ...(r.match.department ?? []), ...(r.match.country ?? []), ...(r.match.location ?? [])].join(", ") || "Everyone";
+  const who = (r: AccessRule) => (["role", "department", "country", "location"] as const)
+    .flatMap((k) => { const v = r.match[k]; return v === undefined ? [] : Array.isArray(v) ? v : [String(v)]; }).join(", ") || "Everyone";
   return (
     <Card className="gap-2 p-3">
       <div className="flex items-center justify-between text-xs">
@@ -202,7 +203,7 @@ export function AccessCard({ it, onChange }: { it: IntegrationDetail; onChange: 
               {r.mode === "request" && <span className="ml-1 rounded bg-amber-50 px-1.5 text-[11px] text-amber-700">asks admin</span>}
               <span className="block text-[11px] text-muted-foreground">For {who(r)}{r.from_rule && ` · from rule ${r.from_rule}`}</span>
             </span>
-            {(it.apps.find((a) => a.id === r.app_id)?.key === "slack" || it.apps.find((a) => a.id === r.app_id)?.key === "jira") && r.resource && (
+            {(r.action === "add_to_channel" || r.action === "add_to_project") && (
               <button onClick={() => setRules((l) => l.map((x, j) => j === i ? { ...x, mode: x.mode === "request" ? "direct" : "request" } : x))}
                 className="text-[11px] text-primary hover:underline">{r.mode === "request" ? "Add directly" : "Ask admin instead"}</button>
             )}

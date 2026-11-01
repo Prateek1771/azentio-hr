@@ -155,6 +155,7 @@ for _k in ("GMAIL_REFRESH_TOKEN", "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "LLM
     os.environ[_k] = ""
 import llm  # noqa: E402
 llm.API_KEY = ""  # rule-based agent only
+llm.PROVIDERS = []
 from integrations import chat as wf_chat, engine as wf_engine, service as wf_service  # noqa: E402
 import logging_setup as _ls  # noqa: E402
 _ls.setup()

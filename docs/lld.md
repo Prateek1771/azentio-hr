@@ -1,4 +1,6 @@
-# Azentio Onboard: Architecture & Agentic Workflow
+# Azentio Onboard: Low-Level Design
+
+Part of the [design docs](README.md). For the big picture read the [HLD](hld.md) first.
 
 This document describes how the HR Onboarding Agent is built and how the agent behaves. It covers the system as it exists in this repository: what each part does, how data moves, what the agent decides on its own, and where the design is deliberately simplified.
 
