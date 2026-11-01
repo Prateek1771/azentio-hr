@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
-import { Activity, ArrowLeftRight, CheckCheck, FileSearch, ChevronsUpDown, FileStack, Gauge, KeyRound, LayoutDashboard, ListChecks, LogOut, Mail, Moon, Plug, ScrollText, Sparkles, Sun, Upload, Users } from "lucide-react";
+import { Activity, ArrowLeftRight, CheckCheck, Database, FileSearch, ChevronsUpDown, FileStack, Gauge, KeyRound, LayoutDashboard, ListChecks, LogOut, Mail, Moon, Plug, ScrollText, Sparkles, Sun, Upload, Users } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { api, type Role, type Stats } from "@/lib/api";
@@ -34,6 +34,7 @@ export const NAV: { href: string; label: string; Icon: typeof Activity; roles: R
   { href: "/quality", label: "AI quality", Icon: Gauge, roles: STAFF },
   { href: "/activity", label: "Activity", Icon: Activity, roles: ALL },
   { href: "/users", label: "Users", Icon: Users, roles: ["admin"] },
+  { href: "/system", label: "System", Icon: Database, roles: ["admin", "auditor"] },
 ];
 
 function ShellSkeleton() {

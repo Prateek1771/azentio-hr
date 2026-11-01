@@ -1,0 +1,936 @@
+{
+ "approvals": [
+  {
+   "candidate_name": "str",
+   "document_results": [
+    {
+     "name": "str",
+     "reason": "null",
+     "status": "str"
+    }
+   ],
+   "integration_id": "str",
+   "integration_name": "str",
+   "item_id": "str",
+   "joiner_id": "str",
+   "kind": "str",
+   "waiting_since": "float"
+  }
+ ],
+ "connector_connection": {
+  "auth_type": "str",
+  "configured_at": "null",
+  "last_test": "null",
+  "secret_hint": "str",
+  "secret_set": "bool",
+  "supported": "bool",
+  "tenant": "str",
+  "tenant_example": "str",
+  "tenant_label": "str",
+  "username": "str"
+ },
+ "connector_detail": {
+  "connection_status": "str",
+  "demo": "bool",
+  "description": "str",
+  "id": "str",
+  "key": "str",
+  "name": "str",
+  "record_count": "int",
+  "record_kind": "str",
+  "role": "str",
+  "type_name": "str"
+ },
+ "connector_imports": [
+  {
+   "errors": [
+    {
+     "field": "str",
+     "message": "str",
+     "name": "str",
+     "row": "int"
+    }
+   ],
+   "filename": "str",
+   "id": "str",
+   "imported": "int",
+   "instance_id": "str",
+   "total": "int",
+   "ts": "float"
+  }
+ ],
+ "connector_records": {
+  "items": [
+   {
+    "created": "float",
+    "employee_id": "null|str",
+    "id": "str",
+    "instance_id": "str",
+    "kind": "str",
+    "updated": "float",
+    "values": {
+     "candidate_id": "str",
+     "date_of_birth": "str",
+     "department_name": "str",
+     "designation": "str",
+     "education": [
+      "str"
+     ],
+     "email": "str",
+     "employment_history": [
+      "None|str"
+     ],
+     "first_name": "str",
+     "grade": "str",
+     "joining_date": "str",
+     "last_name": "str",
+     "location": "str",
+     "phone": "str",
+     "status": "str"
+    }
+   }
+  ],
+  "page": "int",
+  "page_size": "int",
+  "total": "int"
+ },
+ "connector_schema": [
+  {
+   "description": "str",
+   "generated": "bool",
+   "is_custom": "bool",
+   "key": "str",
+   "label": "str",
+   "required": "bool",
+   "type": "str"
+  }
+ ],
+ "connectors": [
+  {
+   "connection_status": "str",
+   "demo": "bool",
+   "description": "str",
+   "id": "str",
+   "key": "str",
+   "name": "str",
+   "record_count": "int",
+   "record_kind": "str",
+   "role": "str",
+   "type_name": "str"
+  }
+ ],
+ "employee_detail": {
+  "employee": {
+   "created": "str",
+   "date_of_birth": "str",
+   "department": "str",
+   "doc_scope": [],
+   "email": "str",
+   "grade": "str",
+   "id": "str",
+   "joining_date": "str",
+   "location": "str",
+   "manager_email": "str",
+   "name": "str",
+   "role": "str",
+   "status": "str",
+   "thread_id": "str",
+   "token": "str",
+   "worker_type": "str"
+  },
+  "events": [
+   {
+    "employee_id": "str",
+    "id": "str",
+    "kind": "str",
+    "message": "str",
+    "ts": "float"
+   }
+  ],
+  "flags": [
+   {
+    "level": "str",
+    "message": "str",
+    "type": "str"
+   }
+  ],
+  "hr_record": {},
+  "items": [
+   {
+    "auto": "str",
+    "blocked_by": [
+     "str"
+    ],
+    "cancelled_by_version": "null",
+    "category": "str",
+    "depends": [
+     "None|str"
+    ],
+    "documents": [
+     "None|{'checks': [], 'confidence': 'float', 'current_decision_id': 'int', 'decided_at': 'str', 'decision': {'by': 'null', 'kind': 'str', 'policy_version': 'null', 'reason': 'str', 'reason_code': 'str'}, 'doc_type': 'str', 'employee_id': 'str', 'extracted': {}, 'filename': 'str', 'id': 'str', 'issues': [], 'item_id': 'str', 'mime': 'str', 'model': 'null', 'policy_version_id': 'null', 'prompt_version': 'null', 'received_at': 'str', 'seed': 'str', 'sha256': 'null', 'size': 'int', 'source': 'str', 'status': 'str', 'tier': 'null', 'ts': 'float'}"
+    ],
+    "due": "str",
+    "employee_id": "str",
+    "id": "str",
+    "key": "str",
+    "kind": "str",
+    "name": "str",
+    "owner_email": "str",
+    "owner_name": "str",
+    "policy_ref": "str",
+    "reason": "str",
+    "rule_id": "str",
+    "rule_version_id": "int",
+    "state": "str",
+    "status": "str",
+    "superseded_by_version": "null"
+   }
+  ],
+  "manager": {
+   "department": "str",
+   "email": "str",
+   "name": "str",
+   "type": "str"
+  },
+  "summary": {
+   "blocked": "int",
+   "completed": "int",
+   "corrections": "int",
+   "needs_review": "int",
+   "overdue": "int",
+   "pending": "int",
+   "progress": "int",
+   "total": "int"
+  },
+  "unmatched_documents": []
+ },
+ "employee_links": [
+  {
+   "connector": "str",
+   "connector_id": "str",
+   "employee_number": "null",
+   "record_id": "str",
+   "type": "str"
+  }
+ ],
+ "employees": [
+  {
+   "created": "str",
+   "date_of_birth": "str",
+   "days_to_join": "int",
+   "department": "str",
+   "doc_scope": [
+    "None|str"
+   ],
+   "email": "str",
+   "flags": "int",
+   "grade": "str",
+   "id": "str",
+   "integration_id": "str",
+   "joining_date": "str",
+   "location": "str",
+   "manager_email": "str",
+   "name": "str",
+   "overall": "str",
+   "role": "str",
+   "status": "str",
+   "summary": {
+    "blocked": "int",
+    "completed": "int",
+    "corrections": "int",
+    "needs_review": "int",
+    "overdue": "int",
+    "pending": "int",
+    "progress": "int",
+    "total": "int"
+   },
+   "thread_id": "str",
+   "worker_type": "str"
+  }
+ ],
+ "events": [
+  {
+   "employee_id": "str",
+   "employee_name": "null|str",
+   "id": "str",
+   "kind": "str",
+   "message": "str",
+   "ts": "float"
+  }
+ ],
+ "integration2_candidates": [
+  {
+   "access": [],
+   "candidate_ref": "str",
+   "created": "float",
+   "document_attempts": "int",
+   "document_results": [
+    {
+     "name": "str",
+     "reason": "null",
+     "status": "str"
+    }
+   ],
+   "email": "str",
+   "id": "str",
+   "integration_id": "str",
+   "joiner_id": "str",
+   "last_error": "str",
+   "name": "str",
+   "record_id": "str",
+   "stage": "str",
+   "updated": "float"
+  }
+ ],
+ "integration2_detail": {
+  "access_rules": [
+   {
+    "action": "str",
+    "app": "str",
+    "app_id": "str",
+    "from_rule": "str",
+    "id": "str",
+    "match": {
+     "department": [
+      "str"
+     ]
+    },
+    "mode": "str",
+    "resource": "str"
+   }
+  ],
+  "access_saved": "bool",
+  "activated_at": "float",
+  "agent_is_simulated": "bool",
+  "agent_name": "str",
+  "apps": [
+   {
+    "actions": [
+     {
+      "key": "str",
+      "label": "str",
+      "needs_resource": "bool"
+     }
+    ],
+    "id": "str",
+    "key": "str",
+    "name": "str"
+   }
+  ],
+  "connectors_locked": "bool",
+  "created": "float",
+  "delivery_is_simulated": "bool",
+  "departments": [
+   "str"
+  ],
+  "description": "str",
+  "doc_types": [
+   {
+    "key": "str",
+    "name": "str"
+   }
+  ],
+  "doc_verification_enabled": "bool",
+  "duplicate_policy": "str",
+  "email_presets": [
+   {
+    "expression": "str",
+    "key": "str"
+   }
+  ],
+  "expression_functions": [
+   {
+    "example": "str",
+    "name": "str"
+   }
+  ],
+  "id": "str",
+  "last_run_at": "float",
+  "log_exclusions": {
+   "fields": [],
+   "sections": []
+  },
+  "mapping": [
+   {
+    "confidence": "float",
+    "default_value": "null",
+    "email_domain": "null",
+    "expression": "null",
+    "origin": "str",
+    "rationale": "str",
+    "source_field": "str",
+    "target_field": "str",
+    "transform": "str"
+   }
+  ],
+  "mapping_approved_at": "float",
+  "messages": [
+   {
+    "content": "str",
+    "id": "str",
+    "integration_id": "str",
+    "role": "str",
+    "ts": "float"
+   }
+  ],
+  "name": "str",
+  "next_run_at": "null",
+  "notifications_saved": "bool",
+  "notify_emails": [],
+  "notify_members": [],
+  "notify_on_created": "bool",
+  "notify_on_failure": "bool",
+  "notify_on_success": "bool",
+  "offer_enabled": "bool",
+  "offer_placeholders": [
+   "str"
+  ],
+  "offer_template": "str",
+  "offer_template_status": "str",
+  "owners": [
+   {
+    "email": "str",
+    "name": "str"
+   }
+  ],
+  "problems": [],
+  "quick_replies": [
+   "str"
+  ],
+  "recipients": [],
+  "records_saved": "bool",
+  "role_documents": {
+   "*": [
+    "str"
+   ]
+  },
+  "roles": [
+   "str"
+  ],
+  "schedule": {
+   "interval_minutes": "null",
+   "kind": "str",
+   "time": "null",
+   "timezone": "str"
+  },
+  "schedule_saved": "bool",
+  "setup_step": "str",
+  "source_fields": [
+   {
+    "description": "str",
+    "generated": "bool",
+    "is_custom": "bool",
+    "key": "str",
+    "label": "str",
+    "required": "bool",
+    "type": "str"
+   }
+  ],
+  "source_filter": {
+   "departments": [
+    "str"
+   ],
+   "statuses": [
+    "str"
+   ]
+  },
+  "source_id": "str",
+  "source_name": "str",
+  "status": "str",
+  "suggested_access": [
+   {
+    "action": "str",
+    "app": "str",
+    "app_id": "str",
+    "from_rule": "str",
+    "id": "str",
+    "match": {
+     "department": [
+      "str"
+     ]
+    },
+    "mode": "str",
+    "resource": "str"
+   }
+  ],
+  "target_fields": [
+   {
+    "description": "str",
+    "generated": "bool",
+    "is_custom": "bool",
+    "key": "str",
+    "label": "str",
+    "required": "bool",
+    "type": "str"
+   }
+  ],
+  "target_id": "str",
+  "target_name": "str"
+ },
+ "integration_candidates": [
+  {
+   "access": [],
+   "candidate_ref": "str",
+   "created": "float",
+   "document_attempts": "int",
+   "document_results": [],
+   "email": "str",
+   "employee_record_id": "str",
+   "id": "str",
+   "integration_id": "str",
+   "name": "str",
+   "record_id": "str",
+   "stage": "str",
+   "updated": "float"
+  }
+ ],
+ "integration_detail": {
+  "access_rules": [],
+  "access_saved": "bool",
+  "activated_at": "float",
+  "agent_is_simulated": "bool",
+  "agent_name": "str",
+  "apps": [
+   {
+    "actions": [
+     {
+      "key": "str",
+      "label": "str",
+      "needs_resource": "bool"
+     }
+    ],
+    "id": "str",
+    "key": "str",
+    "name": "str"
+   }
+  ],
+  "connectors_locked": "bool",
+  "created": "float",
+  "delivery_is_simulated": "bool",
+  "departments": [
+   "str"
+  ],
+  "description": "str",
+  "doc_types": [
+   {
+    "key": "str",
+    "name": "str"
+   }
+  ],
+  "doc_verification_enabled": "bool",
+  "duplicate_policy": "str",
+  "email_presets": [
+   {
+    "expression": "str",
+    "key": "str"
+   }
+  ],
+  "expression_functions": [
+   {
+    "example": "str",
+    "name": "str"
+   }
+  ],
+  "id": "str",
+  "last_run_at": "float",
+  "log_exclusions": {
+   "fields": [],
+   "sections": []
+  },
+  "mapping": [
+   {
+    "confidence": "float",
+    "default_value": "null",
+    "email_domain": "null",
+    "expression": "null",
+    "origin": "str",
+    "rationale": "str",
+    "source_field": "str",
+    "target_field": "str",
+    "transform": "str"
+   }
+  ],
+  "mapping_approved_at": "float",
+  "messages": [
+   {
+    "content": "str",
+    "id": "str",
+    "integration_id": "str",
+    "role": "str",
+    "ts": "float"
+   }
+  ],
+  "name": "str",
+  "next_run_at": "null",
+  "notifications_saved": "bool",
+  "notify_emails": [],
+  "notify_members": [
+   "str"
+  ],
+  "notify_on_created": "bool",
+  "notify_on_failure": "bool",
+  "notify_on_success": "bool",
+  "offer_enabled": "bool",
+  "offer_placeholders": [
+   "str"
+  ],
+  "offer_template": "str",
+  "offer_template_status": "str",
+  "owners": [
+   {
+    "email": "str",
+    "name": "str"
+   }
+  ],
+  "problems": [],
+  "quick_replies": [
+   "str"
+  ],
+  "recipients": [
+   {
+    "email": "str",
+    "name": "str"
+   }
+  ],
+  "records_saved": "bool",
+  "role_documents": {},
+  "roles": [
+   "str"
+  ],
+  "schedule": {
+   "interval_minutes": "null",
+   "kind": "str",
+   "time": "null",
+   "timezone": "str"
+  },
+  "schedule_saved": "bool",
+  "setup_step": "str",
+  "source_fields": [
+   {
+    "description": "str",
+    "generated": "bool",
+    "is_custom": "bool",
+    "key": "str",
+    "label": "str",
+    "required": "bool",
+    "type": "str"
+   }
+  ],
+  "source_filter": {
+   "departments": [
+    "str"
+   ],
+   "statuses": [
+    "str"
+   ]
+  },
+  "source_id": "str",
+  "source_name": "str",
+  "status": "str",
+  "suggested_access": [
+   {
+    "action": "str",
+    "app": "str",
+    "app_id": "str",
+    "from_rule": "str",
+    "id": "str",
+    "match": {
+     "department": [
+      "str"
+     ]
+    },
+    "mode": "str",
+    "resource": "str"
+   }
+  ],
+  "target_fields": [
+   {
+    "description": "str",
+    "generated": "bool",
+    "is_custom": "bool",
+    "key": "str",
+    "label": "str",
+    "required": "bool",
+    "type": "str"
+   }
+  ],
+  "target_id": "str",
+  "target_name": "str"
+ },
+ "integration_messages": [
+  {
+   "attempt": "int",
+   "candidate": "str",
+   "content": "str",
+   "delivered_by": "str",
+   "id": "str",
+   "integration_id": "str",
+   "item_id": "str",
+   "kind": "str",
+   "provider_ref": "str",
+   "subject": "str",
+   "to": "str",
+   "ts": "float"
+  }
+ ],
+ "integrations": [
+  {
+   "candidates": "int",
+   "created": "float",
+   "description": "str",
+   "id": "str",
+   "last_run_at": "float",
+   "name": "str",
+   "next_run_at": "null",
+   "schedule": {
+    "interval_minutes": "null",
+    "kind": "str",
+    "time": "null",
+    "timezone": "str"
+   },
+   "setup_step": "str",
+   "source_id": "str",
+   "source_name": "str",
+   "status": "str",
+   "target_id": "str",
+   "target_name": "str"
+  }
+ ],
+ "logs_integration": {
+  "items": [
+   {
+    "access_granted_count": "int",
+    "access_requested_count": "int",
+    "advanced_count": "int",
+    "approvals_pending_count": "int",
+    "approvals_used_count": "int",
+    "documents_requested_count": "int",
+    "documents_verified_count": "int",
+    "employees_created_count": "int",
+    "employees_updated_count": "int",
+    "enrolled_count": "int",
+    "excluded_fields": [],
+    "excluded_sections": [],
+    "failed_count": "int",
+    "failures": [],
+    "fetched_count": "int",
+    "finished": "float",
+    "id": "str",
+    "integration_id": "str",
+    "integration_name": "str",
+    "offers_sent_count": "int",
+    "started": "float",
+    "status": "str",
+    "trigger": "str",
+    "waiting_count": "int"
+   }
+  ],
+  "page": "int",
+  "page_size": "int",
+  "total": "int"
+ },
+ "logs_integration_records": [
+  {
+   "actions": [
+    {
+     "kind": "str",
+     "message": "str",
+     "section": "str"
+    }
+   ],
+   "candidate_name": "str",
+   "candidate_record_id": "str",
+   "candidate_ref": "str",
+   "error": "str",
+   "id": "str",
+   "integration_id": "str",
+   "mapping": [
+    {
+     "excluded": "bool",
+     "from_default": "bool",
+     "source_field": "str",
+     "target_field": "str",
+     "transform": "str",
+     "value": "str"
+    }
+   ],
+   "mapping_hidden": "bool",
+   "outcome": "str",
+   "run_id": "str",
+   "stage_after": "str",
+   "stage_before": "str",
+   "ts": "float"
+  }
+ ],
+ "policies": [
+  {
+   "source": "str",
+   "text": "str",
+   "title": "str"
+  }
+ ],
+ "quality": {
+  "guardrails": {
+   "by_rule": [
+    {
+     "action": "str",
+     "n": "int",
+     "rule": "str"
+    }
+   ],
+   "days": "int",
+   "recent": [
+    {
+     "action": "str",
+     "id": "str",
+     "rule": "str",
+     "surface": "str",
+     "ts": "float"
+    }
+   ]
+  },
+  "judge": "str",
+  "latest": "null",
+  "results": [],
+  "runs": []
+ },
+ "rules": {
+  "departments": [
+   "str"
+  ],
+  "doc_types": {
+   "address_proof": {
+    "expires": "bool",
+    "fields": [
+     "str"
+    ],
+    "name": "str"
+   },
+   "bank_details": {
+    "expires": "bool",
+    "fields": [
+     "str"
+    ],
+    "name": "str"
+   },
+   "education_certificate": {
+    "expires": "bool",
+    "fields": [
+     "str"
+    ],
+    "name": "str"
+   },
+   "experience_letter": {
+    "expires": "bool",
+    "fields": [
+     "str"
+    ],
+    "name": "str"
+   },
+   "i9_documents": {
+    "expires": "bool",
+    "fields": [
+     "str"
+    ],
+    "name": "str"
+   },
+   "pan_card": {
+    "expires": "bool",
+    "fields": [
+     "str"
+    ],
+    "name": "str"
+   },
+   "photo_id": {
+    "expires": "bool",
+    "fields": [
+     "str"
+    ],
+    "name": "str"
+   },
+   "w4_form": {
+    "expires": "bool",
+    "fields": [
+     "str"
+    ],
+    "name": "str"
+   }
+  },
+  "locations": {
+   "Austin": "str",
+   "Bengaluru": "str",
+   "Hyderabad": "str",
+   "Mumbai": "str",
+   "New York": "str",
+   "Pune": "str"
+  },
+  "owners": [
+   {
+    "department": "str",
+    "email": "str",
+    "name": "str",
+    "type": "str"
+   }
+  ],
+  "roles": [
+   {
+    "department": "str",
+    "grade": "str",
+    "role": "str"
+   }
+  ],
+  "rules": [
+   {
+    "auto": "str",
+    "category": "str",
+    "compliance": "bool",
+    "depends_on": [
+     "None|str"
+    ],
+    "description": "str",
+    "id": "str",
+    "item": "str",
+    "kind": "str",
+    "match": {
+     "country": "str",
+     "department": "str",
+     "grade_min": "int"
+    },
+    "name": "str",
+    "offset_days": "int",
+    "ord": "int",
+    "policy_ref": "str"
+   }
+  ],
+  "version": {
+   "author_email": "null",
+   "id": "int",
+   "number": "int",
+   "published_at": "str"
+  }
+ },
+ "stats": {
+  "avg_progress": "int",
+  "blocked": "int",
+  "departments": [
+   "str"
+  ],
+  "gmail": "bool",
+  "joiners": "int",
+  "joining_7d": "int",
+  "locations": [
+   "str"
+  ],
+  "needs_review": "int",
+  "overdue": "int",
+  "ready": "int"
+ },
+ "templates": [
+  {
+   "body": "str",
+   "id": "str",
+   "name": "str",
+   "subject": "str"
+  }
+ ]
+}

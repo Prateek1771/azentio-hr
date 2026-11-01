@@ -21,6 +21,8 @@ RULES: list[tuple[set, re.Pattern, object]] = [(m, re.compile(p), roles) for m, 
     (ANY, r"^/api/portal/", PUBLIC),
 
     (ANY, r"^/api/users(/|$)", {ADMIN}),
+    # Phase 3: graph -> Postgres migration report (counts, checksums, cutover, drift since cutover).
+    (R, r"^/api/admin/migration$", {ADMIN, AUDITOR}),
     (R, r"^/api/work-queue$", STAFF),
     (W, r"^/api/work-queue/\d+/resolve$", {ADMIN, HR, APPROVER}),
 

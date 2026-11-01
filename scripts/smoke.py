@@ -30,16 +30,16 @@ CHROME_CANDIDATES = [
 ]
 
 NAV_ALL = ["Dashboard", "Add joiners", "Email templates", "Requirement rules", "Connectors", "Integrations",
-           "Document review", "Approvals", "Logs", "AI quality", "Activity", "Users"]
-STAFF_NAV = [n for n in NAV_ALL if n not in ("Add joiners", "Users")]
+           "Document review", "Approvals", "Logs", "AI quality", "Activity", "Users", "System"]
+STAFF_NAV = [n for n in NAV_ALL if n not in ("Add joiners", "Users", "System")]
 
 # role -> (email, password, nav labels expected, allowed pages, a forbidden page)
 ROLES = {
-    "admin": ("admin@azentio.local", "admin-dev-pass", STAFF_NAV + ["Users"], ["/dashboard", "/connectors", "/users"], "/import"),
+    "admin": ("admin@azentio.local", "admin-dev-pass", STAFF_NAV + ["Users", "System"], ["/dashboard", "/connectors", "/users", "/system"], "/import"),
     "hr_ops": ("hrops@azentio.local", "hrops-dev-pass", STAFF_NAV[:1] + ["Add joiners"] + STAFF_NAV[1:], ["/dashboard", "/rules", "/import"], "/users"),
     "approver": ("approver@azentio.local", "approver-dev-pass", STAFF_NAV, ["/dashboard", "/approvals"], "/users"),
     "manager": ("manager@azentio.local", "manager-dev-pass", ["Dashboard", "Activity"], ["/dashboard", "/activity"], "/rules"),
-    "auditor": ("auditor@azentio.local", "auditor-dev-pass", STAFF_NAV, ["/dashboard", "/logs"], "/users"),
+    "auditor": ("auditor@azentio.local", "auditor-dev-pass", STAFF_NAV + ["System"], ["/dashboard", "/logs", "/system"], "/users"),
 }
 GATED = "have access to this page"
 

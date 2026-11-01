@@ -8,14 +8,14 @@ Azentio Onboard is an HR onboarding agent. For each new joiner it works out whic
 We're hardening it from a demo into governed HR operations in 7 phases: see [docs/plans/2026-11-01-hardening-design.md](docs/plans/2026-11-01-hardening-design.md).
 
 ## Current phase
-**Phases 0, 1 and 2 are complete.** Next: **Phase 3: Retire graph record storage** ([plan](docs/plans/phase-3-retire-graph-records.md)). References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
+**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract) is done; batches A1 → E follow, one PR each. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
 
 | Phase | Status |
 |---|---|
 | 0 Trust + foundation (auth, 5 roles, audit chain, jobs/outbox, bootstrap) | **done** |
 | 1 Policy governance + Employee/Item migration | **done** |
 | 2 AI control + Document migration | **done** |
-| 3 Retire graph record storage | planned |
+| 3 Retire graph record storage | **in progress** (PR 0 done) |
 | 4 Ops backbone + **Temporal** | planned |
 | 5 Lifecycle (transfer, offboarding, rechecks, contractor/rehire, leave) | planned |
 | 6 HR ops platform (manager view, SLAs, escalations, appeals, analytics) | planned |
@@ -54,9 +54,12 @@ cd backend && uv run python test_core.py      # rules, validation, ingestion, co
 cd backend && uv run python test_phase0.py    # auth, permission matrix, audit chain, jobs, bootstrap
 cd backend && uv run python test_phase1.py    # rule-set versions, approvals, safe replay, rollback, parity, projection
 cd backend && uv run python test_phase2.py    # document routing, provenance, reviews, spot checks, LLM down, thresholds
+cd backend && uv run python test_phase3.py    # migration engine (freeze, cutover, drift, rollback) + API contract check
 ```
 - Both use throwaway databases (`azentio_test*`, plus FalkorDB graph `test`) and never touch live data.
 - Each new phase adds `test_phaseN.py`.
+- `backend/.venv/Scripts/python scripts/api_contract.py --check` diffs the response shapes of 24 read endpoints against `backend/tests_snapshots/api_contract.json` (`test_phase3` runs it). Re-capture with `--capture` only for a deliberate API change.
+- `cd backend && uv run python -m graph_migration report|drift|rollback <batch>`: the Phase 3 migration report, drift since cutover, and the rollback tool (see the cutover runbook).
 - `backend/.venv/Scripts/python scripts/smoke.py --base http://localhost:3000` runs headless Chrome against the running stack. For every role it signs in through the real form, checks the navigation, checks that allowed pages render and forbidden ones are gated, runs one workflow, and refreshes `docs/screenshots/`.
 - Frontend: `cd frontend && npx next typegen && npx tsc --noEmit && npx eslint app components`.
 
@@ -79,7 +82,8 @@ cd backend && uv run python test_phase2.py    # document routing, provenance, re
 | `backend/shared/db.py` | Pool, `tx()`, `fetch`/`fetch1`/`execute`, `migrate()`, `use_test_database()` |
 | `backend/shared/jobs.py` | **Transactional outbox and short-task queue**: `enqueue(..., idempotency_key, conn=)`, `@handler`, backoff, `dead`, heartbeat |
 | `backend/shared/bridge.py` | Which store each record type is read from; `parity()`/`switch()` for migrations |
-| `backend/shared/bootstrap.py` | Startup steps, each safe to re-run (incl. the one-time Employee/Item migration gate) |
+| `backend/shared/bootstrap.py` | Startup steps, each safe to re-run (incl. the one-time Employee/Item migration gate and the Phase 3 graph batch cutovers) |
+| `backend/graph_migration.py` | **Phase 3 engine:** a `LabelSpec` per graph label; freeze-checked `cutover(batch)`, report, `drift_since_cutover`, `rollback(batch)`, CLI |
 | `backend/documents/` | **Documents (Phase 2).** `store` is the only read/write path for documents, mismatches and decisions (append-only `doc_decisions`); `route` is the pure policy router (`decide`, `ALWAYS_HIGH`, `backtest`) |
 | `backend/records.py` | **The only way to read or write employees and checklist items.** Refreshes the graph projection in place after each write |
 | `backend/policy/` | Rule-set versions: `store` (versions, drafts, diff), `replay` (pure `plan_diff` + `apply`), `service` (preview, approvals, publish/notify jobs), `routes` |
@@ -91,12 +95,13 @@ cd backend && uv run python test_phase2.py    # document routing, provenance, re
 | `backend/connectors/`, `backend/integrations/` | Connector catalog, integration engine and agent |
 | `frontend/app/(hr)/` | HR app pages; `frontend/app/portal/[token]` is the joiner portal (public, token-scoped) |
 | `frontend/app/login`, `frontend/app/(hr)/users` | Sign-in screen; user and role management (admin) |
+| `frontend/app/(hr)/system` | System page: the Phase 3 storage migration report (admin, auditor) |
 | `frontend/app/(hr)/review`, `review/[id]` | Document review queue and detail (policy facts first, decision footer, spot checks) |
 | `frontend/app/(hr)/rules/{draft,draft/preview,history}`, `approvals` | Rule governance: draft editor, impact preview, version history/rollback; Approval Center tabs |
 | `frontend/components/auth.tsx` | `MeProvider`/`useMe`, `can(user, action)`, `RoleGate`, role labels. Hide write buttons with `can()`; the backend still enforces every rule |
 | `frontend/components/app-shell.tsx` | `NAV`, with the roles that can see each page; user menu; page-level gate |
 | `frontend/next.config.ts` | Rewrites `/api/*` to `BACKEND_URL` (same-origin cookie) |
-| `scripts/check_boundaries.py`, `scripts/smoke.py` | Architecture guard; headless-Chrome UI smoke test |
+| `scripts/check_boundaries.py`, `scripts/smoke.py`, `scripts/api_contract.py` | Architecture guard; headless-Chrome UI smoke test; API response-shape contract |
 | `.github/workflows/ci.yml`, `backend/Dockerfile`, `frontend/Dockerfile` | CI and the GHCR images |
 | `docs/` | HLD, LLD, the hardening design, phase plans, ADRs |
 
@@ -112,6 +117,7 @@ cd backend && uv run python test_phase2.py    # document routing, provenance, re
 - **Rules change only by publishing a version** (`policy/`). Replay never deletes an item: not-started items are cancelled, done items or items with documents are kept as evidence.
 - **One open draft at a time is a deliberate limit**, not a bug: two drafts of the same rule set would need merging. Revisit only if HR asks for parallel drafts.
 - **Every `work_queue` kind is a contract** in `work_queue.KINDS`: an SLA, an escalation role and resolution steps. Register a kind before opening items of it.
+- **Graph labels move through `graph_migration.py` only** (Phase 3): register a `LabelSpec`, then the cutover runs at startup before any worker, refuses unless parity, schema diff, edges and the read-path scan are clean, and records before/after evidence. Follow `docs/runbooks/phase-3-cutover.md` per batch.
 - **Postgres is the system of record.**
   - Read migrating record types only through `shared/bridge.py`.
   - A type may switch to Postgres only after `parity()` passes.
