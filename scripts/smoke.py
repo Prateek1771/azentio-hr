@@ -126,21 +126,32 @@ async def run(base: str, shots: Path) -> int:
     shots.mkdir(parents=True, exist_ok=True)
     profile = tempfile.mkdtemp(prefix="smoke-")
     port = 9333
-    proc = subprocess.Popen([find_chrome(), "--headless=new", f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
-                             "--window-size=1440,900", "--hide-scrollbars", "--no-first-run",
-                             *(["--no-sandbox"] if os.getenv("CI") else []), "about:blank"],  # CI runners restrict user namespaces
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    chrome_log = Path(profile) / "chrome-stderr.log"
+
+    def launch():
+        return subprocess.Popen([find_chrome(), "--headless=new", f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
+                                 "--window-size=1440,900", "--hide-scrollbars", "--no-first-run",
+                                 *(["--no-sandbox"] if os.getenv("CI") else []), "about:blank"],  # CI runners restrict user namespaces
+                                stdout=subprocess.DEVNULL, stderr=open(chrome_log, "ab"))
+
+    proc = launch()
     failures = []
     try:
-        for _ in range(50):
+        # A cold runner can take a while to start Chrome: wait up to 60s, relaunch once if it died during startup,
+        # and if it still isn't reachable say why (its own stderr) instead of failing blind.
+        ws_url, relaunched, deadline = None, False, time.time() + 60
+        while time.time() < deadline:
             try:
-                tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json"))
+                tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=2))
                 ws_url = next(t["webSocketDebuggerUrl"] for t in tabs if t["type"] == "page")
                 break
             except Exception:
-                time.sleep(0.2)
-        else:
-            sys.exit("smoke: Chrome did not start")
+                if proc.poll() is not None and not relaunched:
+                    relaunched, proc = True, launch()
+                time.sleep(0.25)
+        if not ws_url:
+            tail = chrome_log.read_text(errors="replace")[-2000:] if chrome_log.exists() else "(no output)"
+            sys.exit(f"smoke: Chrome's DevTools endpoint didn't come up within 60s (exit code {proc.poll()}). Chrome said:\n{tail}")
         async with websockets.connect(ws_url, max_size=50_000_000) as ws:
             p = Page(ws)
             await p.send("Page.enable")
