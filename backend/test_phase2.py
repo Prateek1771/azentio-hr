@@ -242,5 +242,63 @@ check("test_spot_check_fail_reopens", docs.get(s_id)["status"] == "Under Review"
       and any(r["detail"]["reason_code"] == "spot_check_failed" for r in open_reviews(s_id))
       and records.item_by_key(aarav, "address_proof")["status"] == "Under Review" and not open_reviews(s_id, "doc.spot_check"))
 
+# ---------- review-queue contract and API ----------
+from fastapi.testclient import TestClient  # noqa: E402
+import main  # noqa: E402
+import work_queue  # noqa: E402
+
+client = TestClient(main.app)
+
+
+def as_user(u, pw):
+    client.cookies.clear()
+    r = client.post("/api/auth/login", json={"email": u["email"], "password": pw})
+    assert r.status_code == 200, r.text
+
+
+k_id = upload(aarav, "photo_id", "passport2.png", good("photo_id", "Aarav Sharma", 0.99))
+drain()
+rv = open_reviews(k_id)[0]
+item = work_queue.get(rv["id"])
+check("test_queue_contract_shape", {"id", "kind", "status", "reason", "sla_due", "escalate_to", "steps", "assignee",
+                                    "entity_type", "entity_id", "detail"} <= set(item)
+      and item["escalate_to"] == "admin" and item["steps"] and item["sla_due"] is not None)
+e = raises(lambda: work_queue.open_item("doc.reviews", "document", k_id, "typo kind", "approver"), work_queue.UnknownKind)
+check("test_queue_refuses_unknown_kind", e is not None)
+as_user(hr, "hr-pass-12345")
+r = client.post(f"/api/review-queue/{rv['id']}/claim", json={})
+check("test_hr_ops_cannot_claim_high_risk", r.status_code == 403, r.text)
+as_user(ap1, "ap1-pass-12345")
+r1 = client.post(f"/api/review-queue/{rv['id']}/claim", json={})
+as_user(ap2, "ap2-pass-12345")
+r2 = client.post(f"/api/review-queue/{rv['id']}/claim", json={})
+r3 = client.post(f"/api/review-queue/{rv['id']}/claim", json={"takeover": True})  # too soon to take over
+r4 = client.post(f"/api/documents/{k_id}/decision", json={"decision": "accept", "reason_code": "verified_against_original",
+                                                         "reason_text": "looks right"})
+check("test_claim_exclusive", r1.status_code == 200 and r1.json()["assignee"] == ap1["email"] and r2.status_code == 409
+      and r3.status_code == 409 and r4.status_code == 409, (r1.status_code, r2.status_code, r3.status_code, r4.status_code))
+r = client.post(f"/api/work-queue/{rv['id']}/resolve", json={"resolution": "just close it"})
+check("test_generic_resolve_refused_for_reviews", r.status_code == 409, r.text)
+q_ = client.get("/api/review-queue", params={"kind": "doc.review"}).json()
+check("test_review_queue_lists_with_document", any(x["entity_id"] == k_id and x["document"]["tier"] == "high"
+                                                     and x["assignee"] == ap1["email"] for x in q_["items"]))
+as_user(ap1, "ap1-pass-12345")
+det = client.get(f"/api/documents/{k_id}").json()
+check("test_detail_leads_with_policy_facts", det["policy"]["tier"] == "high" and det["policy"]["threshold"] is not None
+      and det["policy"]["version"]["id"] == v_active and det["policy"]["decided_by"] == "system"
+      and det["can_decide"] and "path" not in det["document"])
+r = client.post(f"/api/documents/{k_id}/decision", json={"decision": "accept", "reason_code": "verified_against_original",
+                                                        "reason_text": "Checked against the original", "decision_key": "ui-1"})
+check("test_decision_via_api", r.status_code == 200 and r.json()["status"] == "Accepted" and "path" not in r.json())
+pan_item = records.item_by_key(aarav, "pan_card")
+as_user(hr, "hr-pass-12345")
+r = client.post(f"/api/items/{pan_item['id']}/status", json={"status": "Accepted"})
+check("test_item_status_409_for_documents", r.status_code == 409 and records.item(pan_item["id"])["status"] == "Correction Requested")
+acc = client.get("/api/quality/ai-accuracy").json()
+check("test_ai_accuracy", acc["documents"] >= 8 and acc["spot_checks"] == 1 and acc["spot_check_precision"] == 0.0
+      and acc["too_small"] and acc["review_reasons"] and 0 < acc["auto_accept_rate"] < 1, acc)
+from documents.routes import wilson  # noqa: E402
+check("test_wilson_interval", wilson(27, 30)[0] > 0.7 and wilson(0, 0) is None)
+
 check("audit_chain_verifies", verify_chain()[0])
 print(f"\nphase 2: {ok} checks passed")

@@ -323,23 +323,16 @@ async def set_item_status(item_id: str, body: ItemStatus):
     it = records.item(item_id)
     if not it or not _visible(records.employee(it["employee_id"]) or {}):
         raise HTTPException(404, "Item not found")
+    if it["kind"] == "document":  # a document item's status is derived from a recorded decision, never set directly
+        raise HTTPException(409, "Document items change only through a review decision: "
+                                 "POST /api/documents/{id}/decision (or /override), with a reason")
     records.update_item(item_id, status=body.status)
-    if it["kind"] == "document":  # ponytail: Step 3 replaces this with the decision endpoint (409 here)
-        from documents import store as docs
-        latest = docs.latest_for_item(item_id)
-        if latest and body.status in docs.STATUSES:
-            with db.tx() as c:
-                docs.update(latest["id"], c, status=body.status)
-            records.project(it["employee_id"])
     event(it["employee_id"], "review", f"HR set '{it['name']}' to {body.status}" + (f": {body.note}" if body.note else ""))
     if body.status == "Correction Requested" and gmail.configured():
         emp = get_emp(it["employee_id"])
         await gmail.send_correction(emp, it, [body.note or "Please re-submit a clearer, valid copy."])
     checklist.recompute(it["employee_id"])
     audit.record_audit("checklist.item_status", "item", item_id, f"Set '{it['name']}' to {body.status}", metadata={"note": body.note} if body.note else None)
-    if it["kind"] == "document":
-        from integrations.engine import on_documents_changed
-        on_documents_changed(it["employee_id"])
     return employee_detail(it["employee_id"])
 
 
@@ -575,7 +568,11 @@ def ready():
     except Exception:
         checks["worker"] = False
     body = {k: "ok" if v else "down" for k, v in checks.items()}
-    body["llm"] = "configured" if BASE_URL else "missing"
+    from llm import unavailable_reason
+    why = unavailable_reason() if BASE_URL else "No AI provider configured"
+    body["llm"] = "degraded" if why else "configured"  # informational: documents fall back to human review
+    if why:
+        body["llm_reason"] = why
     return JSONResponse(body, status_code=200 if all(checks.values()) else 503)
 
 
@@ -584,10 +581,12 @@ import work_queue  # noqa: E402
 from policy.routes import router as policy_router  # noqa: E402
 import policy.service  # noqa: E402,F401  (registers policy.publish / notify.item_added job handlers)
 import documents.service  # noqa: E402,F401  (registers doc.extract / doc.after_decision / notify.correction handlers)
+from documents.routes import router as documents_router  # noqa: E402
 
 app.include_router(identity_router)
 app.include_router(work_queue.router)
 app.include_router(policy_router)
+app.include_router(documents_router)
 
 import connector_routes  # noqa: E402
 

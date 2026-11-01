@@ -53,18 +53,75 @@ def open_item(kind: str, entity_type: str, entity_id: str, reason: str, assignee
     return row["id"] if row else None
 
 
-def list_items(role: str, status: str = "open", kind: str = "") -> list[dict]:
-    see_all = role in ("admin", "auditor")
-    where, params = ["status = %s"], [status]
-    if not see_all:
-        where.append("assignee_role = %s")
+TAKEOVER_AFTER = timedelta(minutes=30)
+OPEN = ("open", "in_progress")
+_SELECT = """SELECT w.*, u.email AS assignee FROM work_queue w LEFT JOIN users u ON u.id = w.assignee_id"""
+
+
+def serialize(r: dict) -> dict:
+    """The one shape every API returns for a work item; the frontend reads only this."""
+    spec = KINDS.get(r["kind"], {})
+    return {"id": r["id"], "kind": r["kind"], "status": r["status"], "reason": r["reason"], "sla_due": r["sla_due"],
+            "escalate_to": spec.get("escalate_to"), "steps": spec.get("steps", ""), "assignee": r.get("assignee"),
+            "assignee_id": r.get("assignee_id"), "assignee_role": r["assignee_role"], "claimed_at": r.get("claimed_at"),
+            "entity_type": r["entity_type"], "entity_id": r["entity_id"], "detail": r.get("detail") or {},
+            "created_at": r["created_at"], "resolution": r.get("resolution"), "resolved_at": r.get("resolved_at")}
+
+
+def get(item_id: int, conn=None) -> dict | None:
+    r = db.fetch1(_SELECT + " WHERE w.id=%s", (item_id,), conn=conn)
+    return serialize(r) if r else None
+
+
+def list_items(role: str | None = None, status: str = "open", kind: str | list[str] = "", assignee: str = "all",
+               user_id: int | None = None, reason_code: str = "", since=None) -> list[dict]:
+    """Open means open or claimed (in progress). `role=None` lists every role's items (read-only screens)."""
+    where, params = [], []
+    if status == "open":
+        where.append("w.status IN ('open','in_progress')")
+    else:
+        where.append("w.status = %s")
+        params.append(status)
+    if role and role not in ("admin", "auditor"):
+        where.append("w.assignee_role = %s")
         params.append(role)
     if kind:
-        where.append("kind = %s")
-        params.append(kind)
-    rows = db.fetch(f"SELECT * FROM work_queue WHERE {' AND '.join(where)} ORDER BY sla_due NULLS LAST, created_at", params)
-    return [{**r, "escalate_to": KINDS.get(r["kind"], {}).get("escalate_to"), "steps": KINDS.get(r["kind"], {}).get("steps", "")}
-            for r in rows]
+        where.append("w.kind = ANY(%s)")
+        params.append([kind] if isinstance(kind, str) else list(kind))
+    if assignee == "me":
+        where.append("w.assignee_id = %s")
+        params.append(user_id)
+    elif assignee == "unassigned":
+        where.append("w.assignee_id IS NULL")
+    if reason_code:
+        where.append("w.detail->>'reason_code' = %s")
+        params.append(reason_code)
+    if since:
+        where.append("coalesce(w.resolved_at, w.created_at) >= %s")
+        params.append(since)
+    order = "w.sla_due NULLS LAST, w.created_at" if status == "open" else "w.resolved_at DESC NULLS LAST"
+    return [serialize(r) for r in db.fetch(f"{_SELECT} WHERE {' AND '.join(where)} ORDER BY {order}", params)]
+
+
+def claim(item_id: int, user: dict, takeover: bool = False) -> dict:
+    """Assign an open item to `user`. Someone else's claim can be taken over only after TAKEOVER_AFTER."""
+    with db.tx() as c:
+        it = db.fetch1(_SELECT + " WHERE w.id=%s FOR UPDATE OF w", (item_id,), conn=c)
+        if not it:
+            raise HTTPException(404, "Not found")
+        if it["status"] not in OPEN:
+            raise HTTPException(409, "Already closed")
+        mine = it["assignee_id"] == user["id"]
+        stale = it["claimed_at"] and it["claimed_at"] < datetime.now(timezone.utc) - TAKEOVER_AFTER
+        if it["assignee_id"] and not mine and not (takeover and stale):
+            raise HTTPException(409, f"Being reviewed by {it['assignee']} (claimed {it['claimed_at']:%H:%M})")
+        if not mine:
+            c.execute("UPDATE work_queue SET assignee_id=%s, claimed_at=now(), status='in_progress' WHERE id=%s",
+                      (user["id"], item_id))
+            import audit
+            audit.record_audit("work_queue.claimed", "work_queue", str(item_id), f"Claimed '{it['reason']}'"
+                               + (f" (took over from {it['assignee']})" if it["assignee_id"] else ""), conn=c)
+    return get(item_id)
 
 
 @router.get("")
@@ -94,13 +151,14 @@ def resolve(item_id: int, body: Resolve):
             raise HTTPException(409, "Already closed")
         status = "dismissed" if body.dismiss else "resolved"
         if it["kind"] in RESOLVERS:
-            from policy.store import PolicyError
             try:
                 status = RESOLVERS[it["kind"]](it, body.action or "", user, body.resolution)
-            except PolicyError as e:
-                raise HTTPException(e.status, str(e))
+            except Exception as e:  # PolicyError / DocError carry an HTTP status
+                if getattr(e, "status", None):
+                    raise HTTPException(e.status, str(e))
+                raise
         it = db.fetch1("""UPDATE work_queue SET status=%s, resolution=%s, resolved_by=%s, resolved_at=now()
                           WHERE id=%s RETURNING *""", (status, body.resolution, user["id"], item_id), conn=c)
         audit.record_audit(f"work_queue.{status}", "work_queue", str(item_id), f"{status.title()} '{it['reason']}'",
                            reason=body.resolution, conn=c)
-    return it
+    return get(item_id)

@@ -255,6 +255,11 @@ def decide_human(doc_id: str, user: dict, decision: str, reason_code: str, reaso
             raise DocError(403, "High-risk documents need an approver's decision")
         if doc["status"] != "Under Review":
             raise DocError(409, f"This document is {doc['status']}, not waiting for review. Use override to reverse a decision.")
+        held = db.fetch1("""SELECT u.email FROM work_queue w JOIN users u ON u.id = w.assignee_id
+                            WHERE w.entity_type='document' AND w.entity_id=%s AND w.kind='doc.review'
+                            AND w.status='in_progress' AND w.assignee_id <> %s""", (doc_id, user["id"]), conn=c)
+        if held:
+            raise DocError(409, f"Being reviewed by {held['email']}; take it over from the review queue first")
         if corrected_fields:
             store.update(doc_id, c, extracted={**(doc.get("extracted") or {}), **corrected_fields, "_corrected_by": user["email"]})
         if status == "Correction Requested" and issues:
@@ -321,6 +326,15 @@ def spot_check(work_item_id: int, user: dict, verdict: str, reason_text: str) ->
         audit.record_audit(f"document.spot_check_{verdict}", "document", doc["id"], f"Spot check {verdict}: '{doc['filename']}'",
                            reason=reason_text, conn=c)
     return store.get(doc["id"])
+
+
+def _decide_instead(item: dict, action: str, user: dict, reason: str) -> str:
+    raise DocError(409, "Document reviews close with a decision on the document (POST /api/documents/{id}/decision), "
+                        "or a spot-check verdict; they can't be resolved generically")
+
+
+work_queue.RESOLVERS["doc.review"] = _decide_instead
+work_queue.RESOLVERS["doc.spot_check"] = _decide_instead
 
 
 # ---------- outbox handlers ----------

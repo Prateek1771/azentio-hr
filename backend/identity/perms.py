@@ -43,6 +43,15 @@ RULES: list[tuple[set, re.Pattern, object]] = [(m, re.compile(p), roles) for m, 
     (W, r"^/api/policy/drafts(/|$)", {HR}),
     (W, r"^/api/policy/versions/\d+/(approve|reject)$", {APPROVER}),
     (W, r"^/api/policy/versions/\d+/rollback$", {HR}),
+    # Document review (Phase 2): approvers decide; HR Ops may decide low-risk documents (checked on the tier in
+    # documents.service.can_decide); auditors read. Overrides and spot checks are approver-only.
+    (R, r"^/api/review-queue$", STAFF),
+    (W, r"^/api/review-queue/\d+/claim$", {APPROVER, HR}),
+    (W, r"^/api/review-queue/\d+/spot-check$", {APPROVER}),
+    (W, r"^/api/documents/[^/]+/decision$", {APPROVER, HR}),
+    (W, r"^/api/documents/[^/]+/override$", {APPROVER}),
+    (R, r"^/api/documents/[^/]+$", STAFF),
+    (R, r"^/api/quality/ai-accuracy$", {ADMIN, AUDITOR, APPROVER, HR}),
     # A portal link lets the holder act as the joiner, so only the people who send it can fetch it.
     (R, r"^/api/employees/[^/]+/portal-link$", {HR}),
     # Core onboarding. Managers read, scoped to their own reports by main.get_emp / list_employees.
