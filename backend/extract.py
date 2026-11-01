@@ -1,5 +1,6 @@
 """LLM document understanding: classify + extract fields with a vision model and JSON output."""
 import base64
+import hashlib
 import io
 import json
 import os
@@ -59,21 +60,30 @@ SKELETON = json.dumps({"doc_type": "photo_id", "legible": True, "full_name": "st
                        "address": "string or null", "issuer": "string or null", "confidence": 0.9, "notes": "string"})
 
 
+# Bump PROMPT_VERSION whenever PROMPT_TEMPLATE or SKELETON changes: every decision records it, so outcomes can be
+# compared across prompt changes. test_phase2 fails if the text changes without a bump.
+PROMPT_VERSION = "2026-11-01"
+PROMPT_TEMPLATE = (
+    "You are an HR onboarding document checker. Classify this document and extract its fields.\n"
+    "Allowed doc_type keys:\n{catalogue}\n- unknown: none of the above\n"
+    "{hint}"
+    "Only report values actually printed on the document; use null when absent. Dates must be YYYY-MM-DD. "
+    "Set legible=false if blurry, cropped or unreadable.\n"
+    "Reply with ONLY a flat JSON object with exactly these keys (example of the shape): {skeleton}"
+)
+PROMPT_SHA = hashlib.sha256((PROMPT_TEMPLATE + SKELETON).encode()).hexdigest()
+
+
 async def extract(data: bytes, mime: str, filename: str, doc_types: dict, hint: str | None = None) -> dict:
     catalogue = "\n".join(f"- {k}: {v['name']}" for k, v in doc_types.items())
-    prompt = (
-        "You are an HR onboarding document checker. Classify this document and extract its fields.\n"
-        f"Allowed doc_type keys:\n{catalogue}\n- unknown: none of the above\n"
-        + (f"The employee said this is: {hint}.\n" if hint else "")
-        + "Only report values actually printed on the document; use null when absent. Dates must be YYYY-MM-DD. "
-        "Set legible=false if blurry, cropped or unreadable.\n"
-        f"Reply with ONLY a flat JSON object with exactly these keys (example of the shape): {SKELETON}"
-    )
+    prompt = PROMPT_TEMPLATE.format(catalogue=catalogue, hint=f"The employee said this is: {hint}.\n" if hint else "",
+                                    skeleton=SKELETON)
     content = [{"type": "text", "text": prompt}] + [{"type": "image_url", "image_url": {"url": u}} for u in to_images(data, mime)]
     resp, model = await llm.complete([{"role": "user", "content": content}], max_tokens=1500, name="document-extraction",
                                      response_format={"type": "json_object"})
     out = _parse(resp.choices[0].message.content)
     out["_model"], out["_tokens"] = model, getattr(resp.usage, "total_tokens", None)
+    out["_prompt_version"] = PROMPT_VERSION
     return out
 
 

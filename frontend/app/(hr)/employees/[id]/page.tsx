@@ -5,7 +5,9 @@ import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { AlertOctagon, AlertTriangle, ArrowLeft, Check, ClipboardCopy, ExternalLink, FileText, Pencil, Send, UserX } from "lucide-react";
-import { API, api, daysUntil, fmtDate, timeAgo, type Doc, type EmployeeDetail, type Item, type Template } from "@/lib/api";
+import { API, api, daysUntil, decisionLine, fmtDate, timeAgo, type Doc, type EmployeeDetail, type Item, type Template } from "@/lib/api";
+import { DocViewer } from "@/components/doc-viewer";
+import { TierBadge } from "@/components/review-bits";
 import { Initials, ProgressRing, STATE_STYLE, StateBadge, StatusPill } from "@/components/status";
 import { GraphView } from "@/components/graph-view";
 import { Timeline } from "@/components/timeline";
@@ -15,7 +17,6 @@ import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
@@ -30,7 +31,6 @@ export default function EmployeePage() {
   const [graph, setGraph] = useState<{ nodes: never[]; edges: never[] } | null>(null);
   const [sendOpen, setSendOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
-  const [reject, setReject] = useState<Item | null>(null);
   const [preview, setPreview] = useState<Doc | null>(null);
   const [links, setLinks] = useState<{ type: string; connector_id: string; connector: string; employee_number?: string }[]>([]);
   const [loadError, setLoadError] = useState("");
@@ -150,7 +150,7 @@ export default function EmployeePage() {
                   <span className="text-xs text-muted-foreground">{items.filter((i) => i.state === "completed").length}/{items.length} done</span>
                 </div>
                 {items.map((it) => (
-                  <ChecklistRow key={it.id} it={it} canWrite={canWrite} onStatus={setStatus} onReject={() => setReject(it)} onPreview={setPreview} />
+                  <ChecklistRow key={it.id} it={it} canWrite={canWrite} onStatus={setStatus} onPreview={setPreview} />
                 ))}
               </Card>
             );
@@ -204,22 +204,19 @@ export default function EmployeePage() {
 
       <SendDialog open={sendOpen} onOpenChange={setSendOpen} employeeId={id} onSent={load} />
       <EditDialog key={`edit-${editOpen}`} open={editOpen} onOpenChange={setEditOpen} e={e} onSaved={(nd) => { setD(nd); load(); }} />
-      <RejectDialog key={reject?.id ?? "none"} item={reject} onClose={() => setReject(null)} onSubmit={(note) => { if (reject) setStatus(reject, "Correction Requested", note); setReject(null); }} />
       <Dialog open={!!preview} onOpenChange={(o) => !o && setPreview(null)}>
         <DialogContent className="sm:max-w-3xl">
           <DialogHeader><DialogTitle>{preview?.filename}</DialogTitle></DialogHeader>
-          {preview && (preview.mime === "application/pdf"
-            ? <iframe src={`${API}/api/documents/${preview.id}/file`} className="h-[70vh] w-full rounded-lg border" />
-            // eslint-disable-next-line @next/next/no-img-element
-            : <img src={`${API}/api/documents/${preview.id}/file`} alt={preview.filename} className="max-h-[70vh] w-full rounded-lg border object-contain" />)}
+          {preview && <DocViewer id={preview.id} mime={preview.mime} filename={preview.filename} />}
+          {preview && <div className="flex justify-end"><Button size="sm" variant="outline" nativeButton={false} render={<Link href={`/review/${preview.id}`} />}>Open review page</Button></div>}
         </DialogContent>
       </Dialog>
     </>
   );
 }
 
-function ChecklistRow({ it, canWrite, onStatus, onReject, onPreview }: {
-  it: Item; canWrite: boolean; onStatus: (i: Item, s: string) => void; onReject: () => void; onPreview: (d: Doc) => void;
+function ChecklistRow({ it, canWrite, onStatus, onPreview }: {
+  it: Item; canWrite: boolean; onStatus: (i: Item, s: string) => void; onPreview: (d: Doc) => void;
 }) {
   const st = STATE_STYLE[it.state];
   const latest = it.documents[0];
@@ -242,21 +239,21 @@ function ChecklistRow({ it, canWrite, onStatus, onReject, onPreview }: {
         {latest && (
           <button onClick={() => onPreview(latest)} className="mt-2 inline-flex items-center gap-1.5 rounded-md border bg-muted/40 px-2 py-1 text-xs hover:bg-muted">
             <FileText className="size-3.5" /> {latest.filename} · via {latest.source}
-            {latest.confidence > 0 && <span className="text-muted-foreground">· {Math.round(latest.confidence * 100)}% conf.</span>}
           </button>
         )}
+        {latest?.decision && <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+          <TierBadge tier={latest.tier} />{decisionLine(latest)}</div>}
         {latest?.issues?.length > 0 && it.status === "Correction Requested" && (
           <ul className="mt-1.5 space-y-0.5 text-xs text-amber-700 dark:text-amber-400">{latest.issues.map((x, i) => <li key={i}>• {x}</li>)}</ul>
         )}
       </div>
-      <div className={cn("flex gap-1.5", !canWrite && "hidden")}>
-        {it.kind === "document" && it.status !== "Accepted" && it.documents.length > 0 && (
-          <Button size="sm" variant="outline" onClick={() => onStatus(it, "Accepted")}><Check className="size-3.5" /> Accept</Button>
+      <div className="flex gap-1.5">
+        {/* Document decisions are made, with a reason, on the review page; never set directly here. */}
+        {it.kind === "document" && latest && (
+          <Button size="sm" variant={latest.status === "Under Review" ? "outline" : "ghost"} nativeButton={false} render={<Link href={`/review/${latest.id}`} />}>
+            {latest.status === "Under Review" ? "Open review" : "Details"}</Button>
         )}
-        {it.kind === "document" && it.documents.length > 0 && it.status !== "Correction Requested" && (
-          <Button size="sm" variant="ghost" onClick={onReject}>Request correction</Button>
-        )}
-        {it.kind === "task" && it.status !== "Completed" && it.state !== "blocked" && (
+        {canWrite && it.kind === "task" && it.status !== "Completed" && it.state !== "blocked" && (
           <Button size="sm" variant="outline" onClick={() => onStatus(it, "Completed")}><Check className="size-3.5" /> Mark done</Button>
         )}
       </div>
@@ -312,7 +309,10 @@ function DocCard({ doc, item, employee, onPreview }: { doc: Doc; item: string; e
         </tbody>
       </table>
       {doc.issues.length > 0 && <ul className="space-y-0.5 text-xs text-amber-700 dark:text-amber-400">{doc.issues.map((i, n) => <li key={n}>• {i}</li>)}</ul>}
-      {typeof x._model === "string" && <div className="text-[11px] text-muted-foreground">Extracted by {x._model}</div>}
+      <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+        <TierBadge tier={doc.tier} />{decisionLine(doc)}{typeof x._model === "string" && <span>· extracted by {x._model}</span>}
+        <Link href={`/review/${doc.id}`} className="ml-auto font-medium text-primary hover:underline">Review page</Link>
+      </div>
     </Card>
   );
 }
@@ -414,21 +414,3 @@ function EditDialog({ open, onOpenChange, e, onSaved }: { open: boolean; onOpenC
   );
 }
 
-function RejectDialog({ item, onClose, onSubmit }: { item: Item | null; onClose: () => void; onSubmit: (note: string) => void }) {
-  const [note, setNote] = useState("");
-  return (
-    <Dialog open={!!item} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Request a correction</DialogTitle>
-          <DialogDescription>The employee receives an email explaining what to fix for “{item?.name}”.</DialogDescription>
-        </DialogHeader>
-        <Textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="e.g. The scan is cut off at the bottom — please send a full, clear copy." rows={4} />
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>Cancel</Button>
-          <Button onClick={() => onSubmit(note)} disabled={!note.trim()}>Send correction request</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}

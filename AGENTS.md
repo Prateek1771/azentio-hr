@@ -8,13 +8,13 @@ Azentio Onboard is an HR onboarding agent. For each new joiner it works out whic
 We're hardening it from a demo into governed HR operations in 7 phases: see [docs/plans/2026-11-01-hardening-design.md](docs/plans/2026-11-01-hardening-design.md).
 
 ## Current phase
-**Phases 0 and 1 are complete.** Next: **Phase 2: AI control + Document migration** ([plan](docs/plans/phase-2-ai-control.md)). References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md) (including what changed from its plan).
+**Phases 0, 1 and 2 are complete.** Next: **Phase 3: Retire graph record storage** ([plan](docs/plans/phase-3-retire-graph-records.md)). References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
 
 | Phase | Status |
 |---|---|
 | 0 Trust + foundation (auth, 5 roles, audit chain, jobs/outbox, bootstrap) | **done** |
 | 1 Policy governance + Employee/Item migration | **done** |
-| 2 AI control + Document migration | planned |
+| 2 AI control + Document migration | **done** |
 | 3 Retire graph record storage | planned |
 | 4 Ops backbone + **Temporal** | planned |
 | 5 Lifecycle (transfer, offboarding, rechecks, contractor/rehire, leave) | planned |
@@ -23,7 +23,7 @@ We're hardening it from a demo into governed HR operations in 7 phases: see [doc
 ## Stack
 - **Backend:** FastAPI on Python 3.12, managed with `uv` (`backend/`).
 - **Postgres 17:** the system of record ([ADR 0005](docs/adr/0005-postgres-system-of-record.md)). Plain SQL through `psycopg`, no ORM.
-- **FalkorDB:** a read model only: the dependency graph, the relationship view, and the policy chunks the assistant retrieves ([ADR 0006](docs/adr/0006-graph-as-read-model.md)). Until Phases 1 to 3 finish, it still holds Employee, Item, Document and connector records.
+- **FalkorDB:** a read model only: the dependency graph, the relationship view, and the policy chunks the assistant retrieves ([ADR 0006](docs/adr/0006-graph-as-read-model.md)). Until Phase 3 finishes, it still holds connector records, events and policies.
 - **Next.js 16 / React 19 / Tailwind 4 / shadcn on base-ui** (`frontend/`). The browser calls the API through the Next.js rewrite of `/api/*` to `BACKEND_URL`, so the app and the API share one origin and the session cookie works.
 - **Temporal:** arrives in **Phase 4**, for durable workflows on top of Postgres ([ADR 0011](docs/adr/0011-temporal-orchestration.md)). It isn't used yet.
 
@@ -53,6 +53,7 @@ python scripts/check_boundaries.py            # architecture guard (add --selfte
 cd backend && uv run python test_core.py      # rules, validation, ingestion, connectors, integrations
 cd backend && uv run python test_phase0.py    # auth, permission matrix, audit chain, jobs, bootstrap
 cd backend && uv run python test_phase1.py    # rule-set versions, approvals, safe replay, rollback, parity, projection
+cd backend && uv run python test_phase2.py    # document routing, provenance, reviews, spot checks, LLM down, thresholds
 ```
 - Both use throwaway databases (`azentio_test*`, plus FalkorDB graph `test`) and never touch live data.
 - Each new phase adds `test_phaseN.py`.
@@ -68,6 +69,7 @@ cd backend && uv run python test_phase1.py    # rule-set versions, approvals, sa
 3. An already-applied migration is modified, removed or renamed.
 4. `work_queue.open_item` uses a kind not registered in `work_queue.KINDS`.
 5. Code updates, deletes or truncates `audit_log`, or disables its trigger (tests excepted).
+6. Something writes `Document` nodes or their `HAS_DOC` / `SUBMITTED` / `MISMATCH` edges to the graph outside `documents/store.py`.
 
 ## Where things live
 | Path | Owns |
@@ -77,6 +79,7 @@ cd backend && uv run python test_phase1.py    # rule-set versions, approvals, sa
 | `backend/shared/jobs.py` | **Transactional outbox and short-task queue**: `enqueue(..., idempotency_key, conn=)`, `@handler`, backoff, `dead`, heartbeat |
 | `backend/shared/bridge.py` | Which store each record type is read from; `parity()`/`switch()` for migrations |
 | `backend/shared/bootstrap.py` | Startup steps, each safe to re-run (incl. the one-time Employee/Item migration gate) |
+| `backend/documents/` | **Documents (Phase 2).** `store` is the only read/write path for documents, mismatches and decisions (append-only `doc_decisions`); `route` is the pure policy router (`decide`, `ALWAYS_HIGH`, `backtest`) |
 | `backend/records.py` | **The only way to read or write employees and checklist items.** Refreshes the graph projection in place after each write |
 | `backend/policy/` | Rule-set versions: `store` (versions, drafts, diff), `replay` (pure `plan_diff` + `apply`), `service` (preview, approvals, publish/notify jobs), `routes` |
 | `backend/migrations/NNN_*.sql` | Schema, applied at startup |
@@ -87,6 +90,7 @@ cd backend && uv run python test_phase1.py    # rule-set versions, approvals, sa
 | `backend/connectors/`, `backend/integrations/` | Connector catalog, integration engine and agent |
 | `frontend/app/(hr)/` | HR app pages; `frontend/app/portal/[token]` is the joiner portal (public, token-scoped) |
 | `frontend/app/login`, `frontend/app/(hr)/users` | Sign-in screen; user and role management (admin) |
+| `frontend/app/(hr)/review`, `review/[id]` | Document review queue and detail (policy facts first, decision footer, spot checks) |
 | `frontend/app/(hr)/rules/{draft,draft/preview,history}`, `approvals` | Rule governance: draft editor, impact preview, version history/rollback; Approval Center tabs |
 | `frontend/components/auth.tsx` | `MeProvider`/`useMe`, `can(user, action)`, `RoleGate`, role labels. Hide write buttons with `can()`; the backend still enforces every rule |
 | `frontend/components/app-shell.tsx` | `NAV`, with the roles that can see each page; user menu; page-level gate |
@@ -102,7 +106,8 @@ cd backend && uv run python test_phase1.py    # rule-set versions, approvals, sa
   - Single side effects and local operational tasks are Postgres jobs, with an idempotency key on every side effect.
   - Anything that waits on people or timers becomes a Temporal workflow from Phase 4.
   - Always enqueue inside the transaction of the change that caused it.
-- **Employees and items only through `records.py`.** Never write `Employee`/`Item` with Cypher; documents, events and connector records may still be read by joining the graph projection.
+- **Employees and items only through `records.py`; documents only through `documents/store.py`.** Never write `Employee`/`Item`/`Document` or document edges with Cypher; the graph is a projection refreshed by `records.project`.
+- **AI perceives; policy decides** ([ADR 0012](docs/adr/0012-document-decisions-as-built.md)). Document outcomes come only from `documents.route.decide` and recorded `doc_decisions` rows; item status for a document item is derived (`item_status_for`), never set. `ALWAYS_HIGH` types are never auto-accepted (code + DB trigger).
 - **Rules change only by publishing a version** (`policy/`). Replay never deletes an item: not-started items are cancelled, done items or items with documents are kept as evidence.
 - **One open draft at a time is a deliberate limit**, not a bug: two drafts of the same rule set would need merging. Revisit only if HR asks for parallel drafts.
 - **Every `work_queue` kind is a contract** in `work_queue.KINDS`: an SLA, an escalation role and resolution steps. Register a kind before opening items of it.

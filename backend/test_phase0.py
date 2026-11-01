@@ -45,6 +45,7 @@ MATRIX = [  # method, path, roles allowed
     ("POST", "/api/policy/drafts/3/submit", {H}), ("DELETE", "/api/policy/drafts/3", {H}),
     ("POST", "/api/policy/versions/3/approve", {P}), ("POST", "/api/policy/versions/3/reject", {P}),
     ("POST", "/api/policy/versions/3/rollback", {H}),
+    ("PUT", "/api/policy/drafts/3/doc-policy", {H}),
     ("POST", "/api/items/i1/status", {H}), ("POST", "/api/escalate", {H}), ("POST", "/api/ingest", {H}),
     ("POST", "/api/onboard", {H}), ("POST", "/api/gmail/poll", {H}), ("POST", "/api/hr/chat", {A, H, P, U}),
     ("GET", "/api/approvals", {A, H, P, U}),
@@ -54,6 +55,10 @@ MATRIX = [  # method, path, roles allowed
     ("POST", "/api/connectors/c1/import", {A, H}), ("POST", "/api/connectors/c1/records/r1/onboard", {A, H}),
     ("GET", "/api/logs/audit", {A, H, P, U}), ("GET", "/api/quality", {A, H, P, U}), ("POST", "/api/quality/eval", {A}),
     ("GET", "/api/work-queue", {A, H, P, U}), ("POST", "/api/work-queue/1/resolve", {A, H, P}),
+    ("GET", "/api/review-queue", {A, H, P, U}), ("POST", "/api/review-queue/1/claim", {H, P}),
+    ("POST", "/api/review-queue/1/spot-check", {P}), ("GET", "/api/documents/d1", {A, H, P, U}),
+    ("POST", "/api/documents/d1/decision", {H, P}), ("POST", "/api/documents/d1/override", {P}),
+    ("GET", "/api/quality/ai-accuracy", {A, H, P, U}),
     ("GET", "/api/auth/me", {A, H, P, M, U}), ("GET", "/api/not-a-route", set()), ("DELETE", "/api/stats", set()), ("POST", "/api/policies", set()),
 ]
 bad = [(m, p, r) for m, p, roles in MATRIX for r in perms.ROLES if perms.allowed(m, p, r) != (r in roles)]

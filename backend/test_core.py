@@ -48,11 +48,12 @@ assert names_match("SHARMA AARAV", "Aarav Sharma") and names_match("Aarav K Shar
 assert not names_match("Rahul Verma", "Aarav Sharma")
 ok = {"legible": True, "full_name": "Aarav Sharma", "document_number": "P123", "date_of_birth": "1997-04-12",
       "expiry_date": "2030-01-01", "confidence": 0.95}
-assert evaluate(ok, eng, cfg["doc_types"]["photo_id"])["status"] == "Accepted"
+good = evaluate(ok, eng, cfg["doc_types"]["photo_id"])
+assert not good["issues"] and "status" not in good and all(c["ok"] for c in good["checks"])  # checks only; policy decides
 bad = evaluate({**ok, "full_name": "Rahul Verma", "expiry_date": "2025-01-01"}, eng, cfg["doc_types"]["photo_id"])
-assert bad["status"] == "Correction Requested" and len(bad["issues"]) == 2 and bad["mismatches"][0]["field"] == "name"
-assert evaluate({**ok, "confidence": 0.3}, eng, cfg["doc_types"]["photo_id"])["status"] == "Under Review"
-assert evaluate({**ok, "legible": False}, eng, cfg["doc_types"]["photo_id"])["status"] == "Correction Requested"
+assert len(bad["issues"]) == 2 and bad["mismatches"][0]["field"] == "name"
+assert {c["name"] for c in bad["checks"] if not c["ok"]} == {"name_matches_profile", "valid_on_joining_date"}
+assert evaluate({**ok, "legible": False}, eng, cfg["doc_types"]["photo_id"])["issues"]
 assert check_file("application/zip", 100) and not check_file("application/pdf", 100)
 
 # Ingestion validation

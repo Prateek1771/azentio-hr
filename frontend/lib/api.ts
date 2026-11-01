@@ -49,9 +49,14 @@ export interface EmployeeRow extends Employee {
   summary: Summary; overall: "ready" | "overdue" | "blocked" | "in_progress"; days_to_join: number; flags: number;
 }
 
+export type Tier = "low" | "high";
+export interface DocDecisionSummary { kind: string; reason_code: string; reason: string; by: string | null; policy_version: number | null }
+export interface DocCheck { name: string; ok: boolean; detail: string }
 export interface Doc {
   id: string; filename: string; mime: string; size: number; source: string; status: string; ts: number;
   confidence: number; doc_type: string; extracted: Record<string, unknown>; issues: string[];
+  tier?: Tier | null; item_id?: string | null; model?: string | null; prompt_version?: string | null;
+  policy_version_id?: number | null; checks?: DocCheck[]; decision?: DocDecisionSummary;
 }
 
 export interface Item {
@@ -90,15 +95,26 @@ export interface RuleSetVersion {
   rollback_of: number | null; required_approvals: number; author_email: string | null; created_at: string;
   submitted_at: string | null; published_at: string | null; rule_count?: number; approvals: Approval[];
 }
+export interface DocPolicyChange { type: string; field: "tier" | "auto_accept_min" | "spot_check_rate" | "extraction_deadline_minutes"; from: string | number; to: string | number }
 export interface PolicyDiff {
   added: Rule[]; removed: Rule[];
   changed: { id: string; fields: Record<string, [unknown, unknown]> }[];
+  doc_policy?: DocPolicyChange[];
+}
+export interface DocPolicyEntry { tier?: Tier; auto_accept_min?: number }
+export interface DocPolicy {
+  default: Required<DocPolicyEntry>; types: Record<string, DocPolicyEntry>; spot_check_rate: number; extraction_deadline_minutes: number;
+}
+export interface Backtest {
+  decisions: number; changed: number; newly_auto_accepted: number; newly_reviewed: number; newly_auto_accepted_spot_failed: number;
+  by_type: Record<string, { newly_auto_accepted: number; newly_reviewed: number }>; days: number;
 }
 export interface ImpactSummary {
   joiners: number; added: number; cancelled: number; kept_as_evidence: number; due_moved: number; newly_blocked: number; near_start: number;
 }
 export interface VersionDetail extends RuleSetVersion {
-  rules: Rule[]; diff: PolicyDiff; diff_against: number | null; preview: ImpactSummary | null; author_id: number | null;
+  rules: Rule[]; diff: PolicyDiff; diff_against: number | null; preview: (ImpactSummary & { backtest?: Backtest | null }) | null;
+  author_id: number | null; doc_policy?: DocPolicy;
 }
 export interface ImpactRow {
   employee_id: string; name: string; department: string; role: string; location: string; joining_date: string; near_start: boolean;
@@ -109,11 +125,61 @@ export interface ImpactRow {
     due_moved: { key: string; name: string; from: string; to: string }[]; newly_blocked: string[];
   };
 }
-export interface PolicyPreview { summary: ImpactSummary; rows: ImpactRow[] }
+export interface PolicyPreview { summary: ImpactSummary; rows: ImpactRow[]; doc_policy_changes?: DocPolicyChange[]; backtest?: Backtest | null }
 export interface VersionsResp { versions: RuleSetVersion[]; active_id: number | null; open_id: number | null }
+/** The one work-item shape every API returns (backend work_queue.serialize). */
 export interface WorkItem {
   id: number; kind: string; entity_type: string; entity_id: string; reason: string; detail: Record<string, unknown>;
   assignee_role: Role; status: string; sla_due: string | null; created_at: string; resolution: string | null;
+  escalate_to: Role | null; steps: string; assignee: string | null; assignee_id: number | null; claimed_at: string | null;
+  resolved_at: string | null;
+}
+
+// ---------- document review (Phase 2) ----------
+export interface ReviewDocSummary {
+  id: string; filename: string; doc_type: string; tier: Tier | null; confidence: number; status: string; received_at: string;
+  employee_id: string; employee_name: string;
+}
+export interface ReviewItem extends WorkItem { document: ReviewDocSummary | null }
+export interface ReviewQueueResp { items: ReviewItem[]; llm_unavailable: string; auto_accepted_this_week: number }
+export interface DocDecision {
+  id: number; kind: string; decided_by: number | null; decided_by_email: string | null; reason_code: string; reason_text: string;
+  status_after: string; model: string | null; prompt_version: string | null; confidence: number | null; tier: Tier | null;
+  threshold: number | null; policy_version_id: number | null; checks: DocCheck[]; corrected_fields: Record<string, unknown>; at: string;
+}
+export interface DocumentDetail {
+  document: Doc & { employee_id: string; received_at: string; sha256: string | null };
+  policy: {
+    tier: Tier | null; threshold: number | null; version: { id: number; number: number; state: VersionState } | null;
+    always_high: boolean; decided_by: string | null; decision_kind: string | null; reason_code: string | null; reason_label: string | null;
+  };
+  employee: { id: string; name: string; email: string; date_of_birth: string; joining_date: string; department: string; location: string };
+  item: { id: string; key: string; name: string; status: string; due: string } | null;
+  mismatches: { field: string; expected: string; found: string }[];
+  decisions: DocDecision[]; reviews: WorkItem[]; can_decide: boolean; can_override: boolean; reason_codes: string[];
+}
+export interface AiAccuracy {
+  days: number; documents: number; auto_accept_rate: number | null; spot_checks: number; spot_check_precision: number | null;
+  precision_ci95: [number, number] | null; too_small: boolean; review_reasons: { reason_code: string; label: string; n: number }[];
+  median_seconds_to_decision: number | null; models: string[];
+  by_type: Record<string, { total: number; auto_accept: number; review: number; correction: number; spot_pass: number; spot_fail: number }>;
+}
+export const DECISION_LABEL: Record<string, string> = {
+  auto_accept: "Auto-accepted", auto_correction: "Correction requested automatically", routed_review: "Sent to review",
+  human_accept: "Accepted", human_reject: "Rejected", human_correction: "Correction requested", human_override: "Overridden",
+  spot_check_pass: "Spot check passed", spot_check_fail: "Spot check failed", backfill: "Recorded before Phase 2",
+};
+export const REASON_CODE_LABEL: Record<string, string> = {
+  verified_against_original: "Verified against the original", name_variant_acceptable: "Name variant is acceptable",
+  document_expired: "Document expired", wrong_document: "Wrong document", illegible: "Illegible", other: "Other",
+};
+/** "auto-accepted · 94% · v7" or "accepted by sam@ · reason": who decided, under which policy. */
+export function decisionLine(d: Doc): string {
+  const x = d.decision;
+  if (!x) return "";
+  if (!x.by) return [DECISION_LABEL[x.kind] ?? x.kind, d.confidence > 0 ? `${Math.round(d.confidence * 100)}%` : "",
+    x.policy_version ? `v${x.policy_version}` : ""].filter(Boolean).join(" · ");
+  return `${(DECISION_LABEL[x.kind] ?? x.kind).toLowerCase()} by ${x.by}${x.reason ? ` · ${x.reason}` : ""}`;
 }
 export const STATE_LABEL: Record<VersionState, string> = {
   draft: "Draft", pending_approval: "Waiting for approval", approved: "Publishing", active: "Active",

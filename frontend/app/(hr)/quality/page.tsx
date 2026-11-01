@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { FlaskConical, Loader2, Play, ShieldAlert, ShieldCheck } from "lucide-react";
 import { api, fmtTs, timeAgo } from "@/lib/api";
 import { PageHeader } from "@/components/app-shell";
+import { AiDecisionsCard } from "@/components/ai-decisions";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -69,7 +70,7 @@ export default function QualityPage() {
   return (
     <>
       <PageHeader title="AI quality"
-        subtitle="Ragas scores for the employee assistant on a fixed question set, and every guardrail hit across both assistants."
+        subtitle="How the AI is doing on documents (decided by policy, checked by people) and in the assistants (Ragas scores and guardrail hits)."
         actions={
           <Button onClick={start} disabled={starting || !!active}>
             {active || starting ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
@@ -79,6 +80,7 @@ export default function QualityPage() {
 
       {!data ? <Skeleton className="h-72 rounded-xl" /> : (
         <div className="space-y-6">
+          <AiDecisionsCard />
           {!data.latest && !active && (
             <Card className="items-center gap-2 p-12 text-center">
               <FlaskConical className="size-8 text-muted-foreground" />

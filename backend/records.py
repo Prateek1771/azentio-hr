@@ -4,8 +4,8 @@ Every read and write of an Employee or Item goes through here. Rows come back as
 return (ISO date strings, graph-only properties merged back from `extra`), so callers didn't have to change shape.
 
 After every write, `project(eid)` refreshes that employee's nodes in the graph *in place* (MERGE by id). Nodes are
-never deleted or recreated: documents still live in the graph until Phase 2 and hang off them (HAS_DOC, SUBMITTED,
-MISMATCH, SYNCED_TO, FROM_CANDIDATE).
+never deleted or recreated: connector records hang off them (SYNCED_TO, FROM_CANDIDATE), and documents are projected
+here too (documents.store.project).
 """
 from datetime import date, datetime
 
@@ -223,6 +223,10 @@ def project(eid: str) -> None:
          MATCH (:Employee {id:$e})-[:HAS_ITEM]->(j:Item {key:dk}) CREATE (i)-[:DEPENDS_ON]->(j)""", e=eid)
     q("""MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item) WHERE i.cancelled_by_version IS NULL AND i.superseded_by_version IS NULL
          MATCH (o:Owner {email:i.owner_email}) CREATE (i)-[:OWNED_BY]->(o)""", e=eid)
+    from shared import bridge
+    if bridge.source("Document") == "postgres":  # before the Phase 2 cutover the graph still owns documents
+        from documents import store as docs
+        docs.project(eid)
 
 
 def rebuild_graph(eid: str | None = None) -> int:

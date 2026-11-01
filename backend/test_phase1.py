@@ -28,6 +28,9 @@ from identity import service as idsvc  # noqa: E402
 from policy import replay, service, store  # noqa: E402
 from policy.store import PolicyError  # noqa: E402
 from shared import bridge, jobs  # noqa: E402
+from documents import store as docs  # noqa: E402
+
+bridge.SOURCE["Document"] = "postgres"  # post-cutover state: documents live in Postgres, the graph is a projection
 
 SEED = Path(__file__).parent / "seed"
 ok = 0
@@ -72,12 +75,13 @@ check("joiner_built_from_active_version", {"photo_id", "pan_card", "background_v
 
 
 def doc_on(eid, key, status="Accepted"):
-    """Attach a document (graph, as in production until Phase 2) and set the item's status."""
+    """Attach a document (Postgres since Phase 2; the graph gets the projection) and set the item's status."""
     it = records.item_by_key(eid, key)
     did = new_id("doc")
-    q("CREATE (d:Document {id:$d, filename:'x.pdf', status:$s, ts:1})", d=did, s=status)
-    q("MATCH (i:Item {id:$i}), (d:Document {id:$d}) CREATE (i)-[:HAS_DOC]->(d)", i=it["id"], d=did)
-    records.update_item(it["id"], status=status)
+    with db.tx() as c:
+        docs.insert({"id": did, "employee_id": eid, "item_id": it["id"], "filename": "x.pdf", "path": "x.pdf",
+                     "mime": "application/pdf", "source": "portal", "status": status, "doc_type": key}, c)
+    records.update_item(it["id"], status=status)  # also projects the document
     return it["id"], did
 
 

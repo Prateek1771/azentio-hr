@@ -8,7 +8,7 @@ import { api, fmtDate, fmtWhen, timeAgo, type ImpactSummary, type RuleSetVersion
 import { PageHeader } from "@/components/app-shell";
 import { DecisionButtons } from "@/components/integration-bits";
 import { ImpactPreview } from "@/components/impact-preview";
-import { PolicyDiffView } from "@/components/policy-diff";
+import { BacktestSummary, loosens, PolicyDiffView } from "@/components/policy-diff";
 import { can, useMe } from "@/components/auth";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -93,7 +93,9 @@ function PolicyCard({ v, onDone }: { v: VersionDetail; onDone: () => void }) {
   const mine = v.approvals.find((a) => a.email === me?.email);
   const isAuthor = !!me && me.email === v.author_email;
   const canDecide = can(me, "approve") && !isAuthor && !mine && v.state === "pending_approval";
-  const drifted = live && v.preview && (Object.keys(v.preview) as (keyof ImpactSummary)[]).some((k) => v.preview![k] !== live[k]);
+  const IMPACT: (keyof ImpactSummary)[] = ["joiners", "added", "cancelled", "kept_as_evidence", "due_moved", "newly_blocked", "near_start"];
+  const drifted = live && v.preview && IMPACT.some((k) => v.preview![k] !== live[k]);
+  const loosening = (v.diff.doc_policy ?? []).some(loosens);
 
   const submit = async () => {
     if (!decide) return;
@@ -127,7 +129,7 @@ function PolicyCard({ v, onDone }: { v: VersionDetail; onDone: () => void }) {
           <div className={cn("text-sm font-medium", v.state === "approved" ? "text-sky-700 dark:text-sky-400" : "text-amber-700 dark:text-amber-400")}>
             {v.state === "approved" ? "Approved · publishing" : `${approvals.length} of ${v.required_approvals} approval${v.required_approvals > 1 ? "s" : ""}`}</div>
           {approvals.length > 0 && <div className="text-xs text-muted-foreground">{approvals.map((a) => a.email).join(", ")}</div>}
-          {v.required_approvals > 1 && <div className="text-[11px] text-muted-foreground">Touches a compliance rule</div>}
+          {v.required_approvals > 1 && <div className="text-[11px] text-muted-foreground">{loosening ? "Loosens a document control" : "Touches a compliance rule"}</div>}
         </div>
       </div>
 
@@ -139,6 +141,7 @@ function PolicyCard({ v, onDone }: { v: VersionDetail; onDone: () => void }) {
         <AlertTriangle className="size-4" /> The impact has changed since this was submitted (joiners moved). Check the live preview below.</p>}
 
       <PolicyDiffView diff={v.diff} />
+      {v.preview?.backtest && <BacktestSummary bt={v.preview.backtest} />}
 
       <div className="flex flex-wrap items-center gap-2 border-t pt-3">
         <Button size="sm" variant="ghost" onClick={() => setShowImpact((s) => !s)}>{showImpact ? "Hide" : "Show"} live impact</Button>

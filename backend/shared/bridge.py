@@ -17,7 +17,7 @@ SOURCE: dict[str, str] = {
     "Employee": "graph",  # Phase 1
     "Item": "graph",      # Phase 1
     "Rule": "graph",      # Phase 1
-    "Document": "graph",  # Phase 2
+    "Document": "graph",  # Phase 2: documents.store; switched at startup by bootstrap.migrate_documents
 }
 
 

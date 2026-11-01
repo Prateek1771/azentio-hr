@@ -49,6 +49,7 @@ jobs:
       - run: uv run python test_core.py
       - run: uv run python test_phase0.py
       - run: uv run python test_phase1.py
+      - run: uv run python test_phase2.py
 
   frontend:
     name: Frontend (types, lint)

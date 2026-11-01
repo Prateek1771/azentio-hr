@@ -18,9 +18,9 @@ Parts are labelled **Built** (in the code on `main`) or **Planned (Phase N)** (i
 - **Built (Phase 0):** sign-in with five roles, one permission table enforced on every API call, and a tamper-evident audit log that names the person behind every action.
 - Audit, integration and console logs, optional LLM tracing, and a quality dashboard with Ragas scores.
 
+**Built:** governed rule versions with draft, preview and approval (Phase 1); risk-tiered AI autonomy, where policy decides and people review high-risk documents (Phase 2).
+
 **Planned:**
-- governed rule versions with draft, preview and approval (Phase 1)
-- risk-tiered AI autonomy (Phase 2)
 - a job- and workflow-backed ops backbone with Temporal (Phase 4)
 - the full employee lifecycle (Phase 5)
 - manager views, SLAs and appeals (Phase 6)
@@ -112,7 +112,7 @@ flowchart TB
 | Employee portal | Checklist timeline, uploads, policy acknowledgements, assistant | Same Next.js app, token-scoped routes, no account |
 | Next.js server | Serves the app and rewrites `/api/*` to the backend, so browser and API share one origin and the session cookie stays httpOnly | `next.config.ts` rewrites |
 | Backend | All business logic, permission checks, the LLM calls, email, background work | Python 3.12, FastAPI, uv |
-| PostgreSQL | **Built (Phases 0–1):** system of record for users, sessions, the audit chain, jobs (outbox + short-task queue), approvals, the exception queue, **employees, checklist items and versioned rule sets**. **Planned:** Document (Phase 2); connectors and integrations (Phase 3) | Postgres 17, plain SQL via `psycopg`, migrations applied on start |
+| PostgreSQL | **Built (Phases 0–1):** system of record for users, sessions, the audit chain, jobs (outbox + short-task queue), approvals, the exception queue, **employees, checklist items and versioned rule sets**. **documents and their append-only decision history (Phase 2)**. **Planned:** connectors and integrations (Phase 3) | Postgres 17, plain SQL via `psycopg`, migrations applied on start |
 | Graph DB | A projection of joiners, items and dependencies (refreshed in place after every write, Phase 1), plus documents, connectors and integrations until Phases 2–3. Afterwards it's a read model only: dependency graph, relationship view, policy chunks | FalkorDB (Cypher) |
 | File store | Original documents | Local disk |
 | Temporal | **Planned (Phase 4):** durable workflows (lifecycle cases, escalation ladders, approval waits). Business state stays in Postgres | Temporal server + Python SDK |
@@ -164,7 +164,7 @@ flowchart TB
 | Dependency | Used for | If it's down |
 |---|---|---|
 | PostgreSQL | Users, sessions, audit, jobs, approvals, exceptions | Startup fails fast with a clear message; once running, `/ready` returns 503 and signed-in API calls return 503 |
-| FalkorDB | Joiners, items, documents, rules, connectors, integrations (until Phase 3), then read model | The HR pages fail; `/ready` returns 503. Bootstrap skips graph seeding and reports `graph=False` |
+| FalkorDB | Read model for joiners, items and documents (projected from Postgres); connectors, integrations, events and policies until Phase 3 | The HR pages fail; `/ready` returns 503. Bootstrap skips graph seeding and reports `graph=False` |
 | LLM provider (OpenRouter by default) | Extraction, assistants, setup agent, eval judge | Documents go to *Under Review*; chat shows a fallback reply; the agent falls back to rule-based |
 | Gmail API | Sending requests, reading replies | Portal upload still works; integration emails are recorded as simulated |
 | Temporal (Planned, Phase 4) | Durable workflows | The outbox keeps the start/signal rows; they're relayed when Temporal is back |

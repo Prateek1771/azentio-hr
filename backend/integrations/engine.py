@@ -72,8 +72,9 @@ def document_results(eid: str) -> list[dict]:
         status = {"Accepted": "verified", "Correction Requested": "rejected"}.get(i["status"], "missing")
         reason = None
         if status == "rejected":
-            doc = q1("""MATCH (:Item {id:$i})-[:HAS_DOC]->(d:Document) RETURN d.issues AS iss ORDER BY d.ts DESC LIMIT 1""", i=i["id"])
-            issues = json.loads(doc["iss"]) if doc and doc["iss"] else []
+            from documents import store as docs
+            doc = docs.latest_for_item(i["id"])
+            issues = (doc or {}).get("issues") or []
             reason = "; ".join(issues) or "Sent back for correction"
         elif i["status"] in ("Submitted", "Under Review"):
             reason = "Received, being checked"

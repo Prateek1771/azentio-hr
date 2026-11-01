@@ -11,6 +11,7 @@ import { PageHeader } from "@/components/app-shell";
 import { RoleGate } from "@/components/auth";
 import { blankRule, dueText, matchText, RuleDialog } from "@/components/rule-form";
 import { diffCount, PolicyDiffView } from "@/components/policy-diff";
+import { DocPolicyCard } from "@/components/doc-policy-form";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -103,6 +104,7 @@ function DraftEditor() {
         actions={editable && <Button variant="outline" onClick={() => setEdit({ rule: blankRule(), isNew: true })}><Plus className="size-4" /> Add rule</Button>} />
 
       <div className="grid gap-4 lg:grid-cols-[1fr_22rem]">
+        <div className="min-w-0 space-y-4">
         <Card className="gap-0 overflow-hidden p-0">
           <ul className="divide-y">
             {draft.rules.map((r) => (
@@ -136,6 +138,8 @@ function DraftEditor() {
             ))}
           </ul>
         </Card>
+        <DocPolicyCard key={draft.id + JSON.stringify(draft.doc_policy)} draft={draft} docTypes={docTypes} editable={editable} onSaved={setDraft} />
+        </div>
 
         <div className="space-y-4">
           <Card className="gap-3 p-4">

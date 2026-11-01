@@ -30,7 +30,7 @@ CHROME_CANDIDATES = [
 ]
 
 NAV_ALL = ["Dashboard", "Add joiners", "Email templates", "Requirement rules", "Connectors", "Integrations",
-           "Approvals", "Logs", "AI quality", "Activity", "Users"]
+           "Document review", "Approvals", "Logs", "AI quality", "Activity", "Users"]
 STAFF_NAV = [n for n in NAV_ALL if n not in ("Add joiners", "Users")]
 
 # role -> (email, password, nav labels expected, allowed pages, a forbidden page)
@@ -173,7 +173,7 @@ async def run(base: str, shots: Path) -> int:
                 print(f"[{role}]")
                 expect(await sign_in(email, pw), f"{role}: login form signs in")
 
-                got = await p.js("[...document.querySelectorAll('aside nav a')].map(a => a.innerText.trim())")
+                got = await p.js("[...document.querySelectorAll('aside nav a')].map(a => a.innerText.trim().split(String.fromCharCode(10))[0])")  # label, not its count badge
                 expect(got == nav, f"{role}: nav is {nav}" + ("" if got == nav else f" (got {got})"))
 
                 for path in allowed:
@@ -327,6 +327,62 @@ async def run(base: str, shots: Path) -> int:
                 tgt = await p.api("GET", f"/api/policy/versions/{target['id']}")
                 expect(active is not None and active["rollback_of"] == target["id"], "rollback: approval publishes the rollback")
                 expect(active is not None and strip(active["rules"]) == strip(tgt["rules"]), f"rollback: active rules equal v{before}'s")
+
+            # Document review (Phase 2): a high-risk document is read-only for HR Ops; an approver accepts it with a reason.
+            print("[review]")
+            await sign_in("hrops@azentio.local", "hrops-dev-pass")
+
+            async def high_risk_open():
+                q = await p.api("GET", "/api/review-queue?kind=doc.review")
+                return next((it for it in q.get("items", []) if it["document"] and it["document"]["tier"] == "high"
+                             and not it["assignee"]), None)
+            target = await high_risk_open()
+            if target is None:  # a re-run already decided the seeded one: upload a fresh photo ID through the portal
+                tok = (await p.api("GET", "/api/employees/E1006/portal-link"))["token"]
+                png = base64.b64encode(bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+                                                     "1f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082")).decode()
+                await p.js(f"""(async () => {{ const b = Uint8Array.from(atob("{png}"), c => c.charCodeAt(0));
+                    const fd = new FormData(); fd.append("file", new Blob([b], {{type: "image/png"}}), "smoke_passport.png");
+                    fd.append("item_key", "photo_id");
+                    return (await fetch("/api/portal/{tok}/upload", {{method: "POST", body: fd}})).status; }})()""")
+                for _ in range(120):  # extraction is a job: with no LLM it reaches review (ai_unavailable) after the retries
+                    target = await high_risk_open()
+                    if target:
+                        break
+                    await asyncio.sleep(2)
+            expect(target is not None, "review: a high-risk document is waiting for review")
+            if target:
+                did = target["document"]["id"]
+                await p.goto(f"{base}/review")
+                expect(await p.wait_for("document.body.innerText.includes('High risk')"), "review: queue lists it with its risk tier")
+                await p.shot(shots / "review-queue.png")
+                await p.goto(f"{base}/review/{did}")
+                expect(await p.wait_for("document.body.innerText.includes('decided by an approver')"),
+                       "review: HR Ops sees a high-risk document read-only")
+                await sign_in("approver@azentio.local", "approver-dev-pass")
+                await p.goto(f"{base}/review/{did}")
+                await p.wait_for("!!document.querySelector('input[placeholder^=\"Why\"]')")
+                await p.settle()
+                await p.shot(shots / "review-detail.png")
+                page_text = (await p.text()).lower()
+                expect("risk tier" in page_text and "policy in effect" in page_text, "review: detail leads with the policy facts")
+                await p.fill('input[placeholder^="Why"]', "Smoke test: matches the original passport")
+                await asyncio.sleep(0.3)
+                await p.click_text("Accept", "button")
+                accepted = False
+                for _ in range(20):
+                    if (await p.api("GET", f"/api/documents/{did}"))["document"]["status"] == "Accepted":
+                        accepted = True
+                        break
+                    await asyncio.sleep(0.5)
+                expect(accepted, "review: the approver's decision accepts the document")
+                det = await p.api("GET", f"/api/documents/{did}")
+                expect(any(x["kind"] == "human_accept" and x["decided_by_email"] == "approver@azentio.local" for x in det["decisions"]),
+                       "review: the decision is recorded with the approver and the reason")
+                emp = det["document"]["employee_id"]
+                await p.goto(f"{base}/employees/{emp}")
+                expect(await p.wait_for("document.body.innerText.toLowerCase().includes('accepted by approver@azentio.local')"),
+                       "review: the employee page shows who accepted it")
     finally:
         proc.terminate()
         shutil.rmtree(profile, ignore_errors=True)
