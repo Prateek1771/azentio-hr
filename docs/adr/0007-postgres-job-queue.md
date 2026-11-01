@@ -1,6 +1,6 @@
 # ADR 0007: Run background work on a Postgres job queue
 
-- **Status:** accepted
+- **Status:** accepted; scope narrowed from Phase 4 by [ADR 0011](0011-temporal-orchestration.md). The jobs table becomes the transactional outbox and short-task queue, and Temporal runs the long-lived workflows.
 - **Date:** 2026-11-01
 - **Deciders:** product owner, engineering (from the [hardening design](../plans/2026-11-01-hardening-design.md))
 

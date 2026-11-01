@@ -5,6 +5,7 @@
   - Phase 0: `shared/jobs.py`, `work_queue`, `audit/service.py`, `approval_requests`/`approvals`
   - Phase 1: `employees`/`items` in Postgres, and the version + approval machinery reused for thresholds
 - **Branch:** `phase-2-ai-control`
+- **Orchestration note:** in this phase, waiting for a human document review is plain Postgres state: the `work_queue` review row plus the review decision records, and extraction runs as a job. Phase 4 wraps it in a Temporal `DocumentReviewWorkflow` ([ADR 0011](../adr/0011-temporal-orchestration.md)) **without changing these tables**.
 
 ## Goal
 Today the AI's output can turn straight into a decision. In `pipeline.intake()`, `validate.evaluate()` marks a document `Accepted` whenever there are no issues and `confidence >= LOW_CONFIDENCE` (0.6, hard-coded in `validate.py`). That's true for every document type, passports and I-9 included. A human sees a document only if it's below 0.6 or something failed. When they do act (`POST /api/items/{id}/status`, `main.py:set_item_status`), the result records the new status but not who decided, why, or what evidence they saw.

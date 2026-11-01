@@ -10,7 +10,7 @@ Azentio Onboard is an AI HR onboarding agent. It works out what each new joiner 
 | [Project architecture](project-architecture.md) | How the code is organised, the layering rules, and the modular structure we're moving to | Engineers |
 | [Production architecture](production-architecture.md) | How we would ship and scale it: topology, scaling per component, data, security, cost, rollout phases | Engineering leads, ops, security |
 | [SDLC](sdlc.md) | How work moves from idea to production: branching, reviews, tests, CI/CD, releases, incidents | Everyone who ships |
-| [Hardening roadmap](plans/2026-11-01-hardening-design.md) | How we take the app from demo to governed HR operations, in 7 phases | Everyone |
+| [Hardening roadmap](plans/2026-11-01-hardening-design.md) | How we take the app from demo to governed HR operations, in 7 phases (Temporal orchestration from Phase 4) | Everyone |
 | [Decision records](adr/) | Why we chose what we chose, one decision per file | Engineers |
 
 ## How to keep these docs true

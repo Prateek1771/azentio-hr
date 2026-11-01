@@ -18,7 +18,7 @@ No HR behaviour changes for users beyond signing in and the screens filtered by 
 - `bootstrap.py`: config check, wait for the database, migrations, admin from env, dev seed users, default rules, graph ping and job worker. Safe to re-run.
 - Identity: users, server-side sessions, scrypt password hashes, 5 roles, one permission table, a login throttle, and a manager filter so managers see only their own reports.
 - Audit: hash-chained append-only log in Postgres. Every existing `audit.record_audit` call now records the signed-in user automatically. Old graph audit rows are copied over once.
-- Job queue: enqueue with an idempotency key, workers claiming jobs with `SKIP LOCKED`, backoff, a dead state, and a handler registry.
+- **Jobs table = the transactional outbox and short-task queue.** Enqueue with an idempotency key, workers claiming jobs with `SKIP LOCKED`, backoff, a dead state, and a handler registry. `enqueue(..., conn=c)` commits together with the business change. From Phase 4, the job kinds `temporal.start`/`temporal.signal` hand committed changes to Temporal, which runs the long-lived workflows; no schema change is needed ([ADR 0011](../adr/0011-temporal-orchestration.md)).
 - `work_queue`: the one exceptions inbox table. In Phase 0 its only producer is a dead-lettered job, which opens an `ops` exception for Admin.
 - `approval_requests` and `approvals` tables, created now and used from Phase 1.
 - `shared/bridge.py`: one read source per record type, plus `parity()`.
@@ -33,7 +33,7 @@ No HR behaviour changes for users beyond signing in and the screens filtered by 
 
 ## Non-goals
 - Moving any HR record (Employee, Item, Document) to Postgres. That's Phases 1 and 2.
-- Rule drafts and approvals (Phase 1), document risk tiers (Phase 2), moving the Gmail poller and scheduler onto jobs (Phase 4).
+- Rule drafts and approvals (Phase 1), document risk tiers (Phase 2), Temporal and moving the Gmail poller and scheduler onto schedules (Phase 4).
 - SSO/OIDC, MFA and password reset by email. Passwords are set by an admin, and users can change their own.
 - Multi-tenant isolation.
 
@@ -269,7 +269,7 @@ CREATE INDEX ON work_queue (status, assignee_role);
 | `backend/shared/bootstrap.py` | new: the startup steps, each safe to re-run |
 | `backend/migrations/001–004_*.sql` | new: schema above |
 | `backend/identity/{service,perms,routes}.py` | new |
-| `backend/audit_log/service.py` | new: `record`, `verify_chain`, `list_entries`, `import_graph_rows`. Named `audit_log/` because `audit.py` already exists as a module. |
+| `backend/audit_log/service.py` | new: `record`, `verify_chain`, `list_entries`, `import_graph_rows`. Named `audit_log/` because `audit.py` already exists as a module. Bootstrap imports graph history **before** anything else writes audit rows, so the old history stays first in the chain. |
 | `backend/work_queue.py` | new: `open_item`, `list_items`, `resolve`, plus routes |
 | `backend/audit.py` | becomes a thin wrapper over `audit_log/service.py`; actor comes from `current_user` |
 | `backend/main.py` | `lifespan` runs bootstrap; auth middleware; `/health`, `/ready`; manager filter in `get_emp`, `list_employees` and the document file route; includes the identity and work-queue routers; CORS restricted to `CORS_ORIGINS` |

@@ -5,9 +5,9 @@
   - Phase 0: identity with the `manager` role, audit, `work_queue`
   - Phase 1: Employee and Item in Postgres, governed policy
   - Phase 2: review decisions and the 10% spot-check sample
-  - Phase 4: jobs, outbox, recurring jobs, `escalation.check`
+  - Phase 4: jobs, outbox, recurring jobs, `escalation.check`, the Temporal worker and the `temporal.start`/`temporal.signal` relay
   - Phase 5: lifecycle cases, `employee_history`
-- **Design:** [2026-11-01-hardening-design.md](2026-11-01-hardening-design.md)
+- **Design:** [2026-11-01-hardening-design.md](2026-11-01-hardening-design.md) · **ADR:** [0011 Temporal orchestration](../adr/0011-temporal-orchestration.md)
 
 ## Goal
 Turn the workflow tool into something an HR operations team runs on day to day:
@@ -22,7 +22,7 @@ Same operating principle. The system watches the clock and escalates. People act
 ## Scope
 1. **Manager view:** scoped to the manager's own reports, with comments on employees, items and cases.
 2. **SLAs** per item type (and per `work_queue` kind), versioned as policy.
-3. **Escalation ladder:** owner → owner's manager → HR lead, run by jobs and recorded per step.
+3. **Escalation ladder:** owner → owner's manager → HR lead. It runs as one Temporal workflow per SLA clock, using durable timers, and each step is recorded in Postgres.
 4. **Exceptions and appeals:** waivers, extensions, overrides and joiner appeals, all as `work_queue` items with approval, using the Phase 1 rule that the requester can't approve their own request.
 5. **Analytics:**
    - overdue heatmap
@@ -190,7 +190,18 @@ GROUP BY 1, 2;
 - **The clock starts** in the same `tx()` that creates the item or `work_queue` row. `sla.start(target_kind, target_id)` resolves the most specific matching policy from the *currently published* SLA version.
 - **The clock responds** on the first assignment, comment or acknowledgement by a human, and **resolves** when the item is done or the work_queue item is decided.
 - **Paused items** (Phase 5 leave) pause the clock: `paused_at`, then add the paused time back on resume.
-- **The `sla.tick` job** runs every 5 min (recurring, key per bucket). It replaces the body of the Phase 4 `escalation.check`. For every open clock, it computes the ladder steps whose `after_hours` have passed and inserts into `escalations`. **`UNIQUE (clock_id, step)` makes each step fire once, ever**, however many ticks or workers run. For each new row it enqueues `email.send` with key `email:escalation:<clock id>:<step>`, plus a `notifications` row for in-app users.
+- **One `EscalationWorkflow` per clock, using timers.** It replaces the Phase 4 `escalation.check` sweep.
+  - `sla.start` writes the clock row and enqueues `temporal.start` with key `sla:<clock id>` in the same `tx()`.
+  - The workflow reads the ladder through the activity `sla_due_steps`, then for each step **sleeps until `anchor + after_hours`** (`workflow.sleep`, which survives restarts and deploys).
+  - When it wakes, it runs the activity `escalate_step(clock_id, step)`. That inserts into `escalations` and enqueues `email.send` with key `email:escalation:<clock id>:<step>`, plus a `notifications` row for in-app users.
+- **Each step fires once, ever.** Two things guarantee it:
+  - The workflow id is deterministic (`sla:<clock id>`), so there's never a second ladder for the same clock.
+  - `UNIQUE (clock_id, step)` on `escalations` means a retried or replayed `escalate_step` is a no-op.
+- **Signals.** `respond`, `resolve`, `pause` and `resume` (from `sla.service`) write Postgres first, then send `temporal.signal` through the outbox in the same `tx()`. The workflow re-reads the clock through an activity:
+  - **resolve:** the workflow ends.
+  - **pause:** the timers stop, and on resume they're rescheduled with the paused time added back.
+  - **due date change** (an extension): the remaining timers are rescheduled.
+- **Safety net.** The daily `sla.reconcile` job enqueues `temporal.start` for any open clock with no running workflow. It's keyed, so it does nothing when all is well.
 - **Breach:** `resolve_by` passed and not resolved → `breached = true`, recorded once with an audit row `sla.breach` and an analytics counter.
 - **Email content:** the existing `escalation` email template, extended with the ladder context ("Second reminder; this was due 2 days ago and is blocking: BGV, laptop"). The blocking list is the same `blocked_by` calculation `main.escalate` uses today, through `checklist.view_state`.
 - **Delegation:** an owner can set an out-of-office delegate (`users.delegate_id`, `delegate_until`). Ladder step 0 then goes to the delegate and records that it did.
@@ -205,7 +216,13 @@ All four kinds are `work_queue` rows. They share one inbox, one decision API and
 | `override` (change an AI or human document decision) | hr_ops, approver | 1 approver other than the original decider; **2** for high-risk document types | document status changed; `review_decisions` row with `source='override'`; if it overturns an auto-accept, it counts as AI wrong in `v_ai_accuracy` |
 | `appeal` (joiner disputes a correction request or rejection) | joiner, from the portal ("This is correct, please review") | 1 approver who did *not* make the original decision | same as override, plus an email to the joiner through the outbox with the outcome |
 
-- **Decisions** go through `exceptions.service.decide(wq_id, actor, decision, reason)`. It enforces that the requester ≠ the approver and that an approver can't approve twice (primary key). It waits for `approvals_required` approvals; any single reject closes the item as rejected. Each decision also writes an audit entry and a notification to the requester.
+- **Decisions** go through `exceptions.service.decide(wq_id, actor, decision, reason)`. It enforces that the requester ≠ the approver and that an approver can't approve twice (primary key). Each decision also writes an audit entry and a notification to the requester.
+- **Waiting for approval is a workflow.** Raising an exception or appeal enqueues `temporal.start` for `ExceptionWorkflow` with key `exception:<wq_id>`, in the same `tx()` as the `work_queue` row.
+  - Each `decide` writes `approvals` and then sends the `decision` signal through the outbox.
+  - The workflow waits for `approvals_required` approvals by re-reading them through an activity, so a duplicate signal can't count twice. Any single reject closes the item as rejected.
+  - Once approved, it runs the per-kind effect as an activity: waive the item, shift the due date, change the document decision, send the appeal outcome email.
+  - Its timer is the item's SLA, so a stale appeal escalates through the ladder above instead of being forgotten.
+  - Approval state stays in `approvals` and `work_queue`, so the decision history is complete even without Temporal.
 - **Withdraw:** the requester can withdraw a request while it's open.
 - **Rate limit on appeals:** one open appeal per item per joiner. A rejected appeal can't be re-appealed for 24 h (409 with the reason).
 
@@ -301,14 +318,16 @@ Every analytics endpoint takes the same filters (department, location, worker_ty
 ## File-by-file changes
 | File | Change |
 |---|---|
-| `backend/sla/service.py` (new) | `match_policy(target_kind, attrs)`, `start()`, `respond()`, `resolve()`, `pause()`, `resume()`, `due_steps(clock, now)` (pure: the ladder steps due, with self-checks), and `resolve_target(to_kind, item, employee)`. |
-| `backend/jobs_handlers/sla.py` (new) | `sla.tick` as described. The Phase 4 `escalation.check` is deleted and its recurring registration removed. |
+| `backend/sla/service.py` (new) | `match_policy(target_kind, attrs)`, `start()` (also enqueues `temporal.start` `sla:<clock id>` in the same `tx()`), `respond()`, `resolve()`, `pause()`, `resume()` (each also enqueues the matching `temporal.signal`), `due_steps(clock, now)` (pure: the ladder steps due, with self-checks), and `resolve_target(to_kind, item, employee)`. |
+| `backend/workflows/sla.py` (new) | `EscalationWorkflow(clock_id)` (timers per ladder step; signals `changed`/`resolved`) and `ExceptionWorkflow(wq_id)` (waits for the `decision` signals, applies the effect). Deterministic: no I/O, `workflow.now()` only. |
+| `backend/workflows/activities.py` | Adds `sla_due_steps`, `escalate_step` (insert into `escalations` with `ON CONFLICT (clock_id, step) DO NOTHING`, then `queue_email`), `read_clock`, `count_approvals`, `apply_exception_effect`. |
+| `backend/jobs_handlers/sla.py` (new) | `sla.reconcile` (daily safety net, as described). The Phase 4 `escalation.check` is deleted and its recurring registration removed. |
 | `backend/exceptions/service.py` and `routes.py` (new) | `raise_exception`, `decide`, `withdraw`, the effects per kind (calling `checklist`/`lifecycle`/`documents` services, never touching their tables directly), and auto-approval of short extensions. |
 | `backend/collab/service.py` and `routes.py` (new) | Comments, mention parsing (`@email` resolved against users), and notifications (in-app plus an email copy for mentions through the outbox, keyed `email:mention:<comment id>:<user>`). |
 | `backend/identity/scope.py` (new) | `visible_employees(user) -> SQL fragment, params` and `assert_visible(user, eid)` raising 404. Called by every employee-scoped query in `main.py`, `lifecycle/routes.py` and `analytics/`. |
 | `backend/identity/perms.py` | Rows for every new route. Manager gains `GET /api/me/team`, comments, and exceptions POST (waiver/extension only). |
 | `backend/analytics/service.py` and `routes.py` (new) | SQL over the views, with scope applied, and a Wilson interval helper (pure, tested). |
-| `backend/main.py` | Employee list and detail go through `scope`. `items_with_state` adds the SLA state. `set_item_status` stops the SLA clock and sets `done_at`. Remove the old `escalate()` body; the route enqueues `sla.tick`. |
+| `backend/main.py` | Employee list and detail go through `scope`. `items_with_state` adds the SLA state. `set_item_status` stops the SLA clock and sets `done_at`. Remove the old `escalate()` body; the route now enqueues `sla.reconcile`, which starts any missing ladder workflows. |
 | `backend/checklist.py` | `view_state` returns `waived` for the `Waived` status, which counts as done in `DONE` for dependencies. |
 | `backend/documents/review.py` (Phase 2 module) | Overrides and appeals call `review.record_decision(source='override'|'appeal')`. Spot-check decisions use `source='spot_check'` and a `decision` of `confirm` or `overturn`, which `v_ai_accuracy` reads. |
 | `backend/seed/owners.csv` | Add a `manager_email` column and an `hr_lead` row (Anita Desai). |
@@ -325,7 +344,7 @@ Every analytics endpoint takes the same filters (department, location, worker_ty
 2. Backfill `owners.manager_email` from the seed CSV. In production, admins fill it on the Users and owners screen; missing values make the ladder fall through to `hr_lead`, so it's safe with gaps.
 3. Publish SLA policy v1 through the governed flow. The preview shows how many open items would already be breached (expected: the currently overdue ones). The approver accepts that knowingly.
 4. Backfill `sla_clocks` for every open item and `work_queue` row, from their creation time under v1. Rows that are already breached get `breached=true` **without** firing past ladder steps: the first tick sends only the *current* step, so turning SLAs on doesn't flood inboxes with historic escalations. This is done by pre-inserting the earlier `escalations` rows marked `to_kind='backfill_skipped'`.
-5. Turn on `sla.tick` in dry-run (log only) for one day, then live, removing `escalation.check` in the same deploy so only one escalation path runs.
+5. Register `EscalationWorkflow` with `ESCALATION_DRY_RUN=true`: `escalate_step` logs and records `escalations` rows marked `dry_run` without sending email. Run it for one day, compare against `escalation.check`, then switch to live and remove `escalation.check` in the same deploy, so only one escalation path runs. Backfilled clocks get their workflows from `sla.reconcile`.
 6. Ship the Inbox, then manager accounts, then analytics. Each can be undone by hiding its nav item and route; the tables stay.
 
 ## Seed data (dev)
@@ -351,10 +370,14 @@ Every analytics endpoint takes the same filters (department, location, worker_ty
 - `test_short_extension_auto_approved_long_needs_human`.
 - `test_override_of_auto_accept_counts_as_ai_wrong`: `v_ai_accuracy` changes by one.
 - `test_appeal_decider_must_differ_from_original`.
-- `test_ladder_steps_fire_once`: run `sla.tick` 10 times past every threshold → exactly one `escalations` row and one email per step.
+- `test_ladder_steps_fire_once` (time-skipping env): one clock, time skipped past every threshold, `escalate_step` retried with a forced failure after its insert, and `temporal.start` for the clock enqueued 3 times → one workflow, exactly one `escalations` row and one email per step.
+- `test_ladder_resolve_signal_stops_timers` (time-skipping): resolving before step 2 → steps 2+ never fire.
+- `test_ladder_pause_shifts_timers` (time-skipping): a 10-day pause between step 0 and step 1 → step 1 fires 10 days later than it would have.
+- `test_exception_workflow_waits_for_two_approvals` (time-skipping): a compliance waiver plus one `decision` signal → still waiting and the item unchanged. The same approver signalling again → still waiting. A second approver → the effect runs once.
+- `test_appeal_waits_on_signal_and_escalates_when_stale` (time-skipping): no decision within 72 h → the `hr_lead` escalation fires once.
 - `test_ladder_fallthrough_when_owner_manager_missing`: goes to `hr_lead`, recorded as such.
 - `test_sla_pauses_during_leave`: a 10-day pause → `resolve_by` effectively shifted, no breach.
-- `test_sla_backfill_does_not_flood`: pre-breached item → the first tick sends only the current step.
+- `test_sla_backfill_does_not_flood`: a pre-breached item → its workflow skips the steps marked `backfill_skipped` and sends only the current step.
 - `test_most_specific_sla_policy_wins`: the Compliance BGV policy beats the generic task policy.
 - `test_wilson_interval_bounds`: 54/60 gives roughly (0.80, 0.95); 0/0 → None, so the UI shows "not enough samples".
 - `test_heatmap_scoped_for_manager`: the manager's heatmap only counts their team.
@@ -372,8 +395,9 @@ Every analytics endpoint takes the same filters (department, location, worker_ty
 | Risk | Mitigation |
 |---|---|
 | Wrong `manager_email` data leaks a person to the wrong manager | Scoping only ever narrows (a manager sees a subset of what HR sees), and manager mode has no document content. A Users screen warning lists employees with no matching manager login and managers with no reports. Changes to `manager_email` are audited. |
+| Thousands of long-running timers | A timer costs Temporal next to nothing. One workflow per open clock is well within a single Temporal deployment at HR scale. The workflow ends when the clock resolves. |
 | Escalation spam (bad SLA config) | SLA policies are governed: preview shows the breach impact, and over 10 immediate breaches needs a second approver. One email per step per clock, ever. Owners can see and act on everything from one digest link. |
 | The Inbox becomes a dumping ground | Every producer sets `assignee_role` and an SLA. The `ops` kind goes to admin only. Analytics show exception rate per kind, so a noisy producer stands out. |
 | Analytics queries slow down on large data | The views are plain SQL with indexes on `items(due)` and `sla_clocks(resolve_by)`. Turn them into materialised views refreshed by a job once p95 is over 500 ms (measured from the request log). |
 | Auto-approved extensions hide real delays | Limited to ≤ 3 days on non-compliance items, recorded with the system actor, and counted separately in exception analytics. |
-| Rollback | Each feature is separable: hide Inbox, Team or Analytics nav and routes; stop `sla.tick` and re-register the Phase 4 `escalation.check` (code kept until Phase 6 exit). The migrations are additive. |
+| Rollback | Each feature is separable: hide Inbox, Team or Analytics nav and routes; terminate the `EscalationWorkflow`s (the `escalations` rows remain) and re-register the Phase 4 `escalation.check` (code kept until Phase 6 exit). The migrations are additive. |

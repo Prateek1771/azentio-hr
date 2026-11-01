@@ -5,8 +5,8 @@
   - Phase 0: jobs, audit, `work_queue`, perms
   - Phase 1: Employee, Item and Rule in Postgres; versioned policy; the in-flight publish semantics
   - Phase 2: Document in Postgres, risk tiers, the review queue
-  - Phase 4: every external call job-backed, the outbox, `access.perform`
-- **Design:** [2026-11-01-hardening-design.md](2026-11-01-hardening-design.md)
+  - Phase 4: every external call job- or activity-backed, the outbox, `access.perform`, the Temporal worker and the `temporal.start`/`temporal.signal` relay
+- **Design:** [2026-11-01-hardening-design.md](2026-11-01-hardening-design.md) · **ADR:** [0011 Temporal orchestration](../adr/0011-temporal-orchestration.md)
 
 ## Goal
 Take the same rules engine, document checks, approvals and job backbone that run onboarding, and use them for everything that happens to a worker after the offer, so the product covers the whole workforce lifecycle rather than just onboarding. Built in this order:
@@ -43,6 +43,25 @@ draft ──open──▶ active ──all required items done──▶ complete
 - **`completed`:** set automatically by `checklist.recompute` when every non-optional item is done. Completing triggers that case's *completion effects* (below).
 - Every transition goes through `lifecycle.service.transition(case_id, to, actor, reason)`, which validates against `ALLOWED = {(from, to): roles}`, writes `case_events` and calls `audit.record`. Nothing writes `state` directly.
 
+### How a case runs: one Temporal workflow per case
+Each case is driven by a durable **Temporal workflow** (ADR 0011). The workflow orchestrates; it doesn't hold the case.
+- **State stays in Postgres.** `lifecycle_cases.state`, the items and `case_events` are the record. The workflow changes them only through activities that call `lifecycle/service.py` (`transition`, `generate_items`, `complete_if_done`, the completion effects). If a workflow's history is lost, the case is still complete in Postgres, and `workflows.reconcile` restarts the workflow from it.
+- **Started through the outbox.** `open_case` writes the case row, its items and `jobs.enqueue("temporal.start", {"workflow": "<Type>CaseWorkflow", "args": [case_id]}, idempotency_key=f"case:{case_id}", conn=c)` **in the same `tx()`**. A case can never exist without its workflow eventually starting, and a retry can't start a second one.
+- **Human gates are signals.** Approving a `lifecycle_gate` exception, pausing, resuming, cancelling and "returned early" all write Postgres first, then send `temporal.signal` through the outbox in the same `tx()`. The workflow reacts by re-reading the case through an activity, so a signal tells it to check again; it never carries authoritative data.
+- **Workflow ids:** `case:<case_id>` (deterministic). One workflow per case.
+- **Side effects:** access grants and revokes, emails and document requests run as activities that use the Phase 4 idempotency keys (`access:<app>:<action>:<email>:<resource>`, `email:<purpose>:<case_id>:…`).
+
+| Case type | Workflow | Orchestration |
+|---|---|---|
+| `transfer` | `TransferCaseWorkflow` | If the case is in `draft` (protected window), wait for the `gate_approved` signal. Then sleep until `effective_date` (`workflow.sleep` to 00:00 `ORG_TIMEZONE`), activity `replan` (items for `after`, re-planning in-flight onboarding with the Phase 1 semantics), then grant activities for new access and revoke activities for the `access_diff` result. Wait for `items_changed` signals until `complete_if_done`, then apply the completion effect (`employees` → `after`, `employee_history`). |
+| `offboarding` | `OffboardingCaseWorkflow` | Gate wait if sensitive or in the protected window. Item activities (assets, handover, settlement) run immediately. `immediate` revokes (termination) run at once. Otherwise a **timer to the last working day, 18:00 local**, then every revoke as an activity, then a timer to `effective_date + 1 day` before revoking the portal token. A revoke that exhausts its retries opens `access_revoke_failed` (4 h SLA). The workflow keeps waiting for that item to be resolved and doesn't fail. |
+| `recheck` | `RecheckWorkflow` | Started when a document with an expiry is accepted (key `recheck:<doc_id>`). Sleeps until `expiry - recheck_lead_days`, then opens the recheck case's items and sends the request email, then waits for the renewal to be accepted (an `items_changed` signal from document review). A reminder timer runs weekly until expiry, and at expiry it opens a `compliance_expired` exception. Rules with `recheck_every_days` (e.g. the annual infosec acknowledgement) restart with `continue_as_new` after each cycle. |
+| `leave` | `LeaveCaseWorkflow` | Activity `pause_items`. Then **wait for the `returned` signal**, with a timer at the expected return date as a fallback that opens a `return_overdue` exception for HR (it does not resume by itself). On the signal: activity `resume_items` (shifts due dates) and starts the `return` case through the outbox. |
+| `return` | `ReturnCaseWorkflow` | Replan for return items (restore access, re-acknowledge changed policies), then complete. |
+| `onboarding` | none in this phase | Backfilled onboarding cases keep running on the Phase 1–4 paths. Moving onboarding itself onto a workflow is a later step. |
+
+Contractor/employee and rehire aren't separate workflows. A `worker_type` change opens a transfer case, and a rehire is an onboarding case with reused documents.
+
 ## Scope by case type
 
 ### 1. Transfer (role, department, location, grade or manager change)
@@ -78,8 +97,8 @@ draft ──open──▶ active ──all required items done──▶ complete
 - **Completion effect:** employee `status='exited'`, `exited_at`; they're excluded from the dashboard by default (there's a filter to show them). The portal token is revoked: `/api/portal/{token}` returns 410 "This onboarding link is no longer active". Documents are kept under a retention policy, which is out of scope here (see non-goals).
 
 ### 3. Compliance rechecks
-- **Started by:** the `expiry.watch` job, daily. It looks for accepted documents whose `doc_type.expires` is true and whose `extracted.expiry_date` falls within `RECHECK_LEAD_DAYS` (per doc type, default 60; visa and work permit 90). It also catches rules with a periodic `recheck_every_days` (e.g. annual infosec acknowledgement, certification renewal).
-- **Behaviour:** opens a `recheck` case with one item per expiring document, keyed `recheck:<employee>:<doc_type>:<expiry_date>`, so one expiry produces one case no matter how many times the watcher runs. The request email goes out through the outbox, keyed `email:recheck:<case id>`. The upload runs through the normal intake, so Phase 2 risk tiers apply: a visa is high-risk, so a human always decides.
+- **Started by:** a `RecheckWorkflow`, started through the outbox (key `recheck:<doc_id>`) when a document whose `doc_type.expires` is true is accepted. It sleeps until `extracted.expiry_date - RECHECK_LEAD_DAYS` (per doc type, default 60; visa and work permit 90). Rules with a periodic `recheck_every_days` (e.g. annual infosec acknowledgement, certification renewal) use the same workflow with `continue_as_new`. As a safety net, the daily `lifecycle.reconcile` job starts any missing recheck workflow.
+- **Behaviour:** opens a `recheck` case with one item per expiring document, keyed `recheck:<employee>:<doc_type>:<expiry_date>`, so one expiry produces one case no matter how many times the workflow or the reconcile job runs. The request email goes out through the outbox, keyed `email:recheck:<case id>`. The upload runs through the normal intake, so Phase 2 risk tiers apply: a visa is high-risk, so a human always decides.
 - **Escalation:** if the new document isn't accepted 14 days before expiry, a `work_queue` row `compliance_expiry` goes to hr_ops. On the expiry date itself, a critical row goes to admin and hr_ops. The item becomes `overdue`, and the dashboard shows the employee as "Compliance at risk".
 - **Validation reuse:** `validate.evaluate` already flags `expires` documents with `exp < joining`. For rechecks, the anchor date is the case's `effective_date` (the old expiry), not joining, using the same code path with the snapshot `joining_date` set to the anchor.
 
@@ -99,7 +118,7 @@ draft ──open──▶ active ──all required items done──▶ complete
   - Paused items keep their due date but are excluded from overdue and escalation.
   - Optionally suspends access: rule `case_type='leave'`, e.g. suspend the VPN for leave longer than 30 days.
 - **Return:**
-  - The `return.watch` job opens a `return` case on the expected return date, or HR records the actual return.
+  - The `LeaveCaseWorkflow` waits for the `returned` signal, which is sent when HR records the actual return. It does **not** resume by itself on the expected return date. Instead a timer at that date opens a `return_overdue` exception for HR. On the signal, it opens the `return` case.
   - Return items come from rules with `case_type='return'`: restore suspended access, re-acknowledge policies whose version changed while the person was away (compares the `PolicyAck` version to the current one), and a return-to-work meeting with the manager.
   - Paused items resume, and **their due dates shift by the length of the leave**. That's computed when they resume and recorded as a `case_event` per item.
 - **Extended leave:** past the expected return date + 7 days with no return recorded, a `work_queue` row `leave_overdue` goes to hr_ops.
@@ -255,7 +274,7 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 ## File-by-file changes
 | File | Change |
 |---|---|
-| `backend/lifecycle/service.py` (new) | `open_case(eid, type, effective_date, after, subtype, actor, reason, key=None)`: computes the snapshot, picks draft or active (protected window, sensitive), builds the items, writes the `case_events`, enqueues jobs. Also `preview(...)` (pure, shared with the Phase 1 policy preview), `transition()` with `ALLOWED`, `pause_items` / `resume_items` (the due shift), `complete_if_done(case_id)` (called from `checklist.recompute`), and the completion effects per type. |
+| `backend/lifecycle/service.py` (new) | `open_case(eid, type, effective_date, after, subtype, actor, reason, key=None)`: computes the snapshot, picks draft or active (protected window, sensitive), builds the items, writes the `case_events`, and enqueues the `temporal.start` for `case:<id>` **in the same transaction**. Every state-changing endpoint (gate approval, pause, resume, cancel, return) writes Postgres and then enqueues the matching `temporal.signal` in the same `tx()`. Also `preview(...)` (pure, shared with the Phase 1 policy preview), `transition()` with `ALLOWED`, `pause_items` / `resume_items` (the due shift), `complete_if_done(case_id)` (called from `checklist.recompute`), and the completion effects per type. |
 | `backend/lifecycle/access_diff.py` (new) | `grants_for(eid)` reads the recorded `access_results` / app connector records. `diff(before_grants, after_rules)` returns the revoke items. Pure, with self-checks. |
 | `backend/lifecycle/rehire.py` (new) | `find_previous(email, name, dob)` and `reusable_docs(eid, new_joining_date, doc_types)`. Pure part with tests. |
 | `backend/lifecycle/routes.py` (new) | The endpoints above. |
@@ -264,7 +283,9 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 | `backend/integrations/engine.py` | `_ensure_joiner` calls `lifecycle.rehire.find_previous` before creating, opening `rehire_match` when unsure. `_provision_access` records grants with `case_id` so `access_diff` can find them later. |
 | `backend/validate.py` | `evaluate(ex, emp, doc_type)` already uses `emp["joining_date"]` as the expiry anchor; the case passes the anchor through the snapshot. No logic change, plus one test for the recheck anchor. |
 | `backend/main.py` | `PATCH /api/employees/{eid}` returns 409 for matching-attribute changes. Portal routes check `portal_token_revoked_at`. Include `lifecycle.routes`. |
-| `backend/jobs_handlers/lifecycle.py` (new) | `expiry.watch` (daily), `return.watch` (daily), `contract_end.watch` (daily: opens end-of-contract offboarding 14 days before `contract_end_date`, key `offboard:contract:<eid>:<date>`), `case.activate` (at `effective_date` 00:00 for future-dated cases: applies the completion-effect pre-steps such as the `immediate` revokes). |
+| `backend/workflows/lifecycle.py` (new) | `TransferCaseWorkflow`, `OffboardingCaseWorkflow`, `RecheckWorkflow`, `LeaveCaseWorkflow`, `ReturnCaseWorkflow`, as in the table above. Signals: `gate_approved`, `items_changed`, `pause`, `resume`, `returned`, `cancel`. Deterministic: no I/O, `workflow.now()` only. |
+| `backend/workflows/activities.py` | Adds the lifecycle activities: `case_transition`, `replan`, `generate_items`, `pause_items`, `resume_items`, `complete_if_done`, `apply_completion_effect`, `open_exception`, plus the Phase 4 `access_perform` and `send_email`. Each is a thin call into `lifecycle/service.py` or `notifications`. |
+| `backend/jobs_handlers/lifecycle.py` (new) | Safety-net jobs only. Workflows own the timing. `lifecycle.reconcile` (daily) enqueues `temporal.start` for any active case or accepted expiring document with no running workflow, keyed, so it's a no-op when all is well. `contract_end.watch` (daily) opens end-of-contract offboarding 14 days before `contract_end_date`, key `offboard:contract:<eid>:<date>`, and the offboarding workflow takes it from there. |
 | `backend/seed/requirements.json` | Seeded rules for transfer, offboarding, recheck, leave, return and contractor (listed under Seed data). `doc_types` gain `recheck_lead_days` and `reusable_on_rehire`. Visa and work permit doc types are added. |
 | `backend/migrations/030–033_*.sql` | As above. |
 | `frontend/app/(hr)/employees/[id]/page.tsx` | The lifecycle menu, Cases tab and dialogs. |
@@ -279,10 +300,10 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 2. **Backfill onboarding cases.** For every employee, create `lifecycle_cases(type='onboarding', effective_date=joining_date, state=completed|active)`, with state from whether every item is done. Then set `items.case_id`. Idempotency key `backfill:onboarding:<eid>`. Parity check: the count of items with `case_id IS NULL` is 0.
 3. Backfill `employee_history` with one open row per employee from current attributes. Backfill `worker_type`: interns from grade G1 and role containing "Intern", employee otherwise; flag any ambiguous ones in the migration report.
 4. Publish the new lifecycle rules as a **policy version through the Phase 1 draft → preview → approve flow**, not a raw seed insert in production. The preview must show 0 changes to in-flight onboarding (they're all `case_type` ≠ onboarding). That's the proof the change is safe.
-5. Ship the endpoints and screens behind `LIFECYCLE=on`, and turn on the watch jobs last (`expiry.watch` first in dry-run for 2 days, logging the cases it *would* open).
+5. Ship the endpoints and screens behind `LIFECYCLE=on`. Register the lifecycle workflows on the worker, then run `lifecycle.reconcile` once in **dry-run** for 2 days (it logs the workflows it *would* start, e.g. rechecks for every already-accepted visa) before switching it on.
 6. Switch `PATCH` to 409 for matching attributes in the same release as the transfer dialog.
 
-To roll back, set `LIFECYCLE=off`: the routes are hidden and the watch jobs unregistered, while the backfilled cases stay as passive metadata. The onboarding UI still works off `items`.
+To roll back, set `LIFECYCLE=off`: the routes are hidden, the reconcile job is unregistered, and running case workflows are cancelled with `cancel` (their Postgres state stays as it was), while the backfilled cases stay as passive metadata. The onboarding UI still works off `items`.
 
 ## Seed data (dev)
 - **Rules:**
@@ -310,7 +331,13 @@ To roll back, set `LIFECYCLE=off`: the routes are hidden and the watch jobs unre
 - `test_revoke_dead_job_opens_high_priority_exception`: the revoke handler fails until dead → `access_revoke_failed` row with a 4 h SLA.
 - `test_sensitive_offboarding_hidden_from_manager_until_effective`: GET as manager before the date → case absent; after → present.
 - `test_portal_token_revoked_returns_410`.
-- `test_expiry_watch_opens_one_case_per_expiry`: run the watcher 3 times → one recheck case and one email job.
+- `test_open_case_starts_workflow_in_same_tx`: `open_case` that fails after the item insert → no case, no items and no `temporal.start` job. On success → exactly one job with key `case:<id>`.
+- `test_reconcile_starts_missing_workflow_once`: an active case with no workflow → `lifecycle.reconcile` run 3 times → one `temporal.start` job (keyed).
+- `test_recheck_workflow_fires_at_lead_time` (time-skipping env): a visa accepted with expiry in 120 days and `recheck_lead_days=90` → nothing happens for 30 days; then exactly one recheck case and one `send_email` activity call.
+- `test_offboarding_revokes_at_last_day` (time-skipping): no revoke activity before the last working day at 18:00 local; afterwards one call per granted app; the portal token is revoked the day after.
+- `test_leave_waits_for_return_signal` (time-skipping): no resume at the expected return date, just one `return_overdue` exception. The `returned` signal leads to `resume_items` once and a `return` case started.
+- `test_workflow_state_matches_postgres`: after each workflow test, `lifecycle_cases.state` and `case_events` match the transitions the workflow made (the workflow has no separate truth).
+- `test_expiry_watch_opens_one_case_per_expiry`: accept the same document twice and run `reconcile` → one `RecheckWorkflow` (`recheck:<doc_id>`) and one recheck case.
 - `test_recheck_anchor_is_old_expiry`: a renewed visa that expires before the old expiry anchor is flagged.
 - `test_worker_type_rule_matching`: a contractor gets the MSA and not benefits; an employee the reverse.
 - `test_contractor_conversion_is_transfer`: `worker_type` change → employee-only items added, contractor-only access revoked.
@@ -323,7 +350,8 @@ To roll back, set `LIFECYCLE=off`: the routes are hidden and the watch jobs unre
 ## Exit criteria
 - All five case types can be started from the UI with a preview, run to completion, and leave a complete trail: `case_events` plus audit, readable on the employee's Cases tab.
 - Offboarding demo with Jordan Miller: on the effective date (with the clock moved forward in dev), every granted app shows a revoke done or skipped with no human action. A deliberately failing revoke appears in the work queue within one job cycle.
-- Rechecks run with no human starting them: the expiry watcher opened the seed visa recheck, the email went through the outbox, and the upload is waiting for an approver.
+- Rechecks run with no human starting them: the `RecheckWorkflow` opened the seed visa recheck at lead time (verified in dev by moving the clock forward with a time-skipping run of the seed scenario), the email went through the outbox, and the upload is waiting for an approver.
+- Each open case has exactly one running workflow (`case:<id>`) visible in Temporal UI. Restarting the backend, the worker or Temporal mid-case loses no step and repeats none.
 - Every existing onboarding behaviour is unchanged: `test_core.py` is green and the snapshot test passes.
 - Lifecycle rules were published through the governed policy flow with an approver, and that publish is visible in version history.
 - `scripts/smoke.py` adds one lifecycle happy path: hr_ops opens Rohan → Change role → preview shows add/revoke → confirm → the case appears. Screenshots updated.
@@ -336,4 +364,6 @@ To roll back, set `LIFECYCLE=off`: the routes are hidden and the watch jobs unre
 | Leave pause hides real compliance obligations | `continues_on_leave` is set on every recheck rule by default; the compliance page ignores pause. |
 | Transfer diff revokes access that was granted by hand, not by a rule | The diff only revokes grants recorded with a `rule_id` or `case_id`. Manual grants are listed as "Review manually" in the preview, never auto-revoked. |
 | The `PATCH` 409 breaks the existing edit-employee UI | Shipped in the same release as the transfer dialog; the error message points to the right action. |
+| A workflow and Postgres disagree | The workflow never holds case data: it re-reads through activities, and every transition is validated by `lifecycle.service.transition`. `lifecycle.reconcile` repairs missing workflows. |
+| Long timers (90-day rechecks) outlive a code change | Workflow versioning with `workflow.patched()` for logic changes. Timers survive deploys because Temporal persists them. |
 | Rollback | `LIFECYCLE=off` as above. The migrations are additive and the backfill is idempotent; nothing in onboarding depends on cases existing. |

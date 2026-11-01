@@ -3,6 +3,7 @@
 - **Status:** planned
 - **Depends on:** Phase 0 (`shared/db.py`, `shared/jobs.py`, `shared/bridge.py`, `audit/service.py`, `identity/perms.py`, `work_queue`, `approval_requests`/`approvals` tables)
 - **Branch:** `phase-1-policy-governance`
+- **Orchestration note:** in this phase, waiting for an approval is plain Postgres state: the `approval_requests` and `approvals` tables plus the `work_queue` row, with publishing done by a job. Phase 4 wraps this in a Temporal `RuleVersionApprovalWorkflow` ([ADR 0011](../adr/0011-temporal-orchestration.md)) **without changing these tables**, so nothing built here has to be redone.
 
 ## Goal
 Today, a requirement rule can be edited or deleted in one step, and the change goes live at once. `PUT /api/rules/{rid}` (`main.py:save_rule`) and `DELETE /api/rules/{rid}` (`main.py:delete_rule`) write the rule, then call `checklist.regenerate()` for **every** employee in the same request. `regenerate()` hard-deletes items that no longer apply (`DETACH DELETE i`), even items that are done and have documents attached.

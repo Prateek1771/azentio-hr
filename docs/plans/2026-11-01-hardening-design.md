@@ -31,7 +31,7 @@ Routine work runs on its own. Humans are involved only where policy or risk requ
 
 **Automatic**
 - **Setup:** schema migrations, default roles, the first admin from env, dev seed users, the default rule set, and the job worker. Startup runs it all with no wizard and no hand-run SQL.
-- **Background work:** every external call (Gmail, LLM, connectors), reminders, escalations and document routing runs as a job. Jobs retry with backoff and are dead-lettered only after repeated failure.
+- **Background work:** every external call (Gmail, LLM, connectors), reminders, escalations and document routing runs as a job, or from Phase 4 as a Temporal workflow or activity. Both retry with backoff, and work is dead-lettered only after repeated failure.
 - **Routing:** each document goes to auto-accept or human review based on its risk tier. Joiners starting soon who are affected by a change get flagged automatically. Overdue work escalates through jobs.
 - **Self-awareness:**
   - `/ready` fails when Postgres is down, so the app never claims to work when it can't.
@@ -133,6 +133,37 @@ Why not microservices: the hard problems here are governance, auditability and c
   - Writes go through a database role that can only INSERT and SELECT the audit table.
   - `verify_chain()` detects any edited, deleted or reordered row.
 
+### 3.8 Workflow orchestration: Temporal from Phase 4 ([ADR 0011](../adr/0011-temporal-orchestration.md))
+Temporal sits **on top of** Postgres; it doesn't replace it. It's introduced in Phase 4, once the trust foundation is in place, to run the flows that wait on people and timers:
+- rule draft → approval → publish
+- lifecycle cases
+- the escalation ladder
+- compliance rechecks
+- waiting on appeals
+
+**What changes:**
+- **The Phase 0 `jobs` table becomes the transactional outbox and short-task queue.** A business change and its "start or signal workflow" row commit in one transaction. The jobs worker hands that row to Temporal, and the idempotency key becomes the workflow ID.
+- **Business state stays in Postgres.** Workflows and activities write it only through the module services.
+
+Each type of background work has exactly one owner:
+
+| Work | Owner |
+|---|---|
+| Waiting on a person, timers, multi-day state machines | Temporal workflow |
+| A single side effect inside a workflow | Temporal activity |
+| A single side effect outside any workflow | Postgres job |
+| Handing a committed change to Temporal | Postgres outbox row, relayed by the jobs worker |
+| Local operational tasks | Postgres job |
+
+```
+HR action ──tx──▶ Postgres: change + outbox row ──relay──▶ Temporal workflow
+                                                              ├─ activities: Gmail, LLM, connectors
+                                                              └─ timers, waits for approval or return signals
+                                                       state written back via module services ──▶ Postgres
+```
+
+In Phases 1 and 2, approval waits are plain Postgres state. Phase 4 wraps them in workflows without changing the tables.
+
 ## 4. Moving data from the graph to Postgres
 
 Each record type moves together with the feature that needs it in Postgres.
@@ -197,4 +228,4 @@ Keep tests light and runnable: plain `assert` checks, no test framework.
 - The docs (this file, the phase doc, LLD and ADRs) match what was built.
 
 ## 8. Decision records
-New ADRs [0005](../adr/0005-postgres-system-of-record.md) to [0010](../adr/0010-risk-tiered-ai-autonomy.md) record these decisions. ADR 0005 supersedes the storage part of [0002](../adr/0002-graph-database.md).
+New ADRs [0005](../adr/0005-postgres-system-of-record.md) to [0011](../adr/0011-temporal-orchestration.md) record these decisions. ADR 0005 supersedes the storage part of [0002](../adr/0002-graph-database.md).
