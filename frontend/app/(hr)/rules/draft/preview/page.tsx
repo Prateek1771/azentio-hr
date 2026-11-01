@@ -5,11 +5,11 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { ArrowLeft, Send, ShieldAlert } from "lucide-react";
-import { api, type ImpactSummary, type VersionDetail, type VersionsResp } from "@/lib/api";
+import { api, type ImpactSummary, type PolicyPreview, type VersionDetail, type VersionsResp } from "@/lib/api";
 import { PageHeader } from "@/components/app-shell";
 import { RoleGate } from "@/components/auth";
 import { ImpactPreview } from "@/components/impact-preview";
-import { diffCount, PolicyDiffView } from "@/components/policy-diff";
+import { BacktestSummary, diffCount, loosens, PolicyDiffView } from "@/components/policy-diff";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -29,10 +29,12 @@ function Preview() {
   const [title, setTitle] = useState("");
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
+  const [backtest, setBacktest] = useState<PolicyPreview["backtest"]>(null);
 
   useEffect(() => {
     api<VersionsResp>("/api/policy/versions").then((vs) => {
       if (!vs.open_id) return setMissing(true);
+      api<PolicyPreview>(`/api/policy/versions/${vs.open_id}/preview`).then((p) => setBacktest(p.backtest ?? null)).catch(() => {});
       return api<VersionDetail>(`/api/policy/versions/${vs.open_id}`).then((d) => (d.state === "draft" ? setDraft(d) : setMissing(true)));
     }).catch((e) => toast.error((e as Error).message));
   }, []);
@@ -47,6 +49,7 @@ function Preview() {
 
   const compliance = [...draft.diff.added, ...draft.diff.removed].some((r) => r.compliance)
     || draft.diff.changed.some((c) => draft.rules.find((r) => r.id === c.id)?.compliance || "compliance" in c.fields);
+  const loosening = (draft.diff.doc_policy ?? []).some(loosens);
 
   const submit = async () => {
     setBusy(true);
@@ -72,9 +75,12 @@ function Preview() {
         <Card className="gap-3 p-4">
           <div className="text-sm font-semibold">{diffCount(draft.diff)} rule change{diffCount(draft.diff) === 1 ? "" : "s"}</div>
           <PolicyDiffView diff={draft.diff} />
+          {backtest && <BacktestSummary bt={backtest} />}
         </Card>
         <Card className="h-fit gap-3 p-4">
           <div className="text-sm font-semibold">Submit for approval</div>
+          {loosening && !compliance && <p className="flex gap-2 rounded-lg bg-amber-50 p-2.5 text-xs text-amber-900 dark:bg-amber-500/10 dark:text-amber-200">
+            <ShieldAlert className="size-4 shrink-0" /> This loosens a document control (lower threshold, tier change or fewer spot checks), so two different approvers must sign off.</p>}
           {compliance && <p className="flex gap-2 rounded-lg bg-amber-50 p-2.5 text-xs text-amber-900 dark:bg-amber-500/10 dark:text-amber-200">
             <ShieldAlert className="size-4 shrink-0" /> This touches a compliance rule, so two different approvers must sign off.</p>}
           <div className="space-y-1.5"><Label htmlFor="sub-title">Title</Label>

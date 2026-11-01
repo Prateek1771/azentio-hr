@@ -407,6 +407,7 @@ def seed_demo() -> None:
     if "R-BGV" in rules:
         store.upsert_draft_rule(vid, {**rules["R-BGV"], "offset_days": -5})
     store.upsert_draft_rule(vid, DEMO_NDA)
+    store.set_draft_doc_policy(vid, {"types": {"bank_details": {"auto_accept_min": 0.88}}})  # Phase 2: a threshold change too
     submit(vid, hr, "PAN deadline, NDA for everyone, earlier background checks",
            "Payroll needs PAN a few days later than we ask today; Legal wants an NDA acknowledgement from every joiner; "
            "background checks should start a day earlier.")

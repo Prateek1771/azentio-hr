@@ -52,7 +52,9 @@ async def lifespan(app):
         await asyncio.to_thread(bootstrap.ensure_dev_manager_reports)
         if not bootstrap.is_production():
             from policy.service import seed_demo
+            from documents.seed import seed_demo_documents
             await asyncio.to_thread(seed_demo)
+            await asyncio.to_thread(seed_demo_documents)
     tasks = [asyncio.create_task(jobs.worker()), asyncio.create_task(gmail.poll_forever(60)), asyncio.create_task(_scheduler())]
     ls.log_event(_log, "startup", gmail=gmail.configured(), graph=state["graph"])
     yield

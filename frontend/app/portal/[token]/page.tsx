@@ -124,8 +124,34 @@ function PortalItem({ it, token, onChange, onAck }: { it: Item; token: string; o
   const [busy, setBusy] = useState(false);
   const [drag, setDrag] = useState(false);
   const [result, setResult] = useState<{ status: string; issues: string[] } | null>(null);
+  const [checking, setChecking] = useState<"" | "checking" | "slow">("");
   const done = it.state === "completed";
   const latest = it.documents[0];
+  const alive = useRef(true);
+  useEffect(() => () => { alive.current = false; }, []);
+
+  /** Checking runs in the background now: poll with backoff (2, 4, 8, then every 15s), give up politely after 2 minutes. */
+  const follow = async (docId: string) => {
+    setChecking("checking");
+    const started = Date.now();
+    for (let wait = 2000; Date.now() - started < 120_000; wait = Math.min(wait * 2, 15_000)) {
+      await new Promise((r) => setTimeout(r, wait));
+      if (!alive.current) return;
+      const res = await fetch(`${API}/api/portal/${token}`, { cache: "no-store" }).catch(() => null);
+      const doc = res?.ok ? ((await res.json()) as Portal).items.flatMap((x) => x.documents).find((x) => x.id === docId) : undefined;
+      if (doc && doc.status !== "Submitted") {
+        setChecking("");
+        setResult({ status: doc.status, issues: doc.status === "Correction Requested" ? doc.issues : [] });
+        if (doc.status === "Accepted") toast.success(`${it.name} accepted ✓`);
+        else if (doc.status === "Under Review") toast.info(`${it.name} is with the People Team for review`);
+        else toast.warning(`${it.name} needs a correction`, { description: doc.issues?.[0] });
+        onChange();
+        return;
+      }
+    }
+    setChecking("slow");
+    onChange();
+  };
 
   const upload = async (file: File) => {
     setBusy(true);
@@ -137,11 +163,9 @@ function PortalItem({ it, token, onChange, onAck }: { it: Item; token: string; o
       const res = await fetch(`${API}/api/portal/${token}/upload`, { method: "POST", body: fd });
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail ?? res.statusText);
-      setResult(body);
-      if (body.status === "Accepted") toast.success(`${it.name} accepted ✓`);
-      else if (body.status === "Under Review") toast.info(`${it.name} is with the People Team for review`);
-      else toast.warning(`${it.name} needs a correction`, { description: body.issues?.[0] });
+      toast.success(`${it.name} received`, { description: "We're checking it now." });
       onChange();
+      follow(body.document_id);
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
@@ -171,6 +195,8 @@ function PortalItem({ it, token, onChange, onAck }: { it: Item; token: string; o
           {it.kind === "task" && ` · handled by ${it.owner_name || it.category}`}
           {it.state === "blocked" && it.blocked_by.length > 0 && ` · starts after: ${it.blocked_by.join(", ")}`}
         </p>
+        {checking === "checking" && <p className="mt-2 inline-flex items-center gap-1.5 text-xs text-primary"><Loader2 className="size-3.5 animate-spin" /> Received, checking now…</p>}
+        {checking === "slow" && <p className="mt-2 text-xs text-muted-foreground">Received. This is taking longer than usual; we&apos;ll email you if anything needs fixing.</p>}
         {issues.length > 0 && (
           <div className="mt-2 rounded-lg bg-amber-50 p-2.5 text-xs text-amber-800 dark:bg-amber-500/10 dark:text-amber-300">
             <div className="font-medium">We couldn&apos;t accept your last upload:</div>
@@ -181,7 +207,7 @@ function PortalItem({ it, token, onChange, onAck }: { it: Item; token: string; o
       {it.kind === "document" && !done && (
         <>
           <Button size="sm" variant={it.status === "Correction Requested" ? "default" : "outline"} onClick={() => ref.current?.click()} disabled={busy}>
-            {busy ? <><Loader2 className="size-4 animate-spin" /> Checking…</> : <><UploadCloud className="size-4" /> {latest ? "Re-upload" : "Upload"}</>}
+            {busy ? <><Loader2 className="size-4 animate-spin" /> Uploading…</> : <><UploadCloud className="size-4" /> {latest ? "Re-upload" : "Upload"}</>}
           </Button>
           <input ref={ref} type="file" accept=".pdf,.jpg,.jpeg,.png,.webp" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) upload(f); e.target.value = ""; }} />
         </>

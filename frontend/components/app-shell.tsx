@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
-import { Activity, ArrowLeftRight, CheckCheck, ChevronsUpDown, FileStack, Gauge, KeyRound, LayoutDashboard, ListChecks, LogOut, Mail, Moon, Plug, ScrollText, Sparkles, Sun, Upload, Users } from "lucide-react";
+import { Activity, ArrowLeftRight, CheckCheck, FileSearch, ChevronsUpDown, FileStack, Gauge, KeyRound, LayoutDashboard, ListChecks, LogOut, Mail, Moon, Plug, ScrollText, Sparkles, Sun, Upload, Users } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { api, type Role, type Stats } from "@/lib/api";
@@ -28,6 +28,7 @@ export const NAV: { href: string; label: string; Icon: typeof Activity; roles: R
   { href: "/rules", label: "Requirement rules", Icon: ListChecks, roles: STAFF },
   { href: "/connectors", label: "Connectors", Icon: Plug, roles: STAFF },
   { href: "/integrations", label: "Integrations", Icon: ArrowLeftRight, roles: STAFF },
+  { href: "/review", label: "Document review", Icon: FileSearch, roles: STAFF },
   { href: "/approvals", label: "Approvals", Icon: CheckCheck, roles: STAFF },
   { href: "/logs", label: "Logs", Icon: ScrollText, roles: STAFF },
   { href: "/quality", label: "AI quality", Icon: Gauge, roles: STAFF },
@@ -56,9 +57,14 @@ function Shell({ children }: { children: React.ReactNode }) {
   const { me } = useMe();
   const { resolvedTheme, setTheme } = useTheme();
   const [gmail, setGmail] = useState<boolean | null>(null);
+  const [toReview, setToReview] = useState(0);
   useEffect(() => {
     api<Stats>("/api/stats").then((s) => setGmail(s.gmail)).catch(() => setGmail(false));
   }, []);
+  useEffect(() => {
+    if (me?.role === "manager") return;
+    api<{ items: unknown[] }>("/api/review-queue?kind=doc.review").then((r) => setToReview(r.items.length)).catch(() => {});
+  }, [me, path]);
   const nav = NAV.filter((n) => me && n.roles.includes(me.role));
   const page = NAV.find((n) => path.startsWith(n.href)) ?? (path.startsWith("/employees") ? NAV[0] : undefined);
 
@@ -83,6 +89,7 @@ function Shell({ children }: { children: React.ReactNode }) {
                   active ? "bg-sidebar-accent text-white" : "text-sidebar-foreground/75 hover:bg-sidebar-accent/60 hover:text-white")}>
                 <Icon className="size-4" />
                 {label}
+                {href === "/review" && toReview > 0 && <span className="ml-auto rounded-full bg-rose-500 px-1.5 text-[10px] font-semibold text-white tabular-nums">{toReview}</span>}
               </Link>
             );
           })}

@@ -18,10 +18,20 @@ JSON_COLS = {"extracted", "issues", "checks"}
 STATUSES = ("Submitted", "Under Review", "Accepted", "Correction Requested", "Rejected")
 
 
+# Lists join the current decision, so every screen can say "auto-accepted · 0.94 · v7" or "accepted by sam@ · reason".
+_LIST = """SELECT d.*, dd.kind AS decision_kind, dd.reason_code AS decision_reason_code, dd.reason_text AS decision_reason,
+                  u.email AS decided_by_email, v.number AS policy_version
+           FROM documents d LEFT JOIN doc_decisions dd ON dd.id = d.current_decision_id
+           LEFT JOIN users u ON u.id = dd.decided_by LEFT JOIN rule_set_versions v ON v.id = d.policy_version_id"""
+
+
 def doc_dict(row: dict | None) -> dict | None:
     if row is None:
         return None
     d = {**(row.get("extra") or {}), **{c: row.get(c) for c in COLS if c in row}}
+    if "decision_kind" in row:
+        d["decision"] = {"kind": row["decision_kind"], "reason_code": row["decision_reason_code"],
+                         "reason": row["decision_reason"], "by": row["decided_by_email"], "policy_version": row["policy_version"]}
     d["ts"] = row["received_at"].timestamp() if row.get("received_at") else 0
     for c in ("received_at", "decided_at"):
         if isinstance(d.get(c), datetime):
@@ -40,7 +50,7 @@ def for_items(item_ids: list[str], conn=None) -> dict[str, list[dict]]:
     """item id -> its documents, newest first."""
     out: dict[str, list[dict]] = {}
     if item_ids:
-        for r in db.fetch("SELECT * FROM documents WHERE item_id = ANY(%s) ORDER BY received_at DESC", (item_ids,), conn=conn):
+        for r in db.fetch(_LIST + " WHERE d.item_id = ANY(%s) ORDER BY d.received_at DESC", (item_ids,), conn=conn):
             out.setdefault(r["item_id"], []).append(doc_dict(r))
     return out
 
@@ -56,11 +66,11 @@ def has_docs(item_ids: list[str], conn=None) -> set[str]:
 
 
 def for_employee(eid: str, conn=None) -> list[dict]:
-    return [doc_dict(r) for r in db.fetch("SELECT * FROM documents WHERE employee_id=%s ORDER BY received_at DESC", (eid,), conn=conn)]
+    return [doc_dict(r) for r in db.fetch(_LIST + " WHERE d.employee_id=%s ORDER BY d.received_at DESC", (eid,), conn=conn)]
 
 
 def unmatched(eid: str, conn=None) -> list[dict]:
-    return [doc_dict(r) for r in db.fetch("SELECT * FROM documents WHERE employee_id=%s AND item_id IS NULL ORDER BY received_at DESC",
+    return [doc_dict(r) for r in db.fetch(_LIST + " WHERE d.employee_id=%s AND d.item_id IS NULL ORDER BY d.received_at DESC",
                                           (eid,), conn=conn)]
 
 
