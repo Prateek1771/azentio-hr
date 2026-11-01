@@ -35,6 +35,35 @@ def _png(title: str, lines: list[str]) -> bytes:
     return out.getvalue()
 
 
+def accept_for_demo(eid: str, key: str, conn=None) -> str | None:
+    """Demo/test data only: an accepted sample document behind a document item, recorded as decision kind 'demo_seed'
+    (never presented as an AI or human decision; excluded from AI metrics). The item status is derived as usual."""
+    item = service._live_item(eid, key, conn=conn)
+    if not item or item["kind"] != "document":
+        return None
+    from graph import new_id
+    doc_id = new_id("doc")
+    data = _png(key.replace("_", " "), [f"Sample {key.replace('_', ' ')} for {eid}"])
+    path = service.UPLOADS / f"{doc_id}_demo_{key}.png"
+    path.write_bytes(data)
+
+    def write(c):
+        store.insert({"id": doc_id, "employee_id": eid, "item_id": item["id"], "filename": f"demo_{key}.png", "path": str(path),
+                      "mime": "image/png", "size": len(data), "source": "portal", "status": "Submitted", "doc_type": key,
+                      "seed": "demo_progress"}, c)
+        store.add_decision({"document_id": doc_id, "kind": "demo_seed", "reason_code": "demo_seed", "status_after": "Accepted",
+                            "reason_text": "Sample data so the demo shows progress; not a real check",
+                            "idempotency_key": f"demo_seed:{doc_id}"}, c)
+        service._sync_item(item, "Accepted", c)
+    if conn is not None:
+        write(conn)
+    else:
+        with db.tx() as c:
+            write(c)
+        records.project(eid)
+    return doc_id
+
+
 def seed_demo_documents() -> int:
     if db.fetch1("SELECT 1 AS x FROM documents WHERE extra->>'seed' = 'demo'"):
         return 0

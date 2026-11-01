@@ -24,7 +24,20 @@ The goal, the routing table, provenance, the LLM-down behaviour and the exit cri
 | Portal polls every 3 s | Backoff: 2, 4, 8, then every 15 s, up to 2 minutes | Less load, steadier UX |
 | Seed: separate v2 doc-policy draft | The existing demo draft also lowers `bank_details` to 0.88 (one open draft at a time) | The one-draft limit is deliberate |
 
-**Exit check results (dev stack, 2026-11-02):** document parity passed at cutover (7 documents, 0 missing files); `test_phase2.py` 64 checks; smoke passes for every role, including a portal upload that reached review as `ai_unavailable` while extraction failed, HR Ops read-only on a high-risk document, and an approver acceptance shown on the employee page.
+**Exit check results (dev stack, 2026-11-02):** document parity passed at cutover (7 documents, 0 missing files); `test_phase2.py` 64 checks (79 after hardening); smoke passes for every role, including a portal upload that reached review as `ai_unavailable` while extraction failed, HR Ops read-only on a high-risk document, and an approver acceptance shown on the employee page.
+
+### Hardening (post-merge review, branch `phase-2-hardening`)
+| Review ask | Done |
+|---|---|
+| Item-status derivation can't be bypassed | Migration 010: trigger `items_status_from_document` + `doc_item_status()`; demo seed and tests go through `documents.seed.accept_for_demo` (decision kind `demo_seed`); guard rule 7 |
+| DB enforcement provably present | `test_db_guards_present` checks every safety-net trigger and CHECK exists |
+| Both sides proven | Bypasses refused in SQL (no document, unmapped status, unbacked status); every legitimate path (auto-accept, correction, review, human accept/reject, override, spot-check fail, demo seed) succeeds with no unbacked item |
+| Claim takeover and races | Takeover after 30 minutes with both reviewers audited; two simultaneous claims, exactly one wins |
+| Deadline handling | AI down past the deadline routes to review on the first attempt |
+| Backtest on real data | On pipeline-produced history: 0 changes under each decision's own policy; exact count under a lowered threshold. Live dev history (7 decisions, v7 and v11): 0 changes |
+| Smoke | Adds auto-accept and a spot-check verdict in the UI; found and fixed a display gap (a passed spot check hid the auto-acceptance) |
+
+Not in scope (Phases 5 and 6): escalations, appeals, manager comments, lifecycle-wide review permissions.
 
 ## Goal
 Today the AI's output can turn straight into a decision. In `pipeline.intake()`, `validate.evaluate()` marks a document `Accepted` whenever there are no issues and `confidence >= LOW_CONFIDENCE` (0.6, hard-coded in `validate.py`). That's true for every document type, passports and I-9 included. A human sees a document only if it's below 0.6 or something failed. When they do act (`POST /api/items/{id}/status`, `main.py:set_item_status`), the result records the new status but not who decided, why, or what evidence they saw.

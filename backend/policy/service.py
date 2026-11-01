@@ -113,11 +113,11 @@ BACKTEST_DAYS = 90
 def decision_history(days: int = BACKTEST_DAYS) -> list[dict]:
     """Each document's first automatic decision in the window, plus its spot-check verdict if it had one.
     Read-only input for the pure backtest: no live document is ever re-decided."""
-    return db.fetch("""SELECT DISTINCT ON (dd.document_id) dd.document_id, d.doc_type, dd.kind, dd.reason_code, dd.confidence,
+    return db.fetch("""SELECT DISTINCT ON (dd.document_id) dd.document_id, d.doc_type, dd.kind, dd.reason_code, dd.confidence, dd.policy_version_id,
                               (SELECT CASE s.kind WHEN 'spot_check_pass' THEN 'pass' ELSE 'fail' END FROM doc_decisions s
                                WHERE s.document_id = dd.document_id AND s.kind LIKE 'spot_check_%%' ORDER BY s.at DESC LIMIT 1) AS spot_check
                        FROM doc_decisions dd JOIN documents d ON d.id = dd.document_id
-                       WHERE dd.decided_by IS NULL AND dd.kind <> 'backfill' AND dd.at > now() - make_interval(days => %s)
+                       WHERE dd.decided_by IS NULL AND dd.kind NOT IN ('backfill', 'demo_seed') AND dd.at > now() - make_interval(days => %s)
                        ORDER BY dd.document_id, dd.at""", (days,))
 
 

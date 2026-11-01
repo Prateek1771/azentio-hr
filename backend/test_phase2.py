@@ -345,5 +345,112 @@ check("test_new_threshold_applies_to_new_documents", docs.get(n_id)["status"] ==
       and last_decision(n_id)["policy_version_id"] == vid and abs(last_decision(n_id)["threshold"] - 0.88) < 1e-6)
 check("test_old_documents_not_redecided", docs.get(b_id)["current_decision_id"] == before["current_decision_id"])
 
+# ---------- hardening: the database is the safety net, and the flows hold under failure ----------
+import threading  # noqa: E402
+
+triggers = {r["tgname"] for r in db.fetch("SELECT tgname FROM pg_trigger WHERE NOT tgisinternal")}
+checks = [r["def"] for r in db.fetch("""SELECT pg_get_constraintdef(c.oid) AS def FROM pg_constraint c
+                                        JOIN pg_class t ON t.oid = c.conrelid WHERE t.relname = 'doc_decisions' AND c.contype = 'c'""")]
+check("test_db_guards_present",
+      {"no_auto_accept_high", "doc_decisions_no_update", "rule_set_config_frozen", "items_status_from_document",
+       "audit_log_no_update"} <= triggers
+      and any("human_%" in c and "decided_by IS NOT NULL" in c and "length(reason_text) >= 3" in c for c in checks)
+      and any("spot_check_%" in c and "decided_by IS NOT NULL" in c for c in checks), (sorted(triggers), checks))
+
+# SQL and Python agree on the one mapping
+check("test_item_status_mapping_agrees", all(
+    db.fetch1("SELECT doc_item_status(%s) AS s", (st,))["s"] == service.item_status_for(st) for st in docs.STATUSES))
+
+# bypasses are refused in SQL ...
+bare = joiner("Bare Joiner", "bare@t.io")
+bare_item = records.item_by_key(bare, "address_proof")
+e1 = raises(lambda: records.update_item(bare_item["id"], status="Accepted"), psycopg.Error)                 # no document at all
+e2 = raises(lambda: records.update_item(bare_item["id"], status="Completed"), psycopg.Error)                # not a decision status
+e3 = raises(lambda: db.execute("UPDATE items SET status='Rejected' WHERE id=%s", (bare_item["id"],)), psycopg.Error)
+x_id2 = upload(bare, "address_proof", "bill_x.png", good("address_proof", "Bare Joiner", 0.5))  # backed only as Submitted
+e4 = raises(lambda: records.update_item(bare_item["id"], status="Accepted"), psycopg.Error)                 # no Accepted document
+check("test_item_status_needs_document", all(x is not None for x in (e1, e2, e3, e4))
+      and records.item(bare_item["id"])["status"] == "Submitted")
+records.update_item(bare_item["id"], status="Not Submitted")   # the initial state is always allowed
+records.update_item(bare_item["id"], due=(today + timedelta(days=5)).isoformat())  # non-status updates never trip it
+check("test_trigger_allows_initial_and_non_status_updates", records.item(bare_item["id"])["status"] == "Not Submitted")
+
+# ... and every legitimate service path still succeeds, with the item following the decision
+drain()  # bill_x routes to low_confidence review
+service.decide_human(x_id2, hr, "reject", "wrong_document", "This is a bank statement, not an address proof")
+check("test_reject_maps_to_correction", docs.get(x_id2)["status"] == "Rejected"
+      and records.item(bare_item["id"])["status"] == "Correction Requested")
+paths = {"auto_accept", "auto_correction", "routed_review", "human_accept", "human_reject", "human_override",
+         "spot_check_fail", "demo_seed"}
+seen = {r["kind"] for r in db.fetch("SELECT DISTINCT kind FROM doc_decisions")}
+unbacked = db.fetch("""SELECT i.id, i.status FROM items i WHERE i.kind='document'
+                       AND i.status NOT IN ('Not Submitted','Cancelled')
+                       AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.item_id = i.id AND doc_item_status(d.status) = i.status)
+                       AND i.employee_id <> %s""", (legacy,))  # the legacy joiner predates the trigger (backfill)
+from documents.seed import accept_for_demo  # noqa: E402
+before_demo = client.get("/api/quality/ai-accuracy").json()["documents"]
+demo_id = accept_for_demo(bare, "pan_card")
+seen.add(docs.decisions(demo_id)[0]["kind"])
+check("test_legit_paths_succeed_under_trigger", paths <= seen and not unbacked
+      and records.item_by_key(bare, "pan_card")["status"] == "Accepted", (paths - seen, unbacked))
+acc2 = client.get("/api/quality/ai-accuracy").json()
+check("test_demo_seed_excluded_from_metrics", acc2["documents"] == before_demo)  # a demo row is never an AI decision
+
+# claim takeover only after 30 minutes, with both reviewers in the audit trail
+t_id = upload(bare, "bank_details", "cheque_t.png", good("bank_details", "Bare Joiner", 0.6))
+drain()
+wi = open_reviews(t_id)[0]
+work_queue.claim(wi["id"], ap1)
+db.execute("UPDATE work_queue SET claimed_at = now() - interval '31 minutes' WHERE id=%s", (wi["id"],))
+took = work_queue.claim(wi["id"], ap2, takeover=True)
+trail = db.fetch("SELECT summary, actor FROM audit_log WHERE action='work_queue.claimed' AND entity_id=%s ORDER BY seq", (str(wi["id"]),))
+check("test_claim_takeover_after_30_min", took["assignee"] == ap2["email"] and len(trail) == 2
+      and ap1["email"] in trail[1]["summary"])
+
+# two reviewers claim at the same instant: exactly one wins
+u_id2 = upload(bare, "education_certificate", "degree_c.png", good("education_certificate", "Bare Joiner", 0.6))
+drain()
+wi2 = open_reviews(u_id2)[0]
+results, barrier = [], threading.Barrier(2)
+
+
+def claimer(u):
+    barrier.wait()
+    try:
+        work_queue.claim(wi2["id"], u)
+        results.append("ok")
+    except Exception as ex:  # noqa: BLE001
+        results.append(getattr(ex, "status_code", type(ex).__name__))
+
+
+ths = [threading.Thread(target=claimer, args=(u,)) for u in (ap1, ap2)]
+[t.start() for t in ths]
+[t.join() for t in ths]
+check("test_concurrent_claims", sorted(map(str, results)) == ["409", "ok"], results)
+
+# AI down past the deadline: routes to review on the first attempt, before the retries run out
+drain()
+dl_id = upload(bare, "experience_letter", "relieve_dl.png", RuntimeError("provider timeout"))
+db.execute("UPDATE documents SET received_at = now() - interval '2 hours' WHERE id=%s", (dl_id,))
+asyncio.run(jobs.run_once())
+dl_job = db.fetch1("SELECT * FROM jobs WHERE idempotency_key=%s", (f"doc.extract:{dl_id}",))
+check("test_deadline_routes_before_retries_run_out", docs.get(dl_id)["status"] == "Under Review"
+      and last_decision(dl_id)["reason_code"] == "ai_unavailable" and dl_job["attempts"] == 1 and dl_job["state"] == "done"
+      and len(open_reviews(dl_id)) == 1)
+
+# the backtest, run on decisions the real pipeline produced
+hist = psvc.decision_history()
+by_version: dict = {}
+for h in hist:
+    by_version.setdefault(h["policy_version_id"], []).append(h)
+zero = all(route.backtest(rows, route.policy_for(dict(pstore.version(v)["config"])))["changed"] == 0
+           for v, rows in by_version.items() if v)
+orig = by_version[v_active]
+expected = sum(1 for h in orig if h["doc_type"] == "bank_details" and h["reason_code"] == "low_confidence"
+               and 0.88 <= h["confidence"] < 0.92)
+lowered = route.backtest(orig, route.policy_for({"doc_policy": {"types": {"bank_details": {"auto_accept_min": 0.88}}}}))
+check("test_backtest_on_real_history", zero and len(hist) >= 10 and expected >= 1
+      and lowered["newly_auto_accepted"] == expected and lowered["newly_reviewed"] == 0, (zero, expected, lowered))
+
 check("audit_chain_verifies", verify_chain()[0])
 print(f"\nphase 2: {ok} checks passed")

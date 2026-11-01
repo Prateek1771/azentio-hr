@@ -75,7 +75,8 @@ check("joiner_built_from_active_version", {"photo_id", "pan_card", "background_v
 
 
 def doc_on(eid, key, status="Accepted"):
-    """Attach a document (Postgres since Phase 2; the graph gets the projection) and set the item's status."""
+    """Attach a document and set the item status. The document comes first: since migration 010 the database refuses a
+    document item status that no document backs."""
     it = records.item_by_key(eid, key)
     did = new_id("doc")
     with db.tx() as c:

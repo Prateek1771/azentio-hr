@@ -9,6 +9,9 @@ Rules (see AGENTS.md "Rules for changes"):
   5. No direct UPDATE/DELETE/TRUNCATE of audit_log and no disabling its trigger (tests excepted).
   6. No direct graph writes of Document nodes or their HAS_DOC / SUBMITTED / MISMATCH edges outside
      backend/documents/store.py (Postgres owns documents since Phase 2; the graph is a projection).
+  7. No bulk status write for document items (records.set_items_status with a "document" key) outside
+     backend/documents/. A document item's status is derived from a document decision; the database trigger
+     items_status_from_document (migration 010) enforces it for every other write path.
 
 Usage:  python scripts/check_boundaries.py [--base <git-ref>]     # default base: merge-base with origin/main
         python scripts/check_boundaries.py --selftest             # proves each rule rejects a known-bad snippet
@@ -197,6 +200,30 @@ def check_kinds(files, kinds: set[str]) -> list[str]:
     return errs
 
 
+# ---------- rule 7: document item status only from decisions ----------
+
+def bulk_doc_status_calls(tree: ast.AST) -> list[int]:
+    """Lines calling set_items_status(...) with a dict literal that has a "document" key."""
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", None)) == "set_items_status":
+            for arg in [*node.args, *(k.value for k in node.keywords)]:
+                if isinstance(arg, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "document" for k in arg.keys):
+                    out.append(node.lineno)
+    return out
+
+
+def check_doc_item_status(files) -> list[str]:
+    errs = []
+    for path, rel in files:
+        if rel.startswith("backend/documents/") or is_test(rel):
+            continue
+        for line in bulk_doc_status_calls(ast.parse(path.read_text(encoding="utf-8"))):
+            errs.append(f"{rel}:{line}: sets document item status directly. A document item's status comes only from a "
+                        f"document decision (documents.service; documents.seed.accept_for_demo for demo data)")
+    return errs
+
+
 # ---------- rule 5: audit_log is append-only ----------
 
 AUDIT_MUTATION = re.compile(r"\bUPDATE\s+audit_log\b|\bDELETE\s+FROM\s+audit_log\b|\bTRUNCATE\s+(TABLE\s+)?audit_log\b"
@@ -219,7 +246,7 @@ def check_audit(paths) -> list[str]:
 def run(base: str | None) -> list[str]:
     files = list(py_files())
     sql = [(p, p.relative_to(ROOT).as_posix()) for p in sorted((BACKEND / "migrations").glob("*.sql"))]
-    return (check_graph_writes(files) + check_document_writes(files) + check_roles(files) + check_migrations(base)
+    return (check_graph_writes(files) + check_document_writes(files) + check_doc_item_status(files) + check_roles(files) + check_migrations(base)
             + check_kinds(files, registered_kinds()) + check_audit(files + sql))
 
 
@@ -262,6 +289,10 @@ def selftest() -> None:
         assert ROLE_CHECK.search(line), f"rule 2 missed: {line}"
     for line in ['if c["role"] == role:', 'job_title = e["role"]', 'if s_inst["role"] != "source":']:
         assert not ROLE_CHECK.search(line), f"rule 2 false positive: {line}"
+    bad7 = ast.parse('records.set_items_status(e, keys, {"document": "Accepted", "task": "Completed"})')
+    ok7 = ast.parse('records.set_items_status(e, keys, {"ack": "Acknowledged", "task": "Completed"})')
+    assert bulk_doc_status_calls(bad7), "rule 7 missed a bulk document status write"
+    assert not bulk_doc_status_calls(ok7), "rule 7 false positive"
     for line in ["UPDATE audit_log SET summary='x'", "DELETE FROM audit_log", "TRUNCATE audit_log",
                  "ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update"]:
         assert AUDIT_MUTATION.search(line), f"rule 5 missed: {line}"
@@ -275,7 +306,7 @@ def selftest() -> None:
     finally:
         tmp.unlink(missing_ok=True)
     assert registered_kinds() >= {"ops", "policy.approval", "policy.near_start"}, "could not read work_queue.KINDS"
-    print("boundary guard selftest: ok (rules 1, 2, 4, 5, 6 reject known-bad code; rule 3 is a git diff)")
+    print("boundary guard selftest: ok (rules 1, 2, 4, 5, 6, 7 reject known-bad code; rule 3 is a git diff)")
 
 
 if __name__ == "__main__":
