@@ -195,9 +195,9 @@ Every HR route sits inside the app shell, which loads the signed-in user and sho
 
 ## 4. Data model
 
-Two stores. Postgres is the system of record for everything built in Phases 0 and 1 (including employees, checklist items and rule-set versions) and, phase by phase, for the records below that still live in the graph ([ADR 0005](adr/0005-postgres-system-of-record.md)). `shared/bridge.py` names the one store each migrating record type is read from (§12.3).
+Two stores. Postgres is the system of record for everything built in Phases 0 to 2 (including employees, checklist items, rule-set versions and documents) and, phase by phase, for the records below that still live in the graph ([ADR 0005](adr/0005-postgres-system-of-record.md)). `shared/bridge.py` names the one store each migrating record type is read from (§12.3).
 
-### 4.1 Postgres (Built, Phases 0–1)
+### 4.1 Postgres (Built, Phases 0–2)
 
 | Table | Key columns | Purpose |
 |---|---|---|
@@ -208,7 +208,7 @@ Two stores. Postgres is the system of record for everything built in Phases 0 an
 | `worker_heartbeat` | `worker, seen_at` | Liveness of job workers, read by `/ready` |
 | `approval_requests` | `id, subject_type, subject_id, requested_by, required (1–3), status (pending, approved, rejected, withdrawn), reason, created_at, decided_at` | Created in Phase 0, used from Phase 1 (rule versions) and Phase 2 (documents) |
 | `approvals` | `request_id, approver_id (PK together), decision (approve, reject), reason, ts` | One vote per person per request |
-| `work_queue` | `id, kind, entity_type, entity_id, reason, detail (jsonb), assignee_role, assignee_id, status (open, in_progress, resolved, dismissed), sla_due, resolution, resolved_by, created_at, resolved_at, dedupe_key (unique)` | Exception queue (§11.3) |
+| `work_queue` | `id, kind, entity_type, entity_id, reason, detail (jsonb), assignee_role, assignee_id, claimed_at (Phase 2), status (open, in_progress, resolved, dismissed), sla_due, resolution, resolved_by, created_at, resolved_at, dedupe_key (unique)` | Exception queue (§11.3). A claim sets `assignee_id`, `claimed_at` and `in_progress` |
 | `schema_migrations` | `name, applied_at` | Which migration files have run |
 | `employees` (Phase 1) | `id, name, email (unique lower), role, grade, department, location, manager_email, joining_date, date_of_birth, worker_type, token (unique), thread_id, doc_scope[], status (active, archived), extra (jsonb), created_at, updated_at` | Joiners. Graph-only properties (`created`, `request_sent`, `integration_id`) live in `extra` and come back merged |
 | `items` (Phase 1) | `id, employee_id, key (unique per employee), name, kind, category, status, due, reason, policy_ref, auto, depends[], owner_name, owner_email, rule_id, rule_version_id, superseded_by_version, cancelled_by_version, extra` | Checklist items. Never deleted: a removed requirement is either cancelled or kept as evidence |
@@ -216,8 +216,11 @@ Two stores. Postgres is the system of record for everything built in Phases 0 an
 | `rule_set_versions` (Phase 1) | `id, number (unique), state (draft, pending_approval, approved, active, superseded, rejected), based_on, rollback_of, title, reason, config (jsonb), required_approvals (1–2), preview (jsonb), author_id (NULL = system), created_at, submitted_at, published_at` | Rule-set versions. Partial unique indexes allow one `active` and one open draft |
 | `rules` (Phase 1) | `version_id, id (PK together), ord, item, name, kind, category, match (jsonb), offset_days, depends_on[], description, policy_ref, auto, compliance` | The rules of each version. A trigger freezes every version except an open draft |
 | `item_notices` (Phase 1) | `employee_id, version_id (PK together), sent_at` | One "new requirements" notice per joiner per published version |
+| `documents` (Phase 2) | `id, employee_id, item_id (NULL = not on the checklist), filename, path, mime, size, sha256, source, status (Submitted, Under Review, Accepted, Correction Requested, Rejected), doc_type, tier, confidence, extracted, issues, checks (jsonb), model, prompt_version, policy_version_id, current_decision_id, received_at, decided_at, extra` | Documents. `status` is the result of the current decision, never set on its own |
+| `document_mismatches` (Phase 2) | `document_id, field (PK together), expected, found` | Replaces the graph's `MISMATCH` edges |
+| `doc_decisions` (Phase 2) | `id, document_id, kind (auto_accept, auto_correction, routed_review, human_accept, human_reject, human_correction, human_override, spot_check_pass, spot_check_fail, backfill), decided_by (NULL = system), reason_code, reason_text, status_after, model, prompt_version, confidence, tier, threshold, policy_version_id, checks, extracted, corrected_fields, work_item_id, idempotency_key (unique), at` | Append-only decision history with provenance. Triggers refuse UPDATE/DELETE and any `auto_accept` of a `high` tier. Human and spot-check rows need a user and a reason (CHECK) |
 
-**Planned:** Document and review decisions (Phase 2); connectors, integrations and runs (Phase 3). Schemas are in the [phase plans](plans/).
+`rule_set_versions.config.doc_policy` (Phase 2) holds the document tiers and thresholds; a trigger freezes `config` once a version leaves draft. **Planned:** connectors, integrations and runs (Phase 3). Schemas are in the [phase plans](plans/).
 
 ### 4.2 FalkorDB graph `hr`
 
@@ -332,23 +335,38 @@ sequenceDiagram
         BE->>GM: download attachments, add label
         BE->>G: match by thread_id, else by sender
     end
-    BE->>BE: check_file (type, size)
-    BE->>LLM: page images + doc-type catalogue (JSON reply)
+    BE->>BE: receive(): save file, documents row = Submitted, enqueue doc.extract (same transaction)
+    Note over BE: doc.extract job (retries with backoff)
+    BE->>LLM: page images + doc-type catalogue (JSON reply), prompt version recorded
     LLM-->>BE: doc_type, name, DOB, number, dates, legible, confidence
-    BE->>BE: evaluate(): required fields, name and DOB vs profile, expiry vs joining date, confidence
-    alt passes
-        BE->>G: Item = Accepted
-    else fails
-        BE->>G: Item = Correction Requested, MISMATCH edges
-        BE->>GM: correction email in the same thread
-    else low confidence or extraction failed
-        BE->>G: Item = Under Review (optional AwaitVerify)
+    BE->>BE: evaluate(): checks + mismatches only (required fields, name/DOB vs profile, expiry vs joining)
+    BE->>BE: route.decide(): tier + threshold of the active rule-set version
+    alt file or content issues
+        BE->>BE: decision auto_correction, item = Correction Requested, notify.correction job
+    else high risk / below threshold / unexpected type / AI unavailable
+        BE->>BE: decision routed_review, work_queue doc.review (approver)
+    else low risk at or above threshold
+        BE->>BE: decision auto_accept, item = Accepted (10% sampled to doc.spot_check)
     end
-    BE->>BE: recompute() (may unlock tasks)
+    BE->>G: doc.after_decision job: projection, recompute(), feed, integrations
 ```
 
+Every state change above writes one `doc_decisions` row and derives the item status from it (`documents.service.item_status_for`), in one transaction with the follow-up jobs. The routing table, in order (first match wins, `documents/route.py`):
+
+| Condition | Status | Decision kind / reason | Human? |
+|---|---|---|---|
+| File checks failed | Correction Requested | `auto_correction` / `file_check` | No: the joiner fixes it |
+| Extraction failed after the retries or past `extraction_deadline_minutes` | Under Review | `routed_review` / `ai_unavailable` | Yes |
+| Content issues (illegible, missing field, name/DOB mismatch, expired) | Correction Requested | `auto_correction` / `content_issues` | No |
+| Classified type not on the joiner's checklist | Under Review | `routed_review` / `unexpected_type` | Yes |
+| Tier `high` (always for `ALWAYS_HIGH`: photo ID, I-9, visa, work permit, BGV) | Under Review | `routed_review` / `high_risk` | **Always** |
+| Tier `low`, confidence below `auto_accept_min` | Under Review | `routed_review` / `low_confidence` | Yes |
+| Tier `low`, confidence at or above the threshold | Accepted | `auto_accept`; `sampled(doc_id, spot_check_rate)` opens `doc.spot_check` | Only the sample |
+
+**Human decisions** (`POST /api/documents/{id}/decision`): accept, request correction (with the issue list the joiner sees) or reject, with a reason code and text. Approvers decide any document; HR Ops only low-tier ones; the review item must not be claimed by someone else. **Overrides** (approver) reverse a decided document; **spot checks** (approver) pass, or fail and reopen the document for review. Each is a `doc_decisions` row plus an audit entry, and a client `decision_key` makes a double click a no-op.
+
 ### 5.4 Portal upload
-The same `pipeline.intake` runs, with `source = portal` and the item key supplied by the page. The browser gets the result immediately (status and issues), and the correction email goes out only if Gmail is configured.
+The same `pipeline.intake` (now `documents.service.receive`) runs, with `source = portal` and the item key supplied by the page. It returns `{document_id, status: 'Submitted'}` at once; the page shows "Received, checking now" and polls the portal with backoff (2, 4, 8, then every 15 s, up to 2 minutes) until the document leaves `Submitted`. The correction email is a `notify.correction` job and goes out only if Gmail is configured.
 
 ### 5.5 Dependency-driven provisioning (scenario 2)
 
@@ -689,10 +707,14 @@ Joiners have no account. Their portal token is the credential, and `/api/portal/
 | read | `/api/templates*`, `/api/rules*`, `/api/policies*`, `/api/policy/*` | STAFF |
 | write | `/api/policy/drafts*` (open, edit, discard, submit), `/api/policy/versions/{id}/rollback` | hr_ops |
 | write | `/api/policy/versions/{id}/approve`, `/reject` | approver |
+| read | `/api/review-queue`, `/api/documents/{id}` | STAFF |
+| write | `/api/review-queue/{id}/claim`, `/api/documents/{id}/decision` | approver, hr_ops (hr_ops: low-tier documents only, checked on the document's tier in `documents.service.can_decide`) |
+| write | `/api/review-queue/{id}/spot-check`, `/api/documents/{id}/override` | approver |
+| read | `/api/quality/ai-accuracy` | STAFF |
 | write | `/api/hr/chat` | STAFF |
 | write | `/api/employees*`, `/api/items/*`, `/api/escalate`, `/api/gmail/poll`, `/api/ingest`, `/api/onboard`, `/api/templates*` | hr_ops |
 
-`test_phase0.py` checks 40 representative routes against all 5 roles, including the default deny.
+`test_phase0.py` checks 57 representative routes against all 5 roles, including the default deny.
 
 ### 9.4 The middleware (`main.authenticate`)
 1. `OPTIONS` requests, non-`/api` paths and public rules pass straight through.
@@ -808,14 +830,13 @@ On first start, `import_graph_rows()` copies the graph's `AuditLog` nodes into t
 
 ### 11.3 Exception queue (`work_queue.py`)
 - **`open_item(kind, entity_type, entity_id, reason, assignee_role, detail, dedupe_key, sla_due, conn)`** opens one item per cause; a repeated `dedupe_key` is ignored.
-- **`list_items(role, status)`** returns the role's items; admin and auditor see all of them.
+- **`KINDS`** is the contract for every kind: SLA, escalation role and resolution steps. `open_item` refuses an unregistered kind, and the boundary guard checks every caller. Kinds: `ops`, `policy.approval`, `policy.near_start`, `doc.review`, `doc.spot_check`.
+- **`serialize(row)`** is the one shape every API returns: `id, kind, status, reason, sla_due, escalate_to, steps, assignee, assignee_id, assignee_role, claimed_at, entity_type, entity_id, detail, created_at, resolution, resolved_at`.
+- **`list_items(role, status, kind, assignee, user_id, reason_code, since)`**: "open" means open or claimed; admin and auditor see every role's items.
+- **`claim(id, user, takeover)`** locks an item to one reviewer (409 if someone else holds it); takeover only after 30 minutes. Document reviews can't be closed through the generic resolve, only by a decision.
 - **`POST /api/work-queue/{id}/resolve`** closes an item as `resolved` or `dismissed` with a required resolution text. It locks the row, allows only the assigned role or admin, and audits `work_queue.resolved|dismissed`.
-- **Producers today:** dead jobs (`ops`, admin).
-- **Planned producers:**
-  - rule approvals and near-start changes (Phase 1)
-  - document reviews (Phase 2)
-  - escalations and appeals (Phase 6)
-- **Screen:** the inbox UI arrives with its first human-facing producer (Phase 1).
+- **Producers:** dead jobs (`ops`), rule approvals and near-start changes (Phase 1), document reviews and spot checks (Phase 2). Planned: escalations and appeals (Phase 6).
+- **Screens:** the Approval Center (policy, near-start) and Document review (`/review`).
 
 ---
 
@@ -843,8 +864,9 @@ Every step is idempotent: running it twice gives the same state as running it on
   It returns 503 with the failing component named, and recovers without a restart once the dependency is back.
 
 ### 12.3 The migration bridge (`shared/bridge.py`)
-- `SOURCE` maps each migrating record type to the one store it's read from. `Employee` and `Item` are `postgres` (Phase 1, persisted in `bridge_state`); rules are versioned in Postgres; `Document` is still `graph` until Phase 2.
+- `SOURCE` maps each migrating record type to the one store it's read from. `Employee` and `Item` are `postgres` (Phase 1) and `Document` is `postgres` (Phase 2), all persisted in `bridge_state`; rules are versioned in Postgres.
 - **Phase 1 records** (`records.py`): every Employee/Item read and write goes through it. After each write, `project(eid)` refreshes that employee's nodes in the graph in place (`MERGE` by id), so document edges stay attached. `rebuild_graph()` repairs the projection from Postgres.
+- **Phase 2 documents** (`documents/store.py`): the only read/write path for documents, mismatches and decisions. `store.project(eid)` (called from `records.project`) merges `Document` nodes and their `SUBMITTED`/`HAS_DOC`/`MISMATCH` edges from Postgres; nothing else writes them (guard rule 6). `bootstrap.migrate_documents` backfills once (each copied document gets one decision row labelled `backfill`; missing files are reported and keep `sha256` NULL), switches only if parity passes, and otherwise refuses to start.
 - **Startup gate** (`bootstrap.migrate_records`): on first run it backfills from the graph, switches only if parity passes and records the report. If parity fails, startup stops with the mismatch instead of falling back to graph reads, so there's never a second read path to maintain.
 - `parity(graph_rows, pg_rows)` compares row counts and an order-independent sha256 over canonical rows, and lists missing or extra keys.
 - `switch(type, …)` moves reads to Postgres only if parity passes, and raises `ParityError` otherwise.
@@ -892,6 +914,20 @@ Every route needs a signed-in session, except `/api/auth/login` and `/api/portal
 | GET | `/policy/versions`, `/policy/versions/{id}`, `/policy/versions/{id}/diff?against=`, `/policy/versions/{id}/preview?department=&role=&location=&join_from=&join_to=&status=` | Version history, one version with its diff and approvals, rule diff, impact preview |
 | POST / PUT / DELETE | `/policy/drafts`, `/policy/drafts/{id}/rules/{rid}`, `/policy/drafts/{id}`, `/policy/drafts/{id}/submit` | Open a draft (copy of active), edit or remove a rule, discard, submit `{title, reason}` |
 | POST | `/policy/versions/{id}/approve`, `/reject`, `/rollback` | Decide `{reason}` (required to reject); roll back to a published version |
+| PUT | `/policy/drafts/{id}/doc-policy` | Set the draft's document policy `{default, types: {type: {tier, auto_accept_min}}, spot_check_rate, extraction_deadline_minutes}`. 422 on bounds or on lowering a legal-floor type |
+
+**Document review** (Phase 2)
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/review-queue?kind=doc.review\|doc.spot_check&reason=&assignee=me\|unassigned\|all&status=open\|resolved` | Work items (normalized shape) with the document and joiner, plus `llm_unavailable` and `auto_accepted_this_week` |
+| POST | `/review-queue/{id}/claim` `{takeover}` | Assign to me; 409 if someone else holds it (takeover after 30 min) |
+| POST | `/review-queue/{id}/spot-check` `{verdict: pass\|fail, reason_text}` | Spot-check verdict; fail reopens review |
+| GET | `/documents/{id}` | Policy facts (tier, threshold, version, who decided, why), document, profile, item, mismatches, decision history, open reviews, `can_decide`, `can_override` |
+| POST | `/documents/{id}/decision` `{decision: accept\|request_correction\|reject, reason_code, reason_text, corrected_fields?, issues?, decision_key?}` | Human decision |
+| POST | `/documents/{id}/override` (same body) | Approver reverses a decided document |
+| GET | `/quality/ai-accuracy?days=90` | Auto-accept rate, spot-check precision with a 95% Wilson interval, review reasons, median time to decision, per type |
+
+`POST /items/{id}/status` returns **409** for document items: their status follows the document decision.
 | GET | `/policies` | Policy texts |
 
 **Employee portal** (token-scoped)

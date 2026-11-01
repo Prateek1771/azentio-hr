@@ -102,9 +102,9 @@ Rules:
 
 | Job | What it checks |
 |---|---|
-| `backend` | `ruff check` (rules `F` + `E9`: undefined names, unused imports, syntax), the boundary guard (`scripts/check_boundaries.py --selftest`, then a real run), `test_core.py`, `test_phase0.py`, `test_phase1.py`. Postgres 17 and FalkorDB run as service containers |
+| `backend` | `ruff check` (rules `F` + `E9`: undefined names, unused imports, syntax), the boundary guard (`scripts/check_boundaries.py --selftest`, then a real run), `test_core.py`, `test_phase0.py`, `test_phase1.py`, `test_phase2.py`. Postgres 17 and FalkorDB run as service containers |
 | `frontend` | `tsc --noEmit`, `eslint app components` |
-| `smoke` | After both: backend with the dev seed, `next build` + `next start` (a production build, never dev mode), then `scripts/smoke.py` for every role, the policy flow and rollback. Screenshots and logs are uploaded as an artifact |
+| `smoke` | After both: backend with the dev seed, `next build` + `next start` (a production build, never dev mode), then `scripts/smoke.py` for every role, the policy flow, rollback and document review. Screenshots and logs are uploaded as an artifact |
 | `images` | After all three: builds `backend/Dockerfile` and `frontend/Dockerfile`. Pushes `ghcr.io/prateek1771/azentio-hr-{backend,frontend}:{sha,latest}` **only on a push to `main`**; on PRs it only builds, so a broken Dockerfile fails the PR |
 
 CI has no secrets: `LLM_LOCAL_FALLBACK=0` and `LLM_KEYLESS_FALLBACK=0`, no Gmail credentials, so nothing calls a model or sends mail. Deployment is deliberately not automated yet. The diagram below is the target pipeline; security scans, evals in CI, staging and canary are still to come.

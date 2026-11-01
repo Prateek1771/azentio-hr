@@ -1,11 +1,30 @@
 # Phase 2: AI control + Document migration
 
-- **Status:** planned
+- **Status:** done (2026-11-02). See **As built** below for what changed from this plan.
 - **Depends on:**
   - Phase 0: `shared/jobs.py`, `work_queue`, `audit/service.py`, `approval_requests`/`approvals`
   - Phase 1: `employees`/`items` in Postgres, and the version + approval machinery reused for thresholds
 - **Branch:** `phase-2-ai-control`
 - **Orchestration note:** in this phase, waiting for a human document review is plain Postgres state: the `work_queue` review row plus the review decision records, and extraction runs as a job. Phase 4 wraps it in a Temporal `DocumentReviewWorkflow` ([ADR 0011](../adr/0011-temporal-orchestration.md)) **without changing these tables**.
+
+## As built (what changed from this plan)
+The goal, the routing table, provenance, the LLM-down behaviour and the exit criteria are as planned. These parts changed, each approved in review ([ADR 0012](../adr/0012-document-decisions-as-built.md)):
+
+| Planned | Built | Why |
+|---|---|---|
+| A separate `doc_policy_versions` table, `/api/doc-policy/*` and a Thresholds tab | Tiers and thresholds live in the rule-set version as `config.doc_policy`, edited with `PUT /api/policy/drafts/{id}/doc-policy` and governed by the Phase 1 flow (draft, preview, approve, publish, rollback, history) | One governance flow; no duplicated lifecycle or screens |
+| 2 approvals when lowering a threshold, changing a tier, or raising the spot-check rate above 0.5 | 2 approvals when lowering a threshold, changing a tier, or **lowering** the spot-check rate (fewer acceptances checked) | Lowering the sample is what weakens oversight |
+| Dual-write, then backfill, parity, switch, stop graph writes | One cutover at startup (`bootstrap.migrate_documents`): backfill, switch only if parity passes, else refuse to start. Graph writes stopped at once; `documents.store.project` keeps the view | Same approach as Phase 1; no second write path to keep in step |
+| Backfilled accepted high-risk documents recorded as `human_accept` by a system user | Every backfilled document gets one decision of kind **`backfill`**, `decided_by` NULL; accepted high-risk ones are listed in the backfill report | The history never claims a review that didn't happen |
+| `doc_decisions` protected by REVOKE | An append-only trigger (UPDATE/DELETE refused), plus `idempotency_key UNIQUE` and `documents.current_decision_id` | Holds for every role, and makes retries and double clicks no-ops |
+| Item status written next to the document status | Item status is derived from the decision by `documents.service.item_status_for` only; `POST /api/items/{id}/status` returns 409 for document items | One source of truth |
+| — | `work_queue` gained one serializer for every API, `claim()` with takeover after 30 minutes, and `claimed_at` (migration 009) | The queue contract is enforced, not a generic inbox |
+| — | Guard rule 6: no graph writes of `Document` or its `HAS_DOC`/`SUBMITTED`/`MISMATCH` edges outside `documents/store.py` | The migration stays safe |
+| `GET /api/review-queue` reads; doc-policy endpoints | The review detail leads with the policy facts (tier, threshold, version, who decided, why), ahead of confidence | Reviewers are accountable for the policy, not the score |
+| Portal polls every 3 s | Backoff: 2, 4, 8, then every 15 s, up to 2 minutes | Less load, steadier UX |
+| Seed: separate v2 doc-policy draft | The existing demo draft also lowers `bank_details` to 0.88 (one open draft at a time) | The one-draft limit is deliberate |
+
+**Exit check results (dev stack, 2026-11-02):** document parity passed at cutover (7 documents, 0 missing files); `test_phase2.py` 64 checks; smoke passes for every role, including a portal upload that reached review as `ai_unavailable` while extraction failed, HR Ops read-only on a high-risk document, and an approver acceptance shown on the employee page.
 
 ## Goal
 Today the AI's output can turn straight into a decision. In `pipeline.intake()`, `validate.evaluate()` marks a document `Accepted` whenever there are no issues and `confidence >= LOW_CONFIDENCE` (0.6, hard-coded in `validate.py`). That's true for every document type, passports and I-9 included. A human sees a document only if it's below 0.6 or something failed. When they do act (`POST /api/items/{id}/status`, `main.py:set_item_status`), the result records the new status but not who decided, why, or what evidence they saw.
