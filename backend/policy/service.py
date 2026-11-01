@@ -225,7 +225,7 @@ def rollback(vid: int, user: dict, reason: str) -> dict:
         raise PolicyError(409, "That version is already active")
     with db.tx() as c:
         if store.open_version(conn=c):
-            raise PolicyError(409, "A draft is already open. Finish or discard it first.")
+            raise PolicyError(409, "Only one draft at a time (a deliberate limit, so every change is reviewed against the active rule set). Finish or discard the open draft first.")
         new = store.create_version("draft", f"Roll back to v{src['number']}", dict(src["config"]), store.rules_of(vid, conn=c),
                                    user["id"], c, reason=reason, based_on=act["id"] if act else None, rollback_of=vid)
         audit.record_audit("policy.rollback_requested", "rule_set_version", f"v{src['number']}",
@@ -262,9 +262,10 @@ def publish(vid: int) -> dict:
     applied, held = [], []
     emps = in_flight()
     for start in range(0, len(emps), BATCH):
-        batch, touched = emps[start:start + BATCH], []
         with db.tx() as c:
-            for emp in batch:
+            # Serialises concurrent runners: the next one recomputes its diffs after this batch commits and finds nothing to do.
+            c.execute("SELECT 1 FROM rule_set_versions WHERE id=%s FOR UPDATE", (vid,))
+            for emp in emps[start:start + BATCH]:
                 d = employee_diff(emp, rules, config, own, conn=c)
                 if not replay.changed(d):
                     continue
@@ -273,26 +274,35 @@ def publish(vid: int) -> dict:
                     held.append(emp["id"])
                     continue
                 replay.apply(emp["id"], d, vid, c)
-                touched.append((emp, d))
+                applied.append(emp["id"])
                 audit.record_audit("policy.replay", "employee", emp["id"], f"Applied rule set v{v['number']} to {emp['name']}",
                                    metadata={"version": v["number"], **replay.counts(d)}, actor="system", conn=c)
+                # Outbox: projection, recompute and the activity feed commit with the change, so a crash can't skip them.
+                jobs.enqueue("policy.after_replay", {"employee_id": emp["id"], "lines": replay.describe(d), "version": v["number"]},
+                             idempotency_key=f"policy.after_replay:{emp['id']}:{vid}", conn=c)
                 if d["added"] or d["reactivated"]:
                     jobs.enqueue("notify.item_added", {"employee_id": emp["id"], "version_id": vid,
                                                        "items": [p["name"] for p in d["added"] + d["reactivated"]]},
                                  idempotency_key=f"notify.item_added:{emp['id']}:{vid}", conn=c)
-        for emp, d in touched:
-            records.project(emp["id"])
-            checklist.recompute(emp["id"])
-            for line in replay.describe(d):
-                event(emp["id"], "checklist", f"{line} (rule set v{v['number']})")
-            applied.append(emp["id"])
     with db.tx() as c:
+        if db.fetch1("SELECT state FROM rule_set_versions WHERE id=%s FOR UPDATE", (vid,), conn=c)["state"] != "approved":
+            return {"already": True}  # a concurrent runner flipped it first
         c.execute("UPDATE rule_set_versions SET state='superseded' WHERE state='active'")
         c.execute("UPDATE rule_set_versions SET state='active', published_at=now() WHERE id=%s", (vid,))
         audit.record_audit("policy.published", "rule_set_version", f"v{v['number']}",
                            f"Published rule set v{v['number']}: {len(applied)} joiner(s) updated, {len(held)} held for HR review",
                            metadata={"applied": applied, "held": held}, actor="system", conn=c)
     return {"applied": applied, "held": held}
+
+
+@jobs.handler("policy.after_replay")
+def after_replay_job(job: dict) -> None:
+    # ponytail: a crash mid-handler can repeat a feed line on retry; key events by job id if that ever matters
+    p = job["payload"]
+    records.project(p["employee_id"])
+    checklist.recompute(p["employee_id"])
+    for line in p["lines"]:
+        event(p["employee_id"], "checklist", f"{line} (rule set v{p['version']})")
 
 
 @jobs.handler("notify.item_added")

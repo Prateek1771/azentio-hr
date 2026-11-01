@@ -287,6 +287,45 @@ async def run(base: str, shots: Path) -> int:
             expect(published, "policy: approver's approval publishes the version")
             await p.goto(f"{base}/rules")
             expect(f"Version {before + 1} active" in await p.text(), f"policy: rules page now shows version {before + 1}")
+
+            # Rollback: HR Ops rolls back to the version just replaced -> approver approves -> rules equal the target's
+            print("[rollback]")
+            target = next(v for v in (await p.api("GET", "/api/policy/versions"))["versions"] if v["number"] == before)
+            await sign_in("hrops@azentio.local", "hrops-dev-pass")
+            await p.goto(f"{base}/rules/history")
+            await p.wait_for("document.body.innerText.includes('Roll back to this')")
+            await p.click_text("Roll back to this")  # newest superseded version first, i.e. v{before}
+            expect(await p.wait_for(f"!!document.querySelector('[role=dialog]') && document.querySelector('[role=dialog]').innerText.includes('Roll back to v{before}')"),
+                   f"rollback: dialog offers v{before}")
+            await p.fill("[role=dialog] textarea", "Smoke test: payroll changed its mind.")
+            await p.click_text("Create rollback", "[role=dialog] button")
+            vs = await p.api("GET", "/api/policy/versions")
+            rb = next((v for v in vs["versions"] if v["id"] == vs["open_id"]), None) if vs["open_id"] else None
+            for _ in range(20):
+                if rb:
+                    break
+                await asyncio.sleep(0.5)
+                vs = await p.api("GET", "/api/policy/versions")
+                rb = next((v for v in vs["versions"] if v["id"] == vs["open_id"]), None) if vs["open_id"] else None
+            expect(rb is not None and rb["rollback_of"] == target["id"] and rb["state"] == "pending_approval",
+                   "rollback: creates a pending version that rolls back to the target")
+            await p.settle()
+            await p.shot(shots / "rules-rollback.png")
+            if rb:
+                for em, pw2 in approvers[:rb["required_approvals"]]:
+                    await sign_in(em, pw2)
+                    await p.api("POST", f"/api/policy/versions/{rb['id']}/approve", {"reason": "smoke: rollback ok"})
+                active = None
+                for _ in range(40):
+                    v = await p.api("GET", f"/api/policy/versions/{rb['id']}")
+                    if v["state"] == "active":
+                        active = v
+                        break
+                    await asyncio.sleep(1)
+                strip = lambda rules: sorted(({k: x for k, x in r.items() if k != "ord"} for r in rules), key=lambda r: r["id"])  # noqa: E731
+                tgt = await p.api("GET", f"/api/policy/versions/{target['id']}")
+                expect(active is not None and active["rollback_of"] == target["id"], "rollback: approval publishes the rollback")
+                expect(active is not None and strip(active["rules"]) == strip(tgt["rules"]), f"rollback: active rules equal v{before}'s")
     finally:
         proc.terminate()
         shutil.rmtree(profile, ignore_errors=True)

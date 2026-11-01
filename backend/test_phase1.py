@@ -23,7 +23,6 @@ q("MATCH (n) DETACH DELETE n")  # fresh graph
 
 import ingest  # noqa: E402
 import records  # noqa: E402
-import checklist  # noqa: E402
 from audit_log.service import verify_chain  # noqa: E402
 from identity import service as idsvc  # noqa: E402
 from policy import replay, service, store  # noqa: E402
@@ -232,6 +231,143 @@ try:
     check("near_start_needs_apply_or_skip", False)
 except PolicyError as e:
     check("near_start_needs_apply_or_skip", e.status == 422)
+
+# ---------- publish survives crashes and concurrent runners ----------
+import threading  # noqa: E402
+
+for n in range(4):
+    joiner(f"Batch {n}", f"batch{n}@t.io", 30 + n)
+service.BATCH = 1  # one joiner per transaction, so a crash can land between committed batches
+
+
+def open_dupes():
+    return db.fetch("""SELECT employee_id, key FROM items WHERE cancelled_by_version IS NULL AND superseded_by_version IS NULL
+                       GROUP BY 1, 2 HAVING count(*) > 1""")
+
+
+def converged(vid):
+    """Every in-flight joiner not held for HR review already matches `vid`: a further replay would change nothing."""
+    rules, config = store.load_version(vid)
+    own = service.owners()
+    return all(not replay.changed(service.employee_diff(e, rules, config, own))
+               for e in service.in_flight() if not service.near_start(e))
+
+
+def published_audits(vid):
+    return db.fetch1("SELECT count(*) AS n FROM audit_log WHERE action='policy.published' AND entity_id=%s",
+                     (f"v{store.version(vid)['number']}",))["n"]
+
+
+# a worker dies after a batch committed but before its post-commit work ran; the job retries
+vid = edit_draft(hr, {"R-PAN": {"offset_days": -8}, "R-WEL": {"id": "R-WEL", "item": "welcome_ack", "name": "Welcome pack",
+                                                              "kind": "ack", "category": "HR", "description": "Welcome", "offset_days": -1}})
+service.submit(vid, hr, "Welcome pack", "crash test")
+service.approve(vid, ap1, "ok")
+real_diff, real_project, calls = service.employee_diff, records.project, {"diff": 0, "project": 0}
+
+
+def crashing_diff(*a, **k):  # dies in batch 2, after batch 1 committed
+    calls["diff"] += 1
+    if calls["diff"] == 2:
+        raise RuntimeError("worker died mid-publish")
+    return real_diff(*a, **k)
+
+
+def crashing_project(*a, **k):  # the post-commit projection fails once too
+    calls["project"] += 1
+    if calls["project"] == 1:
+        raise RuntimeError("graph unavailable")
+    return real_project(*a, **k)
+
+
+service.employee_diff, records.project = crashing_diff, crashing_project
+try:
+    while asyncio.run(jobs.run_once()):  # runs publish (crashes) and the first after_replay (crashes)
+        pass
+finally:
+    service.employee_diff, records.project = real_diff, real_project
+job = db.fetch1("SELECT * FROM jobs WHERE idempotency_key=%s", (f"policy.publish:{vid}",))
+crashed_first = job["state"] == "queued" and job["attempts"] == 1 and store.version(vid)["state"] == "approved"
+db.execute("UPDATE jobs SET run_at=now() WHERE run_at > now()")  # skip the backoff
+drain()
+g, p = records.parity_rows("Item")
+check("test_publish_crash_then_retry_converges",
+      crashed_first and store.version(vid)["state"] == "active" and converged(vid) and not open_dupes()
+      and published_audits(vid) == 1 and bridge.parity(g, p)["ok"], (crashed_first, bridge.parity(g, p)))
+check("test_publish_crash_retry_adds_once",
+      all(len([i for i in records.items(e["id"]) if i["key"] == "welcome_ack"]) == 1
+          for e in service.in_flight() if not service.near_start(e)))
+
+# two runners publish the same version at the same time (e.g. a stuck job requeued while the first still runs)
+vid = edit_draft(hr, {"R-WEL": {"offset_days": -2}, "R-KIT": {"id": "R-KIT", "item": "kit_ack", "name": "Kit", "kind": "ack",
+                                                             "category": "HR", "description": "Kit", "offset_days": -1}})
+service.submit(vid, hr, "Kit", "race test")
+pv = service.preview(vid)
+pre = {e["id"]: {i["key"]: i for i in records.items(e["id"], include_closed=True)} for e in service.in_flight()}
+service.approve(vid, ap1, "ok")
+errors, barrier = [], threading.Barrier(2)
+
+
+def racer():
+    try:
+        barrier.wait()
+        service.publish(vid)
+    except Exception as e:  # noqa: BLE001
+        errors.append(e)
+
+
+ts = [threading.Thread(target=racer) for _ in range(2)]
+[t.start() for t in ts]
+[t.join() for t in ts]
+drain()
+replays = db.fetch("""SELECT entity_id, count(*) AS n FROM audit_log WHERE action='policy.replay'
+                      AND (metadata->>'version')::int = %s GROUP BY 1""", (store.version(vid)["number"],))
+check("test_concurrent_publish_replays_once",
+      not errors and not open_dupes() and all(r["n"] == 1 for r in replays) and published_audits(vid) == 1
+      and db.fetch1("SELECT count(*) AS n FROM rule_set_versions WHERE state='active'")["n"] == 1, (errors, replays))
+
+# preview == publish, joiner by joiner (not just the totals)
+post = {e: {i["key"]: i for i in records.items(e, include_closed=True)} for e in pre}
+actual = {}
+for e in pre:
+    added = sum(1 for k in post[e] if k not in pre[e])
+    moved = sum(1 for k, i in post[e].items() if k in pre[e] and pre[e][k]["due"] != i["due"] and i["cancelled_by_version"] is None)
+    if added or moved:
+        actual[e] = (added, moved)
+expected = {r["employee_id"]: (r["added"], r["due_moved"]) for r in pv["rows"] if not r["near_start"] and (r["added"] or r["due_moved"])}
+check("test_preview_equals_publish_per_joiner", expected == actual and len(actual) >= 4, (expected, actual))
+
+# rollback of a rollback: each step is a new governed version; nothing is deleted
+v_kit = vid
+n_items = db.fetch1("SELECT count(*) AS n FROM items")["n"]
+n_approvals = db.fetch1("SELECT count(*) AS n FROM approvals")["n"]
+rb1 = service.rollback(v_bgv, hr, "undo the kit and welcome rules")
+service.approve(rb1["id"], ap1, "ok")
+if store.version(rb1["id"])["required_approvals"] == 2:
+    service.approve(rb1["id"], ap2, "ok")
+drain()
+rb2 = service.rollback(v_kit, hr, "undo the undo")
+service.approve(rb2["id"], ap1, "ok")
+if store.version(rb2["id"])["required_approvals"] == 2:
+    service.approve(rb2["id"], ap2, "ok")
+drain()
+rules_of = lambda v: {r["id"]: {k: x for k, x in r.items() if k != "ord"} for r in store.rules_of(v)}  # noqa: E731
+check("test_rollback_of_rollback",
+      rules_of(store.active_version()["id"]) == rules_of(v_kit) and store.active_version()["rollback_of"] == v_kit
+      and store.version(rb1["id"])["state"] == "superseded" and store.version(rb1["id"])["rollback_of"] == v_bgv
+      and converged(rb2["id"]) and not open_dupes()
+      and db.fetch1("SELECT count(*) AS n FROM items")["n"] >= n_items
+      and db.fetch1("SELECT count(*) AS n FROM approvals")["n"] >= n_approvals + 2)
+service.BATCH = 50
+
+# one open draft at a time is a deliberate Phase 1 limit, and the refusal says so
+store.open_draft(hr["id"])
+try:
+    store.open_draft(ap1["id"])
+    check("test_one_open_draft_is_deliberate", False)
+except PolicyError as e:
+    check("test_one_open_draft_is_deliberate", e.status == 409 and "one draft at a time" in str(e))
+store.discard_draft(store.open_version()["id"], hr)
 
 # ---------- migration: parity, bridge gate, projection ----------
 g, p = records.parity_rows("Item")

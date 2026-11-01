@@ -112,7 +112,7 @@ def open_draft(author_id: int) -> int:
     """Copy the active version into a new draft. One open draft at a time."""
     with db.tx() as c:
         if open_version(conn=c):
-            raise PolicyError(409, "A draft is already open. Finish or discard it first.")
+            raise PolicyError(409, "Only one draft at a time (a deliberate limit, so every change is reviewed against the active rule set). Finish or discard the open draft first.")
         act = active_version(conn=c)
         if not act:
             raise PolicyError(409, "No active rule set to copy")
