@@ -100,6 +100,6 @@ Connectors are the systems that records come from (**sources**, shown in pine) o
 - Code: `backend/connectors/` (`base.py` interface, `registry.py`, one module per connector, `sync.py`), routes in `backend/connector_routes.py`.
 - **Integrations** (`/integrations`): pick a source and target, adjust the suggested field mapping, choose update or skip for duplicates, and run. Re-running never creates duplicates, and every rejected record comes with a reason.
 - **Linked to onboarding:** "Start onboarding" on a candidate creates the joiner and checklist. When a joiner's HR record completes, they're written to the HR Portal automatically.
-- Simplification: there's a single workspace with no permission checks (the app has no sign-in).
+- Access: sign-in with five roles (admin, HR Ops, approver, manager, auditor). See the [hardening roadmap](docs/plans/2026-11-01-hardening-design.md) for what's built and what's next.
 
 To add a connector: subclass `Connector`, implement the four read methods (plus `upsert_record` for a target), register it in `_REGISTRY`, and add a catalog row and an instance in `connectors/seed.py`.

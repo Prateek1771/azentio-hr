@@ -1,6 +1,6 @@
 # ADR 0002: FalkorDB for the build; PostgreSQL as the production system of record
 
-- **Status:** accepted for the current build; PostgreSQL migration proposed for production phase P2
+- **Status:** accepted for the build; storage part superseded by [ADR 0005](0005-postgres-system-of-record.md)
 - **Date:** 2026-11-01
 - **Deciders:** engineering
 
