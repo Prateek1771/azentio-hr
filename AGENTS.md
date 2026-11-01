@@ -68,6 +68,7 @@ cd backend && uv run python test_phase1.py    # rule-set versions, approvals, sa
 3. An already-applied migration is modified, removed or renamed.
 4. `work_queue.open_item` uses a kind not registered in `work_queue.KINDS`.
 5. Code updates, deletes or truncates `audit_log`, or disables its trigger (tests excepted).
+6. Something writes `Document` nodes or their `HAS_DOC` / `SUBMITTED` / `MISMATCH` edges to the graph outside `documents/store.py`.
 
 ## Where things live
 | Path | Owns |
@@ -77,6 +78,7 @@ cd backend && uv run python test_phase1.py    # rule-set versions, approvals, sa
 | `backend/shared/jobs.py` | **Transactional outbox and short-task queue**: `enqueue(..., idempotency_key, conn=)`, `@handler`, backoff, `dead`, heartbeat |
 | `backend/shared/bridge.py` | Which store each record type is read from; `parity()`/`switch()` for migrations |
 | `backend/shared/bootstrap.py` | Startup steps, each safe to re-run (incl. the one-time Employee/Item migration gate) |
+| `backend/documents/` | **Documents (Phase 2).** `store` is the only read/write path for documents, mismatches and decisions (append-only `doc_decisions`); `route` is the pure policy router (`decide`, `ALWAYS_HIGH`, `backtest`) |
 | `backend/records.py` | **The only way to read or write employees and checklist items.** Refreshes the graph projection in place after each write |
 | `backend/policy/` | Rule-set versions: `store` (versions, drafts, diff), `replay` (pure `plan_diff` + `apply`), `service` (preview, approvals, publish/notify jobs), `routes` |
 | `backend/migrations/NNN_*.sql` | Schema, applied at startup |
@@ -102,7 +104,7 @@ cd backend && uv run python test_phase1.py    # rule-set versions, approvals, sa
   - Single side effects and local operational tasks are Postgres jobs, with an idempotency key on every side effect.
   - Anything that waits on people or timers becomes a Temporal workflow from Phase 4.
   - Always enqueue inside the transaction of the change that caused it.
-- **Employees and items only through `records.py`.** Never write `Employee`/`Item` with Cypher; documents, events and connector records may still be read by joining the graph projection.
+- **Employees and items only through `records.py`; documents only through `documents/store.py`.** Never write `Employee`/`Item`/`Document` or document edges with Cypher; the graph is a projection refreshed by `records.project`.
 - **Rules change only by publishing a version** (`policy/`). Replay never deletes an item: not-started items are cancelled, done items or items with documents are kept as evidence.
 - **One open draft at a time is a deliberate limit**, not a bug: two drafts of the same rule set would need merging. Revisit only if HR asks for parallel drafts.
 - **Every `work_queue` kind is a contract** in `work_queue.KINDS`: an SLA, an escalation role and resolution steps. Register a kind before opening items of it.

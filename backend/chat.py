@@ -185,14 +185,13 @@ def hr_context(question: str, chunks: list[dict], focus_id: str | None) -> str:
             waiting = [by_key[d]["name"] for d in i.get("depends", []) if d in by_key and by_key[d]["status"] not in checklist.DONE]
             lines.append(f"- {i['name']} ({i['kind']}): {i['status']}, {i['state']}, due {i['due']}, owner {i['owner_name'] or i['category']}"
                          + (f", waiting on {', '.join(waiting)}" if waiting else ""))
-        for m in q("""MATCH (:Employee {id:$e})<-[m:MISMATCH]-(d:Document)
-                      RETURN m.field AS f, m.expected AS x, m.found AS y, d.filename AS fn""", e=e["id"]):
-            lines.append(f"- FLAG: {m['f']} mismatch on {m['fn']}: profile '{m['x']}' vs document '{m['y']}'")
+        from documents import store as docs
+        for m in docs.mismatches(e["id"]):
+            lines.append(f"- FLAG: {m['field']} mismatch on {m['filename']}: profile '{m['expected']}' vs document '{m['found']}'")
         if e["id"] == focus_id:
             lines.append("  Documents received:")
-            for row in q("MATCH (:Employee {id:$e})-[:SUBMITTED]->(d:Document) RETURN d ORDER BY d.ts DESC", e=e["id"]):
-                d = row["d"]
-                ex = {k: v for k, v in json.loads(d.get("extracted") or "{}").items() if v and not k.startswith("_")}
+            for d in docs.for_employee(e["id"]):
+                ex = {k: v for k, v in (d.get("extracted") or {}).items() if v and not k.startswith("_")}
                 lines.append(f"  - {d['filename']} via {d['source']}: {d['status']}; extracted {ex}; issues {d.get('issues')}")
     lines.append("\nOWNERS:")
     for o in q("MATCH (o:Owner) RETURN o.name AS n, o.email AS e, o.type AS t, o.department AS d ORDER BY o.type"):

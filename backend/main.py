@@ -129,18 +129,18 @@ def emp_by_token(token: str) -> dict:
 def items_with_state(eid: str) -> list[dict]:
     items = checklist.employee_items(eid)
     by_key = {i["key"]: i for i in items}
-    docs = q("""MATCH (i:Item)-[:HAS_DOC]->(d:Document) WHERE i.id IN $ids
-                RETURN i.id AS item, d ORDER BY d.ts DESC""", ids=[i["id"] for i in items]) if items else []
+    from documents import store as docs
+    by_item = docs.for_items([i["id"] for i in items])
     for i in items:
         i["state"] = checklist.view_state(i, by_key)
         i["blocked_by"] = [by_key[d]["name"] for d in i.get("depends", []) if d in by_key and by_key[d]["status"] not in checklist.DONE]
-        i["documents"] = [_doc(r["d"]) for r in docs if r["item"] == i["id"]]
+        i["documents"] = [_doc(d) for d in by_item.get(i["id"], [])]
     return items
 
 
 def _doc(d: dict) -> dict:
-    return {**{k: v for k, v in d.items() if k != "path"}, "extracted": json.loads(d.get("extracted") or "{}"),
-            "issues": json.loads(d.get("issues") or "[]")}
+    """A document as the API shows it: no server path."""
+    return {k: v for k, v in d.items() if k != "path"}
 
 
 def summarize(items: list[dict]) -> dict:
@@ -153,11 +153,11 @@ def summarize(items: list[dict]) -> dict:
 
 
 def flags(eid: str, items: list[dict]) -> list[dict]:
-    """Graph evaluation: mismatches, missing docs close to joining, blocked chains, overdue owners."""
-    out = [{"level": "error", "type": "mismatch", "message": f"{r['field'].replace('_', ' ').title()} mismatch on {r['file']}: "
+    """Mismatches, missing docs close to joining, blocked chains, overdue owners."""
+    from documents import store as docs
+    out = [{"level": "error", "type": "mismatch", "message": f"{r['field'].replace('_', ' ').title()} mismatch on {r['filename']}: "
             f"profile '{r['expected']}' vs document '{r['found']}'"}
-           for r in q("""MATCH (e:Employee {id:$e})<-[m:MISMATCH]-(d:Document)
-                         RETURN m.field AS field, m.expected AS expected, m.found AS found, d.filename AS file""", e=eid)]
+           for r in docs.mismatches(eid)]
     for i in items:
         if i["state"] == "overdue":
             out.append({"level": "warning", "type": "overdue", "message": f"'{i['name']}' overdue since {i['due']} — owner {i['owner_name'] or i['category']}"})
@@ -218,8 +218,8 @@ def stats():
 def employee_detail(eid: str):
     e = get_emp(eid)
     items = items_with_state(eid)
-    unmatched = [_doc(r["d"]) for r in q("""MATCH (:Employee {id:$e})-[:SUBMITTED]->(d:Document)
-                                           WHERE NOT ()-[:HAS_DOC]->(d) RETURN d ORDER BY d.ts DESC""", e=eid)]
+    from documents import store as docs
+    unmatched = [_doc(d) for d in docs.unmatched(eid)]
     events = q("MATCH (v:Event {employee_id:$e}) RETURN v ORDER BY v.ts DESC LIMIT 100", e=eid)
     manager = q1("MATCH (:Employee {id:$e})-[:REPORTS_TO]->(m) RETURN m", e=eid)
     accepted = {}
@@ -256,9 +256,10 @@ def employee_graph(eid: str):
         for dk in i.get("depends", []):
             if dk in by_key:
                 edges.append({"from": i["id"], "to": by_key[dk], "type": "DEPENDS_ON"})
-    for r in q("MATCH (:Employee {id:$e})<-[m:MISMATCH]-(d:Document) RETURN d.id AS d, m.field AS f", e=eid):
-        if r["d"] in nodes:
-            edges.append({"from": r["d"], "to": eid, "type": "MISMATCH", "label": r["f"]})
+    from documents import store as docs
+    for m in docs.mismatches(eid):
+        if m["document_id"] in nodes:
+            edges.append({"from": m["document_id"], "to": eid, "type": "MISMATCH", "label": m["field"]})
     return {"nodes": list(nodes.values()), "edges": edges}
 
 
@@ -323,9 +324,13 @@ async def set_item_status(item_id: str, body: ItemStatus):
     if not it or not _visible(records.employee(it["employee_id"]) or {}):
         raise HTTPException(404, "Item not found")
     records.update_item(item_id, status=body.status)
-    if it["kind"] == "document":
-        q("MATCH (i:Item {id:$id})-[:HAS_DOC]->(d:Document) WITH d ORDER BY d.ts DESC LIMIT 1 SET d.status=$s",
-          id=item_id, s=body.status)
+    if it["kind"] == "document":  # ponytail: Step 3 replaces this with the decision endpoint (409 here)
+        from documents import store as docs
+        latest = docs.latest_for_item(item_id)
+        if latest and body.status in docs.STATUSES:
+            with db.tx() as c:
+                docs.update(latest["id"], c, status=body.status)
+            records.project(it["employee_id"])
     event(it["employee_id"], "review", f"HR set '{it['name']}' to {body.status}" + (f": {body.note}" if body.note else ""))
     if body.status == "Correction Requested" and gmail.configured():
         emp = get_emp(it["employee_id"])
@@ -374,11 +379,11 @@ def events(limit: int = 50):
 
 @app.get("/api/documents/{doc_id}/file")
 def document_file(doc_id: str):
-    row = q1("""MATCH (d:Document {id:$id}) OPTIONAL MATCH (e:Employee)-[:HAS_ITEM]->(:Item)-[:HAS_DOC]->(d)
-                 RETURN d.path AS p, d.mime AS m, d.filename AS f, e.manager_email AS mgr""", id=doc_id)
-    if not row or not _visible({"manager_email": row["mgr"]}):
+    from documents import store as docs
+    d = docs.get(doc_id)
+    if not d or not _visible(records.employee(d["employee_id"]) or {}):
         raise HTTPException(404)
-    return FileResponse(row["p"], media_type=row["m"], filename=row["f"], content_disposition_type="inline")
+    return FileResponse(d["path"], media_type=d["mime"], filename=d["filename"], content_disposition_type="inline")
 
 
 # ---------- ingestion & configuration ----------

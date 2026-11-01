@@ -10,7 +10,7 @@ import audit
 import checklist
 import records
 import work_queue
-from graph import q, event
+from graph import event
 from policy import replay, store
 from policy.store import PolicyError
 from shared import db, jobs
@@ -35,10 +35,9 @@ def in_flight(conn=None) -> list[dict]:
 
 
 def docs_by_item(item_ids: list[str]) -> set[str]:
-    """Items that have at least one document (documents live in the graph until Phase 2)."""
-    if not item_ids:
-        return set()
-    return {r["i"] for r in q("MATCH (i:Item)-[:HAS_DOC]->(:Document) WHERE i.id IN $ids RETURN DISTINCT i.id AS i", ids=item_ids)}
+    """Items that have at least one document: those are kept as evidence, never cancelled."""
+    from documents import store as docs
+    return docs.has_docs(item_ids)
 
 
 def plan_for(emp: dict, rules: list[dict], config: dict, own: dict) -> list[dict]:

@@ -7,6 +7,8 @@ Rules (see AGENTS.md "Rules for changes"):
   3. No edits to an already-applied migration: files in backend/migrations may only be added.
   4. Every work_queue.open_item(kind=...) uses a literal kind registered in work_queue.KINDS.
   5. No direct UPDATE/DELETE/TRUNCATE of audit_log and no disabling its trigger (tests excepted).
+  6. No direct graph writes of Document nodes or their HAS_DOC / SUBMITTED / MISMATCH edges outside
+     backend/documents/store.py (Postgres owns documents since Phase 2; the graph is a projection).
 
 Usage:  python scripts/check_boundaries.py [--base <git-ref>]     # default base: merge-base with origin/main
         python scripts/check_boundaries.py --selftest             # proves each rule rejects a known-bad snippet
@@ -56,20 +58,39 @@ def strings(tree: ast.AST):
 
 # ---------- rule 1: Employee/Item property writes ----------
 
-NODE_CREATE = re.compile(r"\b(CREATE|MERGE)\s*\(\s*\w*\s*:\s*(Employee|Item)\b")
-BIND = re.compile(r"\(\s*(\w+)\s*:\s*(Employee|Item)\b")
+def node_violations(text: str, labels: str = "Employee|Item") -> list[str]:
+    """Writes to nodes with one of `labels`: create/merge, property SET, or DELETE of a bound variable."""
+    out, what = [], labels.replace("|", "/")
+    if re.search(rf"\b(CREATE|MERGE)\s*\(\s*\w*\s*:\s*({labels})\b", text):
+        out.append(f"creates a {what} node")
+    for var in {m.group(1) for m in re.finditer(rf"\(\s*(\w+)\s*:\s*({labels})\b", text)}:
+        if re.search(rf"\bSET\s+[^;]*?\b{var}\s*(\.\w+\s*=|\+=|=)", text):
+            out.append(f"sets properties on {what} variable '{var}'")
+        if re.search(rf"\bDELETE\b[^;]*?\b{var}\b(?!\s*\.)", text):
+            out.append(f"deletes {what} node '{var}'")
+    return out
+
+
+def edge_violations(text: str, rels: str) -> list[str]:
+    """Creating, merging or deleting relationships of the given types."""
+    out, what = [], rels.replace("|", "/")
+    if re.search(rf"\b(CREATE|MERGE)\b[^;]*?\[\s*\w*\s*:\s*({rels})\b", text):
+        out.append(f"creates a {what} edge")
+    for var in {m.group(1) for m in re.finditer(rf"\[\s*(\w+)\s*:\s*({rels})\b", text)}:
+        if re.search(rf"\bDELETE\b[^;]*?\b{var}\b", text):
+            out.append(f"deletes {what} edge '{var}'")
+    return out
 
 
 def cypher_violations(text: str) -> list[str]:
-    out = []
-    if NODE_CREATE.search(text):
-        out.append("creates an Employee/Item node")
-    for var in {m.group(1) for m in BIND.finditer(text)}:
-        if re.search(rf"\bSET\s+[^;]*?\b{var}\s*(\.\w+\s*=|\+=|=)", text):
-            out.append(f"sets properties on Employee/Item variable '{var}'")
-        if re.search(rf"\bDELETE\b[^;]*?\b{var}\b(?!\s*\.)", text):
-            out.append(f"deletes Employee/Item node '{var}'")
-    return out
+    return node_violations(text)
+
+
+DOC_RELS = "HAS_DOC|SUBMITTED|MISMATCH"
+
+
+def document_violations(text: str) -> list[str]:
+    return node_violations(text, "Document") + edge_violations(text, DOC_RELS)
 
 
 def check_graph_writes(files) -> list[str]:
@@ -85,6 +106,20 @@ def check_graph_writes(files) -> list[str]:
                 errs.append(f"{rel}:{line}: {v}. No direct graph writes of Employee/Item properties outside "
                             f"backend/records.py; use records.update_employee/update_item (relationship writes to "
                             f"graph-owned nodes are fine)")
+    return errs
+
+
+def check_document_writes(files) -> list[str]:
+    errs = []
+    for path, rel in files:
+        if rel == "backend/documents/store.py" or is_test(rel):
+            continue
+        for line, s in strings(ast.parse(path.read_text(encoding="utf-8"))):
+            if not re.search(r"\b(MATCH|MERGE|CREATE)\b", s):
+                continue
+            for v in document_violations(s):
+                errs.append(f"{rel}:{line}: {v}. No direct graph writes of Documents or their edges outside "
+                            f"backend/documents/store.py; write through documents.store (the graph is a projection)")
     return errs
 
 
@@ -183,7 +218,7 @@ def check_audit(paths) -> list[str]:
 def run(base: str | None) -> list[str]:
     files = list(py_files())
     sql = [(p, p.relative_to(ROOT).as_posix()) for p in sorted((BACKEND / "migrations").glob("*.sql"))]
-    return (check_graph_writes(files) + check_roles(files) + check_migrations(base)
+    return (check_graph_writes(files) + check_document_writes(files) + check_roles(files) + check_migrations(base)
             + check_kinds(files, registered_kinds()) + check_audit(files + sql))
 
 
@@ -206,6 +241,22 @@ def selftest() -> None:
         assert cypher_violations(c), f"rule 1 missed: {c}"
     for c in ok_cypher:
         assert not cypher_violations(c), f"rule 1 false positive: {c} -> {cypher_violations(c)}"
+    bad_docs = [
+        "CREATE (d:Document) SET d = $p",
+        "MATCH (d:Document {id:$id}) SET d.status='Accepted'",
+        "MATCH (i:Item {id:$i}), (d:Document {id:$d}) CREATE (i)-[:HAS_DOC]->(d)",
+        "MATCH (e:Employee {id:$e}), (d:Document {id:$id}) CREATE (e)-[:SUBMITTED]->(d)",
+        "MATCH (d:Document {id:$id}), (e:Employee {id:$e}) CREATE (d)-[m:MISMATCH]->(e) SET m = $p",
+        "MATCH ()-[h:HAS_DOC]->(d:Document {id:$id}) DELETE h",
+    ]
+    ok_docs = [
+        "MATCH (i:Item)-[:HAS_DOC]->(d:Document) WHERE i.id IN $ids RETURN i.id AS item, d",
+        "MATCH (e:Employee {id:$e})<-[m:MISMATCH]-(d:Document) RETURN m.field AS f",
+    ]
+    for c in bad_docs:
+        assert document_violations(c), f"rule 6 missed: {c}"
+    for c in ok_docs:
+        assert not document_violations(c), f"rule 6 false positive: {c} -> {document_violations(c)}"
     for line in ['if user["role"] == "admin":', "if role in ('admin', 'auditor'):", 'ok = u["role"] != "manager"']:
         assert ROLE_CHECK.search(line), f"rule 2 missed: {line}"
     for line in ['if c["role"] == role:', 'job_title = e["role"]', 'if s_inst["role"] != "source":']:
@@ -223,7 +274,7 @@ def selftest() -> None:
     finally:
         tmp.unlink(missing_ok=True)
     assert registered_kinds() >= {"ops", "policy.approval", "policy.near_start"}, "could not read work_queue.KINDS"
-    print("boundary guard selftest: ok (rules 1, 2, 4, 5 reject known-bad code; rule 3 is a git diff)")
+    print("boundary guard selftest: ok (rules 1, 2, 4, 5, 6 reject known-bad code; rule 3 is a git diff)")
 
 
 if __name__ == "__main__":

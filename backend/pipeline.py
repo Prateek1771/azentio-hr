@@ -1,7 +1,5 @@
 """Shared document intake: email attachments and portal uploads both land here."""
-import json
 import mimetypes
-import time
 from pathlib import Path
 
 import checklist
@@ -9,7 +7,9 @@ import records
 import extract
 import logging_setup as ls
 import validate
-from graph import q, new_id, event
+from documents import store as docs
+from graph import new_id, event
+from shared import db
 
 UPLOADS = Path(__file__).parent / "uploads"
 UPLOADS.mkdir(exist_ok=True)
@@ -29,10 +29,9 @@ async def intake(eid: str, filename: str, data: bytes, mime: str | None, source:
     doc_id = new_id("doc")
     path = UPLOADS / f"{doc_id}_{Path(filename).name}"
     path.write_bytes(data)
-    doc = {"id": doc_id, "employee_id": eid, "filename": filename, "path": str(path), "mime": mime,
-           "size": len(data), "source": source, "status": "Submitted", "ts": time.time(),
-           "extracted": "{}", "issues": "[]", "confidence": 0.0, "doc_type": item_key or ""}
-    q("CREATE (d:Document) SET d = $p", p=doc)
+    with db.tx() as c:
+        docs.insert({"id": doc_id, "employee_id": eid, "filename": filename, "path": str(path), "mime": mime,
+                     "size": len(data), "source": source, "status": "Submitted", "doc_type": item_key or ""}, c)
     event(eid, "document", f"Received '{filename}' via {source}")
 
     doc_types = checklist.config("doc_types") or {}
@@ -40,7 +39,6 @@ async def intake(eid: str, filename: str, data: bytes, mime: str | None, source:
     if file_issues:
         ex, result = {}, {"status": "Correction Requested", "issues": file_issues, "mismatches": []}
     else:
-        q("MATCH (d:Document {id:$id}) SET d.status='Under Review'", id=doc_id)
         try:
             ex = await extract.extract(data, mime, filename, doc_types, hint=doc_types.get(item_key, {}).get("name"))
             event(eid, "ai", f"Extracted '{filename}' via {ex.get('_model')} ({ex.get('_tokens') or '?'} tokens), confidence {ex.get('confidence')}")
@@ -64,23 +62,20 @@ async def intake(eid: str, filename: str, data: bytes, mime: str | None, source:
         result = {"status": "Under Review", "issues": [f"Document classified as '{key}', which is not on this checklist."],
                   "mismatches": result["mismatches"]}
 
-    q("""MATCH (d:Document {id:$id}) SET d.status=$s, d.extracted=$x, d.issues=$iss,
-         d.confidence=$c, d.doc_type=$k""",
-      id=doc_id, s=result["status"], x=json.dumps(ex), iss=json.dumps(result["issues"]),
-      c=float(ex.get("confidence") or 0), k=key)
-    q("MATCH (e:Employee {id:$e}), (d:Document {id:$id}) CREATE (e)-[:SUBMITTED]->(d)", e=eid, id=doc_id)
+    with db.tx() as c:
+        docs.update(doc_id, c, status=result["status"], extracted=ex, issues=result["issues"],
+                    confidence=float(ex.get("confidence") or 0), doc_type=key, model=ex.get("_model"),
+                    item_id=item["id"] if item else None)
+        docs.set_mismatches(doc_id, result["mismatches"], c)
     ls.log_event(ls.get("documents"), "document.checked", doc=doc_id, employee=eid, source=source, status=result["status"],
                  issues=len(result["issues"]), model=ex.get("_model"), tokens=ex.get("_tokens"))
-    for m in result["mismatches"]:
-        q("MATCH (e:Employee {id:$e}), (d:Document {id:$id}) CREATE (d)-[m:MISMATCH]->(e) SET m = $p", e=eid, id=doc_id, p=m)
-
     if item:
-        q("MATCH (i:Item {id:$i}), (d:Document {id:$d}) CREATE (i)-[:HAS_DOC]->(d)", i=item["id"], d=doc_id)
         if item["status"] != "Accepted":  # a later bad upload never downgrades an accepted item
             records.update_item(item["id"], status=result["status"])
         label = item["name"]
     else:
         label = key
+    records.project(eid)  # refresh the graph view of this document
     event(eid, "verification", f"{label}: {result['status']}" + (f" — {'; '.join(result['issues'])}" if result["issues"] else ""))
 
     if result["status"] == "Correction Requested" and notify:

@@ -86,6 +86,31 @@ def migrate_records() -> dict:
     return report
 
 
+def migrate_documents() -> dict:
+    """Document graph -> Postgres, once (Phase 2): backfill, then switch only if parity passes (else refuse to start).
+    After the switch the graph never gets a direct document write again; documents.store.project() keeps the view."""
+    from shared import bridge
+    from documents import store as docs
+    import records
+    bridge.load()
+    if bridge.source("Document") == "postgres":
+        return {"documents": "postgres"}
+    if not graph_ok():
+        raise SystemExit("bootstrap: the graph is unreachable, so documents can't be migrated to Postgres yet. "
+                         "Start FalkorDB (`docker compose up -d falkordb`) and restart.")
+    report = docs.backfill()
+    g, p = docs.parity_rows()
+    try:
+        report["parity"] = bridge.switch("Document", g, p)
+    except bridge.ParityError as e:
+        raise SystemExit(f"bootstrap: {e}. Documents stay in the graph; see the backfill report, fix the data and restart. "
+                         f"Report: {report}") from None
+    records.rebuild_graph()  # re-project documents from Postgres
+    ls.log_event(_log, "documents.migrated", documents=report["documents"], missing_files=len(report["missing_files"]),
+                 accepted_high_risk=len(report["accepted_high_risk"]), unknown_status=len(report["unknown_status"]))
+    return report
+
+
 def graph_ok() -> bool:
     try:
         from graph import q
@@ -104,6 +129,7 @@ def run() -> dict:
     imported = import_graph_rows() if graph_ok() else 0  # before anything else writes audit rows: history stays first in the chain
     created = ensure_users()
     migrate_records()
+    migrate_documents()
     state = {"migrations": applied, "users_created": created, "audit_imported": imported, "graph": graph_ok()}
     ls.log_event(_log, "done", **{k: (len(v) if isinstance(v, list) else v) for k, v in state.items()})
     if created and not is_production():
