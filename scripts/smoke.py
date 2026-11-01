@@ -127,7 +127,8 @@ async def run(base: str, shots: Path) -> int:
     profile = tempfile.mkdtemp(prefix="smoke-")
     port = 9333
     proc = subprocess.Popen([find_chrome(), "--headless=new", f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
-                             "--window-size=1440,900", "--hide-scrollbars", "--no-first-run", "about:blank"],
+                             "--window-size=1440,900", "--hide-scrollbars", "--no-first-run",
+                             *(["--no-sandbox"] if os.getenv("CI") else []), "about:blank"],  # CI runners restrict user namespaces
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     failures = []
     try:

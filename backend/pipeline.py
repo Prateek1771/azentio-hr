@@ -9,7 +9,7 @@ import records
 import extract
 import logging_setup as ls
 import validate
-from graph import q, q1, new_id, event
+from graph import q, new_id, event
 
 UPLOADS = Path(__file__).parent / "uploads"
 UPLOADS.mkdir(exist_ok=True)

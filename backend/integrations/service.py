@@ -512,7 +512,7 @@ def save_documents(iid: str, enabled: bool, speak: bool = True) -> dict:
 
 
 async def generate_offer(iid: str, speak: bool = True) -> dict:
-    it = store.get(iid)
+    store.get(iid)
     content = await get_agent().draft_offer_letter(store.COMPANY, list(store.OFFER_PLACEHOLDERS))
     store.update(iid, offer_template=content, offer_template_status="pending_approval")
     _settled(iid, speak)

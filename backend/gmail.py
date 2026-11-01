@@ -15,7 +15,7 @@ from markupsafe import Markup
 import logging_setup as ls
 import pipeline
 import records
-from graph import q, q1, event
+from graph import q1, event
 
 LABEL = "azentio-processed"
 _log = ls.get("gmail")

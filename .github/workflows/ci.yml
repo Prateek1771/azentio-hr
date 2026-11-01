@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # No secrets in CI: nothing emails anyone or calls an LLM.
+  LLM_LOCAL_FALLBACK: "0"
+  LLM_KEYLESS_FALLBACK: "0"
+  DATABASE_URL: postgresql://azentio:azentio@localhost:5432/azentio
+  FALKORDB_URL: redis://localhost:6379
+
+jobs:
+  backend:
+    name: Backend (lint, boundary guard, tests)
+    runs-on: ubuntu-latest
+    services: &services
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_USER: azentio, POSTGRES_PASSWORD: azentio, POSTGRES_DB: azentio }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U azentio" --health-interval 5s --health-retries 10
+      falkordb:
+        image: falkordb/falkordb:latest
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10
+    defaults: { run: { working-directory: backend } }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }  # the guard diffs migrations against origin/main
+      - uses: astral-sh/setup-uv@v6
+        with: { enable-cache: true, cache-dependency-glob: backend/uv.lock }
+      - run: uv sync --frozen
+      - name: Lint (ruff F + E9)
+        run: uv run ruff check . --output-format github
+      - name: Boundary guard
+        run: |
+          uv run python ../scripts/check_boundaries.py --selftest
+          uv run python ../scripts/check_boundaries.py --base "${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}"
+      - run: uv run python test_core.py
+      - run: uv run python test_phase0.py
+      - run: uv run python test_phase1.py
+
+  frontend:
+    name: Frontend (types, lint)
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: frontend } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm, cache-dependency-path: frontend/package-lock.json }
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx eslint app components
+
+  smoke:
+    name: UI smoke (production build, every role, policy + rollback)
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    services: *services
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with: { enable-cache: true, cache-dependency-glob: backend/uv.lock }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm, cache-dependency-path: frontend/package-lock.json }
+      - name: Start backend (dev seed users and joiners)
+        working-directory: backend
+        run: |
+          uv sync --frozen
+          nohup uv run uvicorn main:app --port 8000 > ../backend.log 2>&1 &
+      - name: Build and start frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+          nohup npx next start -p 3000 > ../frontend.log 2>&1 &
+      - name: Wait for /ready
+        run: |
+          for i in $(seq 90); do curl -fs http://localhost:8000/ready && curl -fs -o /dev/null http://localhost:3000/login && exit 0; sleep 2; done
+          cat backend.log frontend.log; exit 1
+      - name: Smoke test
+        run: backend/.venv/bin/python scripts/smoke.py --base http://localhost:3000 --shots smoke-shots
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke
+          path: |
+            smoke-shots/
+            backend.log
+            frontend.log
+
+  images:
+    name: Image (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: [backend, frontend, smoke]
+    strategy:
+      matrix:
+        service: [backend, frontend]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.service }}
+          push: ${{ env.PUSH == 'true' }}
+          tags: |
+            ghcr.io/prateek1771/azentio-hr-${{ matrix.service }}:${{ github.sha }}
+            ghcr.io/prateek1771/azentio-hr-${{ matrix.service }}:latest
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

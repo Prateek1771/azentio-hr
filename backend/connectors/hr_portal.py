@@ -1,5 +1,4 @@
 """HR Portal: the built-in demo HR system (target). Employees matched on work email; supports custom fields."""
-import json
 import re
 import secrets
 
