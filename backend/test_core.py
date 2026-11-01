@@ -1,6 +1,8 @@
 """Self-checks for the pure logic: rule matching, blocking, validation, ingestion. Run: uv run python test_core.py"""
 import os
 os.environ["FALKORDB_GRAPH"] = "test"  # before anything imports graph: these checks wipe integrations, never touch the live graph
+from shared import db  # noqa: E402
+db.use_test_database("azentio_test_core")  # audit entries land here, never in the live Postgres
 import json
 from datetime import date
 from pathlib import Path

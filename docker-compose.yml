@@ -1,4 +1,4 @@
-# ponytail: only FalkorDB is containerised; backend/frontend run natively (uv / npm) for fast reloads.
+# ponytail: only the databases are containerised; backend/frontend run natively (uv / npm) for fast reloads.
 services:
   falkordb:
     image: falkordb/falkordb:latest
@@ -7,5 +7,19 @@ services:
     # Append-only log on top of snapshots: every write (integrations, runs, audit) survives a restart within ~1s.
     environment:
       REDIS_ARGS: "--appendonly yes --appendfsync everysec"
+  # System of record (ADR 0005). Migrations run automatically when the backend starts.
+  postgres:
+    image: postgres:17
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: azentio
+      POSTGRES_PASSWORD: azentio
+      POSTGRES_DB: azentio
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U azentio"]
+      interval: 5s
+      retries: 10
 volumes:
   falkor-data:
+  pg-data:

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
@@ -10,7 +11,8 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import FileResponse, StreamingResponse  # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # noqa: E402
+from starlette.concurrency import run_in_threadpool  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 import audit  # noqa: E402
@@ -21,6 +23,8 @@ import gmail  # noqa: E402
 import ingest  # noqa: E402
 import pipeline  # noqa: E402
 from graph import q, q1, event  # noqa: E402
+from identity import perms, service as identity  # noqa: E402
+from shared import bootstrap, db, jobs  # noqa: E402
 
 
 ls.setup()
@@ -40,16 +44,43 @@ async def _scheduler(interval: int = 30):
 
 @asynccontextmanager
 async def lifespan(app):
-    await ingest.seed()
-    tasks = [asyncio.create_task(gmail.poll_forever(60)), asyncio.create_task(_scheduler())]
-    ls.log_event(_log, "startup", gmail=gmail.configured())
+    state = await asyncio.to_thread(bootstrap.run)  # migrations, users, audit import; exits with a clear message on bad config
+    if state["graph"]:
+        await ingest.seed()  # default rule set, templates, sample joiners on first run
+        await asyncio.to_thread(bootstrap.ensure_dev_manager_reports)
+    tasks = [asyncio.create_task(jobs.worker()), asyncio.create_task(gmail.poll_forever(60)), asyncio.create_task(_scheduler())]
+    ls.log_event(_log, "startup", gmail=gmail.configured(), graph=state["graph"])
     yield
     for t in tasks:
         t.cancel()
+    db.close()
 
 
 app = FastAPI(title="Azentio HR Onboarding Agent", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# The browser reaches the API through the Next.js rewrite (same origin), so CORS only matters for direct callers.
+app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()],
+                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def authenticate(request: Request, call_next):
+    """The one permission check (identity/perms.py). Sets current_user for the request so audit entries name the actor."""
+    path, method = request.url.path, request.method
+    if method == "OPTIONS" or not path.startswith("/api/") or perms.is_public(method, path):
+        return await call_next(request)
+    try:
+        user = await run_in_threadpool(identity.user_for_token, request.cookies.get(identity.COOKIE))
+    except Exception:
+        return JSONResponse({"detail": "Service unavailable: database unreachable"}, status_code=503)
+    if not user:
+        return JSONResponse({"detail": "Sign in required"}, status_code=401)
+    if not perms.allowed(method, path, user["role"]):
+        return JSONResponse({"detail": "Your role can't do this"}, status_code=403)
+    token = identity.current_user.set(user)
+    try:
+        return await call_next(request)
+    finally:
+        identity.current_user.reset(token)
 
 
 @app.middleware("http")
@@ -70,9 +101,15 @@ async def request_log(request: Request, call_next):
 
 # ---------- helpers ----------
 
+def _visible(e: dict) -> bool:
+    """Managers see only their own reports; every other role sees everyone it is allowed to reach."""
+    u = identity.current_user.get()
+    return not u or u["role"] != "manager" or (e.get("manager_email") or "").lower() == u["email"]
+
+
 def get_emp(eid: str) -> dict:
     row = q1("MATCH (e:Employee {id:$e}) RETURN e", e=eid)
-    if not row:
+    if not row or not _visible(row["e"]):  # 404, not 403: don't reveal that someone else's report exists
         raise HTTPException(404, "Employee not found")
     return row["e"]
 
@@ -136,6 +173,8 @@ def list_employees(department: str = "", location: str = "", status: str = "", j
     out = []
     for row in q("MATCH (e:Employee) RETURN e ORDER BY e.joining_date"):
         e = row["e"]
+        if not _visible(e):
+            continue
         if department and e["department"] != department or location and e["location"] != location:
             continue
         if join_from and e["joining_date"] < join_from or join_to and e["joining_date"] > join_to:
@@ -328,14 +367,15 @@ async def poll_now():
 @app.get("/api/events")
 def events(limit: int = 50):
     rows = q("""MATCH (v:Event) OPTIONAL MATCH (e:Employee {id:v.employee_id})
-                RETURN v, e.name AS name ORDER BY v.ts DESC LIMIT $l""", l=limit)
-    return [{**r["v"], "employee_name": r["name"]} for r in rows]
+                RETURN v, e.name AS name, e.manager_email AS mgr ORDER BY v.ts DESC LIMIT $l""", l=limit)
+    return [{**r["v"], "employee_name": r["name"]} for r in rows if _visible({"manager_email": r["mgr"]})]
 
 
 @app.get("/api/documents/{doc_id}/file")
 def document_file(doc_id: str):
-    row = q1("MATCH (d:Document {id:$id}) RETURN d.path AS p, d.mime AS m, d.filename AS f", id=doc_id)
-    if not row:
+    row = q1("""MATCH (d:Document {id:$id}) OPTIONAL MATCH (e:Employee)-[:HAS_ITEM]->(:Item)-[:HAS_DOC]->(d)
+                 RETURN d.path AS p, d.mime AS m, d.filename AS f, e.manager_email AS mgr""", id=doc_id)
+    if not row or not _visible({"manager_email": row["mgr"]}):
         raise HTTPException(404)
     return FileResponse(row["p"], media_type=row["m"], filename=row["f"], content_disposition_type="inline")
 
@@ -541,6 +581,32 @@ class HrChatBody(BaseModel):
 async def hr_chat(body: HrChatBody):
     return StreamingResponse(chat.hr_answer_stream(body.message, body.history, body.employee_id), media_type="text/plain")
 
+
+@app.get("/health")
+def health():
+    """Process is up. Says nothing about dependencies; see /ready."""
+    return {"ok": True}
+
+
+@app.get("/ready")
+def ready():
+    """Can we actually serve? Postgres, graph and the job worker are required; the LLM is informational."""
+    from llm import BASE_URL
+    checks = {"postgres": db.ping(), "graph": bootstrap.graph_ok()}
+    try:
+        checks["worker"] = checks["postgres"] and jobs.worker_alive()
+    except Exception:
+        checks["worker"] = False
+    body = {k: "ok" if v else "down" for k, v in checks.items()}
+    body["llm"] = "configured" if BASE_URL else "missing"
+    return JSONResponse(body, status_code=200 if all(checks.values()) else 503)
+
+
+from identity.routes import router as identity_router  # noqa: E402
+import work_queue  # noqa: E402
+
+app.include_router(identity_router)
+app.include_router(work_queue.router)
 
 import connector_routes  # noqa: E402
 
