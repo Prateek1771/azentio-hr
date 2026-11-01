@@ -50,6 +50,7 @@ jobs:
       - run: uv run python test_phase0.py
       - run: uv run python test_phase1.py
       - run: uv run python test_phase2.py
+      - run: uv run python test_phase3.py   # migration engine + API contract (scripts/api_contract.py --check)
 
   frontend:
     name: Frontend (types, lint)

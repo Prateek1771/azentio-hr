@@ -59,6 +59,7 @@ MATRIX = [  # method, path, roles allowed
     ("POST", "/api/review-queue/1/spot-check", {P}), ("GET", "/api/documents/d1", {A, H, P, U}),
     ("POST", "/api/documents/d1/decision", {H, P}), ("POST", "/api/documents/d1/override", {P}),
     ("GET", "/api/quality/ai-accuracy", {A, H, P, U}),
+    ("GET", "/api/admin/migration", {A, U}), ("POST", "/api/admin/migration", set()),
     ("GET", "/api/auth/me", {A, H, P, M, U}), ("GET", "/api/not-a-route", set()), ("DELETE", "/api/stats", set()), ("POST", "/api/policies", set()),
 ]
 bad = [(m, p, r) for m, p, roles in MATRIX for r in perms.ROLES if perms.allowed(m, p, r) != (r in roles)]

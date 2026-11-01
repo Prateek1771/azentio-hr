@@ -1,299 +1,240 @@
-# Phase 3: Retire graph-backed record storage
+# Phase 3: Retire graph record storage
 
-- **Status:** planned
-- **Depends on:**
-  - Phase 0: `shared/db.py`, `shared/bridge.py`, `audit/service.py`
-  - Phase 1: Employee, Item and Rule are in Postgres
-  - Phase 2: Document is in Postgres
-- **Branch:** `phase-3-retire-graph-records`
+- **Status:** in progress. PR 0 (tooling) is done; batches A1 → E follow, one PR each.
+- **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
+- **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
+- **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
 
-## Goal
-After Phases 1–2, the HR core lives in Postgres, but about 20 other graph labels are still written as authoritative records. `grep -rhoE "(CREATE|MERGE) \(\w*:\w+"` over `backend/` lists them:
-- **Connectors:** `Connector`, `ConnectorInstance`, `Record`, `CustomField`, `ImportRun`, `IntegrationRun`
-- **Integrations:** `Integration`, `IntegrationCandidate`, `WorkflowRun`, `IntegrationLogRecord`, `OutboundMessage`, `AgentMessage`
-- **Configuration:** `Config`, `EmailTemplate`, `Owner`
-- **Activity and quality:** `Event`, `EvalRun`, `EvalResult`, `GuardrailEvent`
-- **Retrieval:** `Policy`, `PolicyChunk`, `Chunk`
+## As built so far (PR 0)
+- `backend/graph_migration.py` is the engine. A `LabelSpec` per label gives the graph query, the table, the row
+  mapper, a canonical form, a reverse mapper for rollback, its edges, deliberately dropped keys and the files allowed to
+  keep reading the label. It provides `cutover(batch)`, `label_report`, `drift_since_cutover()`, `rollback(batch)` and
+  `full_report()`. The CLI is `python -m graph_migration report|drift|rollback <batch> [--out file]`.
+- The freeze: `cutover` holds a Postgres advisory lock on its own connection, and `check_freeze` watches other
+  instances' heartbeats from the last 60 s for 15 s. A heartbeat that advances is a live instance, so cutover refuses
+  ("stop other instances, then restart"). One that stands still is a stopped process, as on a restart, and is
+  allowed. The evidence is stored in the label's report (`freeze`).
+- The bridge rows hold the whole report: before counts and checksums, after parity, the schema diff, edge counts,
+  `cutover_at` and `graph_checksum_at_cutover`. The engine upserts `bridge_state` itself, because `bridge.switch` inserts
+  with `ON CONFLICT DO NOTHING`, which can't switch back after a rollback.
+- `bootstrap.migrate_graph_batches()` runs after `migrate_documents()` and before the worker, poller and scheduler.
+- `GET /api/admin/migration` (admin, auditor) and the **System** page show the report. `/ready` adds
+  `graph_migration: drift` when a switched label's graph checksum has changed since its cutover.
+- `scripts/api_contract.py --capture|--check` records the shape of 24 read endpoints on a deterministic fixture
+  (`backend/tests_snapshots/api_contract.json`). `test_phase3` runs `--check`.
+- `test_phase3.py` proves the engine on a synthetic label (`P3Probe`): schema diff, read-path scan, freeze (a live
+  heartbeat, a stopped one, a held lock), refusal when not clean, cutover, idempotency, drift, the report, and a
+  rollback round trip that includes rows written after cutover.
 
-After this phase:
-1. **Every authoritative record lives in Postgres.** The graph holds only:
-   - **the projection:** `Employee`, `Item`, `Document` and `Owner` nodes and their edges, rebuilt from Postgres
-   - **the retrieval index:** `Policy`/`PolicyChunk`/`Chunk` with the vector index (still built from the approved policy files in `seed/policies/`)
-2. **The graph is a deliberate, rebuild-only read model.**
-   - `rebuild_graph()` rebuilds everything from Postgres and the policy files.
-   - `rebuild_graph(eid)` rebuilds one employee's subgraph, called in the same request as a write.
-   - There's no background sync, so drift can't build up unnoticed. Wiping the graph volume and running `rebuild_graph()` gives an identical graph, and a test proves it.
-3. **Graph writes for each label stop only after every read path for that label has switched.** Each label's PR includes a grep check showing zero remaining graph reads.
-4. **A one-off migration with a parity gate** moves the existing data. Row counts and checksums must match per label before the bridge switches.
+## The approved plan
 
-## Scope
-- Postgres tables for the labels listed above, except the retrieval index.
-- Moving `integrations/store.py`, `integrations/engine.py`, `integrations/delivery.py`, `integrations/service.py`, `connectors/*.py`, `connector_routes.py`, `integration_routes.py`, `evals.py`, `guardrails.py` and the `Event`/`Config`/`EmailTemplate`/`Owner` call sites onto `shared/db.py`.
-- Encrypting connector secrets at rest (`ConnectorInstance.secret` is plain text in the graph today).
-- `rebuild_graph()` covering the whole projection, a `GET /api/admin/graph/status` drift check, and an admin "Rebuild graph" action.
-- `backend/migrate_graph.py`, the one-off migration, with a parity report.
+### Context
+Phases 0 to 2 and the hardening work are merged, and CI is green on `main`. Employees, items, rule sets and documents live in Postgres. The graph still holds about 20 labels as authoritative records.
 
-## Non-goals
-- **Changing integration behaviour.** The setup steps, stages, mapping and log exclusions all stay the same. This is a storage move only. Any behaviour change found along the way is logged as an issue, not fixed here.
-- **Moving retrieval to pgvector.** `PolicyChunk` stays in FalkorDB's vector index. It's derived data rebuilt from files, not a record. Revisit only if the graph would otherwise be needed only for retrieval.
-- **Moving the Gmail poller and integration scheduler onto jobs.** That's Phase 4. This phase keeps `_scheduler()` and `gmail.poll_forever()` as they are and only changes where they read and write.
-- **Deleting graph data.** The old nodes stay until the phase exit criteria pass. Clean-up is `rebuild_graph()` with a full wipe, run as the last step.
+Phase 3 makes Postgres the only store of record. The graph becomes a rebuild-only read model:
+- the projection: `Employee`, `Item`, `Document`, `Owner` and their edges
+- the policy retrieval index: `PolicyChunk`
 
-## Design
+This also removes the last source-of-truth ambiguity.
 
-### Order of work
-Labels move in an order where every reader of a label has moved before its writers stop:
+The review approved the direction: Postgres authoritative, graph as projection plus index, rebuild as the recovery path, parity gates, an API snapshot, encrypted secrets. It called v1 "phase-ready, not ship-ready" and asked for these gates:
+- a migration freeze and a rollback drill
+- secret-key fail-fast and a rotation test
+- a wipe-and-restart rebuild test
+- runtime enforcement of the read model
+- an explicit API contract comparison
+- smaller batches, one migration report, and one cutover checklist
 
-| Batch | Labels | Readers to switch (non-exhaustive, from grep) |
-|---|---|---|
-| A: configuration | `Config`, `EmailTemplate`, `Owner` | `checklist.config()`/`category_owners()` (now reading the policy snapshot from Phase 1, but `Config` still feeds `main.rules()`), `gmail.render()`, `main.templates()`/`save_template()`, `ingest.py`, `integrations/service.py:61` |
-| B: activity | `Event`, `GuardrailEvent`, `EvalRun`, `EvalResult` | `graph.event()` (called from about 40 places, one function), `main.events()`, `employee_detail()` activity, `guardrails.py`, `evals.py`, `quality_routes.py` |
-| C: connectors | `Connector`, `ConnectorInstance`, `Record`, `CustomField`, `ImportRun`, `IntegrationRun` | `connectors/base.py`, `registry.instance()`/`get()`, `candidates.py`, `hr_portal.py` (`push_employee`, `instance_id_for`), `apps.py`, `sync.run()`/`runs()`, `seed.py`, `connector_routes.py` |
-| D: integrations | `Integration`, `IntegrationCandidate`, `WorkflowRun`, `IntegrationLogRecord`, `OutboundMessage`, `AgentMessage` | `integrations/store.py` (`get`, `all_integrations`, `_write`, `create`, `update`, `items`, `item`, `item_for_joiner`, `set_item`), `engine.py` (`_enroll`, `run_row`, run creation at about lines 318/343/389/416), `delivery.record()`/`messages()`, `service.py:28/33`, `integration_routes.py` (approvals, logs) |
+v2 builds all of them in.
 
-Within a batch, the 4 bridge steps run per label. Batches A and B are independent of each other. C must come before D because integrations read connector instances.
+### The fixed label inventory (the final gate checks this list)
 
-### `graph.event()`: one choke point
-`event()` is the most-called write in the codebase and has a single implementation (`graph.py:40`), so it switches in one line: `INSERT INTO events`. Dual-write is skipped for `Event` because it's append-only history:
-1. Backfill.
-2. Point `event()` at Postgres and the readers at Postgres in the **same** PR.
-3. Run parity on everything up to the backfill cut-off timestamp.
+| Label | Live rows | Target | Owner module (only writer after cutover) | Batch |
+|---|---|---|---|---|
+| Owner | 8 | `owners` table; graph `Owner` becomes a projection | `owners.py` | A1 |
+| EmailTemplate | 4 | `email_templates` | `templates.py` | A1 |
+| Config | 4 | removed: the rule-set version config already owns it | `policy/store.py` | A1 |
+| Policy | 7 | `policies` (uploads are authoritative) | `policies.py` | A2 |
+| PolicyChunk | 31 | stays in the graph: derived index, rebuilt from `policies` | `chat.index_policy` | A2 |
+| Rule (legacy) | 18 | removed: `import_requirements` writes rule-set versions | `ingest.py` → `policy/store.py` | A3 |
+| Event | 306 | `events` | `graph.event()` (choke point) | B |
+| GuardrailEvent | 1 | `guardrail_events` | `guardrails.record` | B |
+| EvalRun / EvalResult | 2 / 25 | `eval_runs` / `eval_results` | `evals.py` | B |
+| Connector | 7 | `connectors` (catalog) | `connectors/store.py` | C |
+| ConnectorInstance | 7 | `connector_instances` (+ `secret_enc`) | `connectors/store.py` | C |
+| Record | 20 | `connector_records` | `connectors/base.py` → `connectors/store.py` | C |
+| SYNCED_TO / FROM_CANDIDATE edges | 3 / 3 | `employee_record_links` | `connectors/store.py` | C |
+| CustomField / ImportRun | 0 / 1 | `custom_fields` / `import_runs` | `connectors/hr_portal.py`, `candidates.py` | C |
+| IntegrationRun (dead) | 3 | archived to `legacy_sync_runs` as JSON, code deleted (no callers) | none | C |
+| Integration / IntegrationCandidate | 3 / 0 | `integrations` / `integration_candidates` | `integrations/store.py` | D |
+| WorkflowRun / IntegrationLogRecord | 0 / 0 | `workflow_runs` / `integration_log_records` | `integrations/engine.py` | D |
+| OutboundMessage / AgentMessage | 0 / 34 | `outbound_messages` / `agent_messages` | `integrations/delivery.py` / `service.py` | D |
+| AuditLog (legacy) | 34 | removed: already imported into `audit_log` (Phase 0) | none | E |
 
-### Data shape: keep JSON where the code already uses JSON
-`integrations/store.py` deliberately keeps settings in one JSON `config` property ("a FalkorDB property can't hold null"), so Postgres uses a `jsonb config` column with the same contents. The store's `_load()`/`_write()` signatures stay the same, so `service.py`, `chat.py`, `agent.py` and `engine.py` see the same dicts. The same applies to `Record.values` and `IntegrationCandidate.document_results`.
+The known bypasses are closed in their batch:
+- `integrations/service.py:102`
+- `integrations/engine.py:196/314/320/391`
+- `integration_routes.py:393/403/408`
+- `connector_routes.py:34/53/66/101/131/142/159/161/180/210`
+- `hr_portal.py:103/123`
+- `main.py:434/441/450/521/526/533`
+- `chat.py:197/200`
 
-### Secrets
-- `connector_instances.secret_enc bytea`, encrypted with `cryptography.fernet.Fernet`. `cryptography` is already in `uv.lock` as a transitive dependency; it's declared explicitly in `pyproject.toml`. The key comes from `SECRETS_KEY`.
-- Bootstrap's config check (Phase 0) adds `SECRETS_KEY`, which is required when any connector has a saved secret.
-- `connector_routes._connection()` keeps returning only `secret_set` and `secret_hint`, and the plaintext never reaches the API.
-- Rotating the key: `uv run python -m connectors.rotate_key --old … --new …` re-encrypts the stored secrets in one transaction.
+**Guiding principle:** the graph is not the source of truth any more. It is a recoverable projection, and rebuilding it is the restore path.
 
-### Rebuild
-`graph.rebuild_graph(eid: str | None = None)`:
-- **For one employee (`eid` given):** run `MATCH (e:Employee {id:$e}) OPTIONAL MATCH (e)-[*1..2]-(n) WHERE n:Item OR n:Document DETACH DELETE e, n`, then recreate the employee's nodes and edges from Postgres: `HAS_ITEM`, `DEPENDS_ON`, `OWNED_BY→Owner`, `HAS_DOC`, `SUBMITTED`, `MISMATCH`, and `REPORTS_TO` (to an `Owner` or `Employee` by `manager_email`, the same logic as `ingest.py:97`). It runs in one Redis `MULTI` so readers never see half an employee.
-- **For everything (`eid=None`):**
-  1. Build into a scratch graph `hr_rebuild`.
-  2. Ingest the policy files into it with the existing `ingest` policy loader.
-  3. Run `ensure_indexes()` on it.
-  4. Atomically swap it in: `GRAPH.COPY hr_rebuild hr` after `GRAPH.DELETE hr`, or point `FALKORDB_GRAPH` at the new name, whichever the FalkorDB version supports. Check this when implementing; the fallback is building in place during a maintenance window. The live graph is never half-built.
-- **`graph_status()`:** compares node and edge counts per label, plus a checksum of the projection, against what Postgres says they should be. `GET /api/admin/graph/status` returns `{ok, labels: [{label, expected, actual}], checked_at}`. `/ready` (Phase 0) includes `graph: ok|drift|down`. Drift means `ready` reports **degraded**, not down: the graph is a read model, and the app's records are still correct.
-- **Reaction to drift:** a `graph.verify` job runs hourly (Phase 0 jobs, `run_at`). If it finds drift it rebuilds the affected employees automatically, and only opens an `ops` `work_queue` item if drift remains after the rebuild. This follows the operating principle: routine repair is automatic, and only a persistent fault reaches a human.
+### Delivery: one PR per batch, each with its own gate
+**PRs:** 0 (tooling) → A1 → A2 → A3 → B → C → D → E (read model and cleanup). Each batch PR merges only when its gate passes. Every item below is **required, not optional**:
+1. **The batch's section of the migration report is attached to the PR:** parity per label, plus the extras listed below.
+   - **Required artifact:** graph and Postgres counts and checksums from **before and after** the dev cutover, per label and per edge type. They're pasted into the PR body and saved in `docs/runbooks/phase-3-cutover.md`.
+   - **The freeze is a requirement, not a step.** The PR records that the cutover ran with no other instance live (the single-writer check passed) and before any worker started.
+   - **Live rollback drill on the dev stack, every batch:** cut over → write through the app → `graph_migration rollback <batch>` → parity → cut over again. Its output is attached, alongside the automated round-trip test.
+2. **A smoke test of the affected features passes on a fresh build.** The feature list per batch is in the cutover checklist.
+3. **The rollback drill for that batch passes** (see "Rollback").
+4. **The API contract check passes,** and a failing diff is printed key by key.
+5. **CI is green,** then the PR is merged, then the dev cutover is run and its report recorded in `docs/runbooks/phase-3-cutover.md`.
 
-## Schema
-Migrations continue after Phase 2's `008`. Every table keeps the graph ids as `text PRIMARY KEY`, so links in old audit rows and URLs keep working.
+### PR 0: Tooling (no storage moves)
+- **API contract snapshot:**
+  - `scripts/api_contract.py --capture | --check` records the recursive key structure (with types) of about 15 endpoints:
+    - connectors (list, detail, records, connection)
+    - integrations (list, detail, messages, logs)
+    - approvals, templates, quality, events
+    - employee detail and links, rules, policies
+  - Output is `backend/tests_snapshots/api_contract.json`.
+  - `--check` prints a diff (missing, added and retyped keys per endpoint) and exits 1 on any change. It runs in `test_phase3` and in CI.
+- **`backend/graph_migration.py`:** one engine for every batch. Each label has a spec: the graph read query, the target table, a row mapper, a canonical form, and its edges. It provides:
+  - `backfill(labels)`, idempotent (`ON CONFLICT DO UPDATE`).
+  - `report(labels)`, which writes **one** `migration_report.json` (sections per batch) holding, per label:
+    - graph and Postgres counts, both checksums
+    - first mismatching id, missing/extra ids (up to 20)
+    - a **schema diff:** graph property keys seen versus mapped columns; unmapped keys must be empty or listed as intentionally dropped
+    - **edge count** graph versus Postgres for the label's relationships
+    - a **read-path-switched** section: the guard scan for remaining `MATCH (:Label` in code, which must be 0
+    - the `cutover_at` timestamp and the `graph_checksum_at_cutover`
+  - `rollback(batch)`, described below.
+- **The cutover runs at startup** (`bootstrap.migrate_graph_batch`), like Phases 1 and 2, with an explicit freeze:
+  - It runs **before** the job worker, Gmail poller and scheduler start, and before the API serves anything. In this process nothing writes during cutover.
+  - **Single-writer check:** it takes a Postgres advisory lock and refuses to cut over if any other worker heartbeat is newer than 60 seconds, which means another replica is running. The message: "stop other instances, then restart".
+  - It switches the bridge only when parity passes. Otherwise the app refuses to start, and the graph stays the source with nothing written to Postgres reads.
+- **Diff since cutover:** the hourly `graph.verify` job (PR E), and `GET /api/admin/migration` from PR 0 onwards, recompute each migrated label's graph-side checksum and compare it with `graph_checksum_at_cutover`. Any change means something still writes the retired label: an `ops` work item opens and `/ready` reports `graph_migration: drift`.
+- **`/api/admin/migration`** (admin, auditor) and a System page with a Migration card: per label, source, parity, counts, cutover time and drift-since-cutover.
 
-**`backend/migrations/009_config_activity.sql`**
-```sql
-CREATE TABLE config (key text PRIMARY KEY, value jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());
+### Batches
+- **A1, config/owners/templates (migration 011):**
+  - Tables: `owners`, `email_templates`.
+  - New modules `owners.py` (`all`, `get`, `by_category`, `upsert`, `manager_for`) and `templates.py`.
+  - The 13 Owner sites and the template sites switch over.
+  - `checklist.config()`/`policy.store.ensure_active` drop the graph `Config` fallback (the rule-set config already owns it).
+  - Graph `Owner` nodes become projection (`records.project` MERGEs the owners it links to from Postgres).
+  - **Feature smoke:** dashboard and employee detail (manager shown, owners), template list/edit/preview email, manager scoping, rules page.
+- **A2, policy retrieval (migration 012):**
+  - Table: `policies`. `chat.index_policy` stores the text there and builds `PolicyChunk` from it, and the full rebuild re-indexes from it.
+  - `main.py:441/450` read the table.
+  - **Feature smoke:** an employee assistant question returns cited policy sections; the portal ack shows the policy text.
+- **A3, the import flow:**
+  - `ingest.import_requirements` creates v1 in Postgres on a fresh install, and opens a governed draft when an active version exists.
+  - It stops writing `Rule`/`Config` nodes; the legacy graph-rule reader in `ensure_active` is removed.
+  - **Feature smoke:** an upload on `/import` → a draft appears → preview.
+- **B, activity (migration 013):**
+  - Tables: `events` (no FK; indexed on (employee_id, ts) and ts), `guardrail_events`, `eval_runs`, `eval_results`.
+  - `graph.event()` becomes `INSERT`, so its 28 callers don't change. The 3 reads become SQL joins, with manager scoping kept.
+  - **Feature smoke:** the activity page, the employee timeline, quality guardrails, starting an eval run.
+- **C, connectors (migration 014):**
+  - Tables: `connectors`, `connector_instances` (+ `secret_enc`, `secret_key_id`), `connector_records`, `employee_record_links`, `custom_fields`, `import_runs`, `legacy_sync_runs`.
+  - `connectors/store.py` owns them. The `Connector` interface is unchanged, and `list_records` paginates in SQL.
+  - Secrets are covered below. `connectors/sync.run`/`runs` are deleted.
+  - **Feature smoke:**
+    - connectors list, records page, CSV import
+    - the connection form shows the hint only; test-connection works
+    - onboarding a candidate creates the `from_candidate` link
+    - the HR Portal sync creates `synced_to`
+- **D, integrations (migration 015):**
+  - Tables: `integrations` (unique on lower(name)), `integration_candidates` (UNIQUE (integration_id, record_id)), `workflow_runs`, `integration_log_records` (masked before the insert), `outbound_messages`, `agent_messages`.
+  - Store signatures and return dicts are unchanged: epoch floats; `None`/`""` exactly as before, checked by the contract.
+  - **Feature smoke:**
+    - admin creates an integration with the setup chat, approves the mapping, and runs it
+    - the logs show the run with exclusions masked
+    - a candidate reaches `documents_requested` with a simulated message
+    - the approval decision works
+- **E, the read model and cleanup:**
+  - `rebuild_graph`, `graph_status`, `graph.verify`, admin rebuild, runtime enforcement, removing the legacy `AuditLog`, and the one-time cleanup rebuild.
+  - Before the cleanup: `BGSAVE`, then a full rebuild, then a label scan that must show only the 5 read-model labels.
 
-CREATE TABLE email_templates (
-  id text PRIMARY KEY, name text NOT NULL, subject text NOT NULL, body text NOT NULL,
-  system boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now(), updated_by bigint REFERENCES users(id));
+### Runtime enforcement of the read model (not just a convention)
+1. **Static:** guard rule 8 refuses CREATE/MERGE/SET/DELETE of any label outside {Employee, Item, Document, Owner, PolicyChunk} anywhere in `backend/`. Projection labels may only be written in `records.py`, `documents/store.py` and the `graph.py` rebuild, and `PolicyChunk` only in `chat.py`. No `MATCH (:<retired label>` may remain anywhere, including in `scripts/` and tests (test setup moves to SQL helpers).
+2. **Runtime:** `graph.q()` refuses (raises `ReadModelViolation`) any write query that names a label outside the read model. It's a regex on CREATE/MERGE/SET targets, active from PR E; before that, it's active per migrated label as each batch lands.
+3. **Test:** `test_phase3` runs a write of each retired label through `q()` and expects the error, and the guard selftest has a bad snippet per rule.
+4. **Startup:** after the cleanup, bootstrap scans the graph's labels. If any are unexpected, `/ready` shows `graph_projection: drift (unexpected labels: …)` and `graph.verify` rebuilds.
 
-CREATE TABLE owners (
-  email text PRIMARY KEY, name text NOT NULL, type text NOT NULL,   -- 'owner:IT', 'manager', …
-  extra jsonb NOT NULL DEFAULT '{}');
+### Rebuild: proven recovery from a missing graph
+- **`rebuild_graph(eid=None)`:**
+  - The full rebuild sets `graph_state = rebuilding` (in Postgres), wipes the graph, projects every employee (with documents and owners), re-indexes `PolicyChunk` from `policies`, then sets `ready`.
+  - **While rebuilding, no partial projection is served.** The graph-backed readers return 503 `{"detail": "The relationship view is rebuilding; try again in a moment"}`. Those readers are `employee_graph` and policy retrieval in `chat.retrieve`; the assistant answers "policy search is rebuilding" rather than answering without sources. Records and every other page are unaffected.
+  - Per-employee projection stays in place and is small; it's the existing `records.project`.
+- **Bootstrap self-heals:** at startup, if the graph is empty or the label scan or status shows drift, it enqueues a full rebuild. The app serves records immediately, and graph-backed views return the "rebuilding" 503 until it's done.
+- **Wipe-and-restart drill:**
+  - Automated in `test_phase3`: wipe → bootstrap → the rebuild job → `graph_status().ok`, equal per-label counts and a projection checksum equal to before the wipe; `chat.retrieve("notice period")` returns chunks; the graph view of an employee matches.
+  - Also run by hand on the dev stack (stop, `GRAPH.DELETE hr`, start), recorded in the cutover runbook.
+- **Drift repair:** `graph.verify` runs hourly. It rebuilds the affected employees, and opens an `ops` item only if drift persists. A test forces the rebuild to fail and expects exactly one item.
 
-CREATE TABLE events (
-  id text PRIMARY KEY, employee_id text REFERENCES employees(id), kind text NOT NULL, message text NOT NULL,
-  ts timestamptz NOT NULL DEFAULT now());
-CREATE INDEX events_employee_ts ON events (employee_id, ts DESC);
-CREATE INDEX events_ts ON events (ts DESC);
+### Secrets at rest: key loss and rotation
+- **Storage:** `secret_enc` (Fernet) plus `secret_key_id` (the first 8 hex characters of sha256 of the key). The key comes from `SECRETS_KEY`, with an optional `SECRETS_KEY_PREVIOUS` for the rotation window, read with `MultiFernet`.
+- **Fail fast:**
+  - If any stored secret exists and `SECRETS_KEY` is unset in production, bootstrap exits with "connector secrets are stored; set SECRETS_KEY".
+  - If no configured key matches `secret_key_id`, bootstrap exits naming both fingerprints.
+  - Dev derives a key from a fixed dev salt, with a logged warning, and never in production.
+- **Behaviour without a usable key:** a connector call that needs the secret raises a clear `SecretUnavailable`. The connection test reports "secret can't be decrypted with the current key"; nothing crashes, and records stay readable.
+- **The rotation rule:**
+  1. Deploy with `SECRETS_KEY=new` and `SECRETS_KEY_PREVIOUS=old`.
+  2. Run `python -m connectors.rotate_key`, which re-encrypts every secret with the new key in one transaction and updates `secret_key_id`.
+  3. Remove `SECRETS_KEY_PREVIOUS`.
 
-CREATE TABLE guardrail_events (id text PRIMARY KEY, kind text NOT NULL, assistant text NOT NULL, detail jsonb NOT NULL DEFAULT '{}',
-  ts timestamptz NOT NULL DEFAULT now());
-CREATE TABLE eval_runs (id text PRIMARY KEY, status text NOT NULL, progress int NOT NULL DEFAULT 0, total int NOT NULL DEFAULT 0,
-  scores jsonb NOT NULL DEFAULT '{}', error text, started timestamptz NOT NULL DEFAULT now(), finished timestamptz);
-CREATE TABLE eval_results (id text PRIMARY KEY, run_id text NOT NULL REFERENCES eval_runs(id), question text NOT NULL,
-  answer text NOT NULL, scores jsonb NOT NULL DEFAULT '{}');
-```
+  After step 3, the old key can't decrypt anything, and the test asserts that. `_connection()` only ever returns `secret_set`/`secret_hint`.
+- **Tests:** plaintext never in `secret_enc`; a missing key → fail-fast; a wrong key → fail-fast naming the fingerprints; rotation → readable with the new key, unreadable with the old; a connector with an undecryptable secret gives a clear error.
+- A new ADR 0013 covers secrets at rest.
 
-**`backend/migrations/010_connectors.sql`**
-```sql
-CREATE TABLE connectors (key text PRIMARY KEY, name text NOT NULL, role text NOT NULL CHECK (role IN ('source','target','app')),
-  description text NOT NULL DEFAULT '', demo boolean NOT NULL DEFAULT true, extra jsonb NOT NULL DEFAULT '{}');
+### Rollback (drilled per batch)
+- **Before a batch's PR merges,** the batch's code is simply not deployed.
+- **After its cutover:**
+  1. `python -m graph_migration rollback <batch>` writes the Postgres rows (including any written since cutover) back to graph nodes and edges, using the same mapping in reverse.
+  2. It runs parity graph↔Postgres.
+  3. It resets the batch's `bridge_state` rows to `graph`.
+  4. Then the previous release is deployed.
+- **`test_phase3.test_rollback_round_trip`,** per batch: cut over → write new rows through the app → roll back → parity ok and the new rows are present in the graph → cut over again → parity ok. That proves no data is lost either way.
+- **After PR E's cleanup,** the rollback point is the `BGSAVE` snapshot plus the rollback tool. The runbook gives the exact commands.
 
-CREATE TABLE connector_instances (
-  id text PRIMARY KEY, key text NOT NULL REFERENCES connectors(key), name text NOT NULL,
-  connection jsonb NOT NULL DEFAULT '{}',          -- tenant, auth_type, username, configured_at, last_test
-  secret_enc bytea,                                -- Fernet(SECRETS_KEY); never returned by the API
-  created timestamptz NOT NULL DEFAULT now());
+### Tests (essential list)
+`test_phase3.py` on `azentio_test_p3` plus graph `test_phase3`:
+- parity per label, including the schema diff and edge counts; a Postgres-only edit fails exactly that label
+- the cutover refuses on a mismatch and while another worker heartbeat is live
+- the cutover is idempotent
+- diff-since-cutover catches a stray graph write
+- rollback round-trip per batch
+- read-model enforcement: the guard, the runtime `q()` error, and the startup label scan
+- wipe-and-restart rebuild, with policy retrieval and no partial serving (a 503 during rebuild)
+- per-employee rebuild, and drift auto-repair with one `ops` item on persistent failure
+- the event choke point
+- `_enroll` idempotent under two threads
+- log exclusions masked at rest
+- secrets: missing key, wrong key, rotation, undecryptable
+- both `import_requirements` paths
+- the API contract with no diff
 
-CREATE TABLE connector_records (
-  id text PRIMARY KEY, instance_id text NOT NULL REFERENCES connector_instances(id), kind text NOT NULL,
-  values jsonb NOT NULL, created timestamptz NOT NULL DEFAULT now(), updated timestamptz NOT NULL DEFAULT now());
-CREATE INDEX connector_records_instance ON connector_records (instance_id, created DESC);
-CREATE INDEX connector_records_email ON connector_records (instance_id, lower(values->>'email'));
+`test_core` moves its raw Cypher setup to SQL helpers, with assertions unchanged. CI adds `test_phase3`, `api_contract --check` and `SECRETS_KEY`.
 
-CREATE TABLE employee_sync (employee_id text REFERENCES employees(id), record_id text REFERENCES connector_records(id),
-  PRIMARY KEY (employee_id, record_id));        -- replaces (:Employee)-[:SYNCED_TO]->(:Record)
+### Docs
+- **`docs/runbooks/phase-3-cutover.md`:** the one cutover checklist. Per batch: pre-checks, freeze, cutover, report review, feature smoke, rollback commands, and sign-off, with the dev results filled in.
+- The phase-3 doc rewritten as built.
+- LLD: storage, data model, bridge, API, read model.
+- ADR 0006 updated, and the new ADR 0013 (secrets).
+- `.env.example`: `SECRETS_KEY`, `SECRETS_KEY_PREVIOUS`.
+- AGENTS.md / CLAUDE.md: the phase, rule 8, runtime enforcement, `test_phase3`.
 
-CREATE TABLE custom_fields (instance_id text REFERENCES connector_instances(id), key text, label text NOT NULL,
-  type text NOT NULL, required boolean NOT NULL DEFAULT false, created timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (instance_id, key));
-
-CREATE TABLE import_runs (id text PRIMARY KEY, instance_id text NOT NULL REFERENCES connector_instances(id), filename text NOT NULL,
-  counts jsonb NOT NULL DEFAULT '{}', errors jsonb NOT NULL DEFAULT '[]', ts timestamptz NOT NULL DEFAULT now(),
-  actor_id bigint REFERENCES users(id));
-
-CREATE TABLE sync_runs (                        -- graph label IntegrationRun (connectors/sync.py)
-  id text PRIMARY KEY, source_id text NOT NULL, target_id text NOT NULL, policy text NOT NULL,
-  counts jsonb NOT NULL DEFAULT '{}', rejected jsonb NOT NULL DEFAULT '[]', ts timestamptz NOT NULL DEFAULT now());
-```
-
-**`backend/migrations/011_integrations.sql`**
-```sql
-CREATE TABLE integrations (
-  id text PRIMARY KEY, name text NOT NULL,
-  status text NOT NULL CHECK (status IN ('draft','active','paused','archived')),
-  config jsonb NOT NULL DEFAULT '{}',              -- same contents as the graph's JSON `config` (store.DEFAULT_CONFIG keys)
-  next_run_at timestamptz, created timestamptz NOT NULL DEFAULT now(), updated timestamptz NOT NULL DEFAULT now());
-CREATE INDEX integrations_due ON integrations (next_run_at) WHERE status = 'active';
-
-CREATE TABLE integration_candidates (
-  id text PRIMARY KEY, integration_id text NOT NULL REFERENCES integrations(id),
-  record_id text NOT NULL REFERENCES connector_records(id), candidate_ref text NOT NULL DEFAULT '',
-  name text NOT NULL DEFAULT '', email text NOT NULL DEFAULT '',
-  stage text NOT NULL,                             -- store.STAGES
-  joiner_id text REFERENCES employees(id),
-  document_results jsonb NOT NULL DEFAULT '[]', document_attempts int NOT NULL DEFAULT 0,
-  extra jsonb NOT NULL DEFAULT '{}',
-  created timestamptz NOT NULL DEFAULT now(), updated timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (integration_id, record_id));             -- makes _enroll() idempotent at the DB level
-CREATE INDEX integration_candidates_stage ON integration_candidates (integration_id, stage);
-
-CREATE TABLE workflow_runs (
-  id text PRIMARY KEY, integration_id text NOT NULL REFERENCES integrations(id), trigger text NOT NULL,
-  status text NOT NULL, counts jsonb NOT NULL DEFAULT '{}', mapping_snapshot jsonb,
-  started timestamptz NOT NULL DEFAULT now(), finished timestamptz, extra jsonb NOT NULL DEFAULT '{}');
-CREATE INDEX workflow_runs_integration ON workflow_runs (integration_id, started DESC);
-
-CREATE TABLE integration_log_records (
-  id text PRIMARY KEY, run_id text NOT NULL REFERENCES workflow_runs(id), integration_id text NOT NULL,
-  record jsonb NOT NULL, actions jsonb NOT NULL DEFAULT '[]', ts timestamptz NOT NULL DEFAULT now());
-
-CREATE TABLE outbound_messages (
-  id text PRIMARY KEY, integration_id text, item_id text, kind text NOT NULL, "to" text NOT NULL, subject text NOT NULL,
-  content text NOT NULL, attempt int NOT NULL DEFAULT 1, delivered_by text NOT NULL, provider_ref text NOT NULL DEFAULT '',
-  candidate text NOT NULL DEFAULT '', ts timestamptz NOT NULL DEFAULT now());
-CREATE INDEX outbound_messages_integration ON outbound_messages (integration_id, ts DESC);
-
-CREATE TABLE agent_messages (id text PRIMARY KEY, integration_id text NOT NULL REFERENCES integrations(id),
-  role text NOT NULL, content jsonb NOT NULL, ts timestamptz NOT NULL DEFAULT now());
-CREATE INDEX agent_messages_integration ON agent_messages (integration_id, ts);
-```
-
-`integration_log_records.record` is stored **already masked**: `run_log.mask_record()` runs before the insert, as it does today, so log exclusions keep their guarantee that excluded values never land in storage.
-
-## API
-**No public endpoint changes shape.** The integration, connector, log, template and quality endpoints return the same JSON. Permissions (from `identity/perms.py`, unchanged from Phase 0):
-- `/api/connectors*` and `/api/integrations*`: admin, plus `hr_ops` for running an integration and handling candidates
-- logs: admin, hr_ops, auditor read
-
-New endpoints:
-
-| Method & path | Purpose | Roles |
-|---|---|---|
-| `GET /api/admin/graph/status` | Projection drift check | admin, auditor (read) |
-| `POST /api/admin/graph/rebuild` | `{employee_id?}`. Enqueues `graph.rebuild` (key `graph.rebuild:<eid or all>:<minute>`) and returns the job id | admin |
-| `GET /api/admin/migration/parity` | Per-label parity report from the last `migrate_graph.py` run, plus a live re-check | admin, auditor |
-
-## Screens
-- **Admin → System** (`frontend/app/(hr)/system/page.tsx`, admin and auditor; Phase 4 adds jobs and the dead-letter queue here):
-  - A **Graph read model** card: status badge (In sync / Drift / Down), the time of the last check, and a table of labels showing expected versus actual counts.
-  - A **Rebuild now** button (admin only) with confirmation and job progress.
-  - States: loading skeleton; "Graph unreachable, records are unaffected; relationship views and the assistant's policy search are unavailable" when it's down.
-- **A Migration card**, shown until Phase 3 is done: per-label rows with graph count, Postgres count, checksum match ✓/✕, `SOURCE` (graph/postgres), and whether graph writes have stopped. It's read-only, so the auditor can watch the cut-over.
-- **No changes to the Connectors, Integrations, Logs, Templates or Quality screens.** The smoke test is the proof that nothing changed.
-
-## File-by-file changes
-
-| File | Change |
-|---|---|
-| `backend/graph.py` | `event()` → `INSERT INTO events` (batch B). `q`/`q1` stay for the projection and retrieval. Adds `rebuild_graph(eid=None)`, `graph_status()`, and `@jobs.handler("graph.rebuild")`/`("graph.verify")`. `ensure_indexes()` is kept for `Employee`, `Item`, `Document`, `Owner` and `PolicyChunk`; the `Rule`/`Event` indexes are removed |
-| `backend/checklist.py` | `config()` reads `config` through `shared.db` (batch A); `category_owners()` reads `owners` |
-| `backend/gmail.py` | `render()` reads `email_templates`. `poll()` reads employee addresses through the bridge (already done in Phase 1) |
-| `backend/main.py` | `templates()`/`save_template()` → `email_templates`, recording `updated_by`. `events()` → the `events` table. `rules()` drops its `MATCH (o:Owner)` in favour of `owners`. `employee_graph()` still reads the graph (projection) |
-| `backend/ingest.py` | Seeding writes `config`, `owners` and `email_templates` to Postgres. The policy-file loader still writes `Policy`/`PolicyChunk`/`Chunk` to the graph, and `rebuild_graph()` calls it |
-| `backend/connectors/base.py` | Record storage (line ~69, `CREATE (r:Record …)-[:IN]->(i)`) → `connector_records`. The `Connector` interface (`list_records`, `get_record`, `upsert_record`, `schema`) is unchanged |
-| `backend/connectors/registry.py` | `instance()`/`get()` read `connector_instances` |
-| `backend/connectors/candidates.py` | `ImportRun` creation (line ~76) → `import_runs`, with `actor_id` |
-| `backend/connectors/hr_portal.py` | `CustomField` (line ~77) → `custom_fields`. `push_employee()` (`SYNCED_TO` at line ~123) → `employee_sync`. `instance_id_for()` → SQL |
-| `backend/connectors/apps.py`, `seed.py`, `sync.py` | Storage → SQL. `sync.run()`/`runs()` use `sync_runs` |
-| `backend/connector_routes.py` | `_connection()`/`put_connection()` read and write `connection` + `secret_enc` (Fernet). Other handlers keep their bodies and switch their storage helpers |
-| `backend/integrations/store.py` | `_load`/`_write`/`get`/`all_integrations`/`create`/`update`/`items`/`item`/`item_for_joiner`/`set_item` → SQL on `integrations` and `integration_candidates`, returning the same dicts. The module docstring is updated (the JSON-config reason now reads "kept for compatibility") |
-| `backend/integrations/engine.py` | `_enroll()` uses `INSERT … ON CONFLICT (integration_id, record_id) DO NOTHING`. Run rows → `workflow_runs`. Log rows → `integration_log_records` (masked before the insert) |
-| `backend/integrations/delivery.py` | `record()`/`messages()` → `outbound_messages` |
-| `backend/integrations/service.py` | `AgentMessage` (lines ~28/33) → `agent_messages`. The `Owner` and `ConnectorInstance` reads (lines ~61/65) → SQL |
-| `backend/integration_routes.py` | Logs (lines ~393/408) → SQL. `approvals()` is unchanged in shape |
-| `backend/guardrails.py`, `evals.py`, `quality_routes.py` | `GuardrailEvent`/`EvalRun`/`EvalResult` → SQL |
-| `backend/shared/bridge.py` | One `SOURCE` entry per label plus `parity()` checksums. After this phase every entry is `postgres`. The map then stays as a record of the migration. **Deleting the bridge is out of scope**; Phase 4 removes it once a release has gone out with everything on Postgres |
-| `backend/migrate_graph.py` | new. The one-off migration (below) |
-| `backend/connectors/rotate_key.py` | new. Re-encrypts connector secrets with a new key |
-| `backend/admin_routes.py` | new. The graph status/rebuild and migration parity endpoints |
-| `frontend/app/(hr)/system/page.tsx` | new. The System page (Graph + Migration cards) |
-| `frontend/components/app-shell.tsx` | adds a "System" nav item (min role admin; auditor read) |
-
-## Migration steps
-Each label follows the standard 4 steps. **The bridge may switch a label only once `parity(label).ok`.**
-
-1. **Dual-write.** For each label, every writer calls `bridge.write(label, …)`, which writes to Postgres and to the graph. Reads still go to the graph.
-2. **Backfill with the one-off migration.** `uv run python migrate_graph.py --labels Config,EmailTemplate,… [--dry-run]`:
-   - It's idempotent: `INSERT … ON CONFLICT (id) DO UPDATE`, ordered by dependency (connectors → instances → records → integrations → candidates → runs → log records → messages).
-   - Graph-only properties that aren't mapped go into `extra`. Their key names are listed in the report so nothing is dropped silently.
-   - Connector secrets are encrypted on the way in.
-   - It writes `migration_report.json`: per label, the graph count, Postgres count, both checksums, the first mismatching id, and the unmapped keys.
-   - An `audit.record(actor=system, action='migration.backfill', …)` row is written per label.
-3. **Parity, then switch reads.**
-   - The checksum is `sha256` over canonical JSON of the mapped columns, sorted by primary key. Timestamps are normalised to epoch seconds, since the graph stores floats; JSON strings in the graph are parsed so that `config`/`values`/`document_results` compare structurally.
-   - When `ok`, flip `SOURCE[label] = "postgres"` in its own PR, with the parity output pasted in.
-   - The same PR adds a check to `test_phase3.py` that greps `backend/` (excluding `graph.py`'s projection and `migrate_graph.py`) for any remaining `MATCH (x:<Label>` and requires zero hits. **No read path for the label may remain.**
-4. **Stop graph writes** for the label: remove the graph half of `bridge.write`.
-
-Clean-up after the last label:
-- Run `rebuild_graph()` (full, into the scratch graph, then swap). This deletes every old record node and leaves only the projection and the retrieval index.
-- `graph_status().ok` must be true.
-- Take a FalkorDB `BGSAVE` snapshot first, and keep it for 30 days as a rollback point.
-
-## Seed data
-No new demo data. Bootstrap seeding (`connectors/seed.py:seed_connectors`/`seed_apps`, `ingest.seed`) writes to Postgres from now on. Fresh installs never create record nodes in the graph and only build the projection.
-
-## Tests
-`backend/test_phase3.py` (plain asserts, `azentio_test` plus the `test` graph):
-
-| Check | Asserts |
-|---|---|
-| `test_no_graph_reads_left` | For every label in batches A–D, a grep of `backend/**/*.py` (excluding `graph.py`'s projection and rebuild code, `migrate_graph.py` and tests) finds no `MATCH (…:<Label>` and no `CREATE (…:<Label>` |
-| `test_rebuild_from_empty_is_identical` | `graph_status()` on the live test graph → delete the graph → `rebuild_graph()` → `graph_status().ok`; node and edge counts per label and the projection checksum equal the values from before the wipe |
-| `test_rebuild_one_employee` | Change one item's `depends` in Postgres → `rebuild_graph(eid)` → that employee's `DEPENDS_ON` edges match, and other employees' subgraphs are unchanged (their checksums are equal) |
-| `test_drift_autorepairs` | Delete one `HAS_ITEM` edge directly in the graph → the `graph.verify` job detects drift, rebuilds that employee, and opens no work item. With the rebuild patched to fail → exactly one `ops` work item |
-| `test_parity_per_label` | After `migrate_graph.py` on the seeded graph, every label in the report is `ok`. Changing one `connector_records.values` row → that label is `ok=False` with `first_mismatch_id` |
-| `test_migration_idempotent` | Running `migrate_graph.py` twice gives the same row counts and checksums |
-| `test_enroll_idempotent` | `engine._enroll()` twice for the same integration creates candidates once (unique constraint) |
-| `test_secret_encrypted` | After `put_connection`, `secret_enc` doesn't contain the plaintext bytes; `_connection()` returns only `secret_set`/`secret_hint`; `rotate_key` keeps the secret readable with the new key and unreadable with the old |
-| `test_log_exclusions_hold` | An integration excluding the `email` field → the stored `integration_log_records.record` has no email value (masked before the insert) |
-| `test_api_shapes_unchanged` | The JSON keys from `/api/integrations`, `/api/integrations/{id}`, `/api/connectors`, `/api/approvals`, `/api/logs/runs` and `/api/templates` equal a snapshot taken before this phase (`tests/snapshots/phase3_api_keys.json`) |
-| `test_event_choke_point` | `graph.event()` writes one `events` row and no graph node |
-| Earlier phase tests | `test_core.py`, `test_phase0.py`, `test_phase1.py` and `test_phase2.py` all still pass |
-
-**Smoke:**
-- `admin@` creates an integration from the seeded Candidate Portal to the HR Portal, approves the mapping, and clicks Run now. The run shows in Logs and the candidate reaches `documents_requested` with a simulated message.
-- System shows "In sync".
-
-## Exit criteria
-- `SOURCE` is `postgres` for every label; `test_no_graph_reads_left` passes.
-- After the clean-up rebuild, the graph contains only projection labels (`Employee`, `Item`, `Document`, `Owner`) and retrieval labels (`Policy`, `PolicyChunk`, `Chunk`). `graph_status().ok` is true.
-- Wiping the FalkorDB volume and restarting gives a working app. Bootstrap rebuilds the graph and no record is lost. This is checked manually once and covered by `test_rebuild_from_empty_is_identical`.
-- Connector secrets are encrypted at rest, and `SECRETS_KEY` is part of the bootstrap config check.
-- All phase tests and the smoke test pass. `migration_report.json` is attached to the phase PR. The LLD's storage section and ADR 0006 ("graph is a rebuild-only read model") match the code.
-
-## Risks & rollback
-| Risk | Mitigation |
-|---|---|
-| A missed read path still reads the graph after its writes stop | `test_no_graph_reads_left` greps for every label, and the switch PR must include it passing. Dual-write keeps the graph current until step 4 |
-| JSON-in-graph properties compare unequal because of formatting | The parity check parses JSON strings and compares structurally; timestamps are normalised |
-| `rebuild_graph()` on a large graph blocks readers | A full rebuild runs into a scratch graph and then swaps in; per-employee rebuilds are small and atomic (`MULTI`) |
-| FalkorDB doesn't support the atomic swap | Fall back to rebuilding in place during a short maintenance window, with `/ready` reporting `graph: rebuilding` (degraded) |
-| A lost `SECRETS_KEY` makes connector secrets unrecoverable | Bootstrap refuses to start without it once secrets exist; the key goes in the secret store; losing it only means re-entering the connector credentials, and no HR records are affected |
-| `Record.values` gets large (imported candidate files) | It's `jsonb`; the records list is paginated (`connector_records` endpoint, page_size 25) as it is today, and the email index covers the duplicate lookup |
-| **Rolling back the phase** | Per label before step 4: flip `SOURCE` back. After step 4: restore the FalkorDB snapshot taken before the clean-up rebuild, then flip `SOURCE` back. Postgres keeps every row either way, and nothing is deleted from Postgres by a rollback |
+### Go/no-go for the phase
+- Every label in the inventory is `postgres` (or removed), and its parity, schema diff and edge counts are clean in `migration_report.json`.
+- Zero retired-label reads or writes in code (guard), at runtime (`q()` refuses), and in the graph (label scan).
+- The wipe-and-restart drill passes automatically and by hand.
+- Rollback round-trips pass for every batch.
+- Secrets: fail-fast on a missing or wrong key, and the rotation test passes.
+- The API contract has no diff, and smoke passes for all roles and features.
+- CI is green on every batch PR and on `main`.

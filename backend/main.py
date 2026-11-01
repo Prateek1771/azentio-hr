@@ -570,12 +570,25 @@ def ready():
     except Exception:
         checks["worker"] = False
     body = {k: "ok" if v else "down" for k, v in checks.items()}
+    try:  # a retired label changed in the graph after cutover: something still writes it
+        import graph_migration
+        if checks["postgres"] and checks["graph"] and not all(d["ok"] for d in graph_migration.drift_since_cutover()):
+            body["graph_migration"] = "drift"
+    except Exception:
+        pass
     from llm import unavailable_reason
     why = unavailable_reason() if BASE_URL else "No AI provider configured"
     body["llm"] = "degraded" if why else "configured"  # informational: documents fall back to human review
     if why:
         body["llm_reason"] = why
     return JSONResponse(body, status_code=200 if all(checks.values()) else 503)
+
+
+@app.get("/api/admin/migration")
+def migration_report():
+    """Phase 3: per label, its source, parity, counts, cutover time and whether the graph changed since cutover."""
+    import graph_migration
+    return graph_migration.full_report()
 
 
 from identity.routes import router as identity_router  # noqa: E402

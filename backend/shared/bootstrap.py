@@ -111,6 +111,25 @@ def migrate_documents() -> dict:
     return report
 
 
+def migrate_graph_batches() -> dict:
+    """Phase 3: cut over every registered graph label batch not yet in Postgres. Runs before the job worker, Gmail
+    poller and scheduler start (the freeze); refuses to start on a live second instance or a parity failure."""
+    import graph_migration as gm
+    out = {}
+    for b in gm.batches():
+        if not gm.pending(b):
+            continue
+        if not graph_ok():
+            raise SystemExit(f"bootstrap: the graph is unreachable, so batch {b} can't be migrated yet. "
+                             "Start FalkorDB (`docker compose up -d falkordb`) and restart.")
+        try:
+            out[b] = gm.cutover(b)
+        except (gm.FreezeError, gm.bridge.ParityError) as e:
+            raise SystemExit(f"bootstrap: graph migration batch {b}: {e}. Nothing was switched.") from None
+        ls.log_event(_log, "graph_migration.cutover", batch=b, labels=len(out[b].get("labels", [])))
+    return out
+
+
 def graph_ok() -> bool:
     try:
         from graph import q
@@ -130,6 +149,7 @@ def run() -> dict:
     created = ensure_users()
     migrate_records()
     migrate_documents()
+    migrate_graph_batches()
     state = {"migrations": applied, "users_created": created, "audit_imported": imported, "graph": graph_ok()}
     ls.log_event(_log, "done", **{k: (len(v) if isinstance(v, list) else v) for k, v in state.items()})
     if created and not is_production():
