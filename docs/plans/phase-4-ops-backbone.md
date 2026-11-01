@@ -32,7 +32,7 @@ Alert evaluation and backups stay on Postgres jobs on purpose. They must keep wo
 - `gmail.send` has no deduplication. `POST /api/escalate` re-sends every overdue escalation on every click.
 - `pipeline.intake` calls `extract.extract` inline. If the LLM is down, the document gets confidence 0 and goes to Under Review, which is safe. But there's no retry once the LLM comes back, and no signal that it happened at scale.
 - `integrations.engine.run_due` claims by moving `next_run_at`, which is safe within one process but can't be seen or retried. `notify` swallows failures (`notify.failed`), and nothing follows up.
-- There are no alerts, no backups and no CI.
+- There are no alerts and no backups. (CI was built early, after Phase 1: see `docs/sdlc.md` §5.)
 
 ## Scope
 1. Job handlers for every external side effect, each with an idempotency key.
@@ -47,7 +47,7 @@ Alert evaluation and backups stay on Postgres jobs on purpose. They must keep wo
 10. Alerts: queue stall, poller stall, DLQ growth, workflow failures, Temporal unreachable, `/ready` failing. Sent by email and an optional webhook, deduplicated.
 11. Metrics endpoint and an ops dashboard card.
 12. Nightly `pg_dump` with retention, plus a restore runbook that has actually been tested.
-13. GitHub Actions CI: self-checks, type check, lint, build.
+13. ~~GitHub Actions CI~~: **done early** (after Phase 1). This phase only adds `test_phase4.py`, the Temporal replay test and the security-scan job to the existing `ci.yml`.
 
 ## Non-goals
 - No other queue or broker (Celery, Redis Streams, SQS). Postgres jobs handle the outbox and short tasks, and Temporal handles orchestration.
@@ -363,7 +363,7 @@ All entries are added to the Phase 0 `identity/perms.py` table. `/api/ops/*` def
 | `frontend/components/app-shell.tsx` | Ops nav item (admin and auditor), alert dot, Gmail status from `/ready`. |
 | `frontend/app/(hr)/employees/[id]/page.tsx` | Timeline shows outbox status. Upload shows "Processing…" until the document leaves `Submitted`, polling every 2 s and capped at 60 s, after which it reads "Still processing; you'll see it here when it's done". |
 | `frontend/app/portal/[token]/page.tsx` | Same async upload state for joiners: "Received. We're checking it now." |
-| `.github/workflows/ci.yml` (new) | See CI below. |
+| `.github/workflows/ci.yml` | Exists; see CI below for what this phase adds. |
 | `scripts/backup.sh`, `docs/runbooks/restore.md` (new) | See Backups below. |
 | `.env.example` | `ALERT_EMAILS`, `ALERT_WEBHOOK_URL`, `BACKUP_DIR`, `BACKUP_KEEP_DAILY=14`, `BACKUP_KEEP_WEEKLY=8`, `ORG_TIMEZONE`, `TEMPORAL_ADDRESS=localhost:7233`, `TEMPORAL_NAMESPACE=default`, `TEMPORAL_API_KEY` (Cloud), `TEMPORAL_TLS_CERT` and `TEMPORAL_TLS_KEY` (mTLS), `TEMPORAL_UI_URL=http://localhost:8233`, `TEMPORAL_WORKER_INPROCESS=true` (dev). |
 
@@ -385,18 +385,10 @@ All entries are added to the Phase 0 `identity/perms.py` table. `/api/ops/*` def
 - **Restore drill:** once a month, an admin clicks "Mark restore tested" on the Health screen after running the runbook against a scratch DB; this sets `backups.restore_tested_at`. The Health screen shows amber when the last tested restore is over 35 days old. This is the one routine human task in this phase, and it's deliberate: an untested backup isn't a backup.
 
 ## CI (`.github/workflows/ci.yml`)
-Runs on every PR and on push to `main`. Two jobs run in parallel:
-- **backend**
-  - Services: `postgres:17` and `falkordb/falkordb:latest`. No Temporal service: the workflow tests use `temporalio.testing.WorkflowEnvironment.start_time_skipping()`, which runs an in-process test server and skips through timers instantly.
-  - Steps: `astral-sh/setup-uv`, `uv sync --frozen`, then `uv run python test_core.py`, `uv run python test_phase0.py` … `test_phase4.py` (every `test_*.py` in `backend/`), then `uv run python -m compileall -q .` as a syntax gate.
-  - Env: `DATABASE_URL` pointing at the service DB `azentio_test`, and `FALKORDB_GRAPH=test`. LLM keys unset, so the tests exercise the keyless/unavailable paths, which is the point.
-- **frontend**
-  - Node 22, `npm ci`, `npx tsc --noEmit`, `npm run lint`, `npm run build` with `NEXT_PUBLIC_API_URL=""`.
-- **Gates:**
-  - A required status check on `main` (set in branch protection by the repo owner).
-  - `pip-audit` and `npm audit --omit=dev --audit-level=high` run as a third, non-blocking job that posts a summary. They become blocking once the current findings are triaged.
-
-The headless-Chrome smoke script (`scripts/smoke.py`) is **not** in CI this phase: it needs a full stack with seeded data. It runs locally before each phase merge, as the definition of done requires. Add it to CI when a compose-based CI job is worth its run time.
+**Already built** after Phase 1 (lint, boundary guard, all backend suites, frontend checks, the UI smoke test against a production build, and GHCR images; see `docs/sdlc.md` §5). Phase 4 adds:
+- `test_phase4.py` to the `backend` job. The workflow tests use `temporalio.testing.WorkflowEnvironment.start_time_skipping()`, so CI needs no Temporal service.
+- The `Replayer` test over recorded workflow histories.
+- `pip-audit` and `npm audit --omit=dev --audit-level=high` as a non-blocking job that posts a summary; blocking once current findings are triaged.
 
 ## Migration steps
 1. Apply migrations 020–025. They're additive, and the old code paths still work.

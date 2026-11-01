@@ -370,7 +370,7 @@ Bootstrap creates it if missing, and it's safe to re-run.
 |---|---|
 | A publish replay fails halfway through | The batch transactions are idempotent: re-running `plan_diff` against current state produces no further changes. The version only flips to `active` after the last batch. A dead job opens an `ops` exception |
 | The preview drifts from what publishing actually does | Both call the same `plan_diff`, and `test_preview_matches_publish` guards it |
-| One open draft at a time slows HR down | This is deliberate: two drafts editing the same set would need merging. Revisit if HR asks for parallel drafts |
+| One open draft at a time slows HR down | **Deliberate limit**: two drafts editing the same set would need merging. The 409 says so. Revisit if HR asks for parallel drafts |
 | The near-start gate holds up a legally required change | The exception's `sla_due` is the day before joining, so HR Ops sees it in time. "Apply" is one click. The same Phase 6 escalation ladder applies |
 | The graph projection goes stale | It's rebuilt in the same request as every write; `rebuild_graph()` for everything is the repair; `test_rebuild_graph_matches` covers it |
 | The backfill misses graph-only properties | Unmapped properties land in `extra`, and the parity checksum covers the mapped columns. Review the backfill report's list of `extra` keys before switching |

@@ -1,5 +1,7 @@
 # Azentio Onboard: AI HR Onboarding Agent
 
+[![CI](https://github.com/Prateek1771/azentio-hr/actions/workflows/ci.yml/badge.svg)](https://github.com/Prateek1771/azentio-hr/actions/workflows/ci.yml)
+
 This app coordinates a new joiner's onboarding from offer to day one:
 - It works out which documents and tasks apply to each person, and records why.
 - It emails requests through Gmail, reads the replies, and checks each attachment with a vision LLM.

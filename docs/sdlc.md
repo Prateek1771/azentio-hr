@@ -96,9 +96,18 @@ Rules:
 - **LLM-dependent tests use recorded responses or fakes.** Live model calls belong in the eval suite, not unit tests, so CI is fast and free.
 - **Eval gate:** a PR that lowers faithfulness or context recall by more than 5 points, or lets any attack prompt through, fails.
 
-## 5. CI/CD pipeline (gap: planned for Phase 4 as GitHub Actions)
+## 5. CI/CD pipeline (built)
 
-Until CI exists, the checks in §4 are run by hand before each commit. Phase 4 runs them in GitHub Actions with Postgres and FalkorDB service containers, plus Temporal workflow replay tests once workflows exist.
+`.github/workflows/ci.yml` runs on every pull request and every push to `main`. A newer push cancels the older run.
+
+| Job | What it checks |
+|---|---|
+| `backend` | `ruff check` (rules `F` + `E9`: undefined names, unused imports, syntax), the boundary guard (`scripts/check_boundaries.py --selftest`, then a real run), `test_core.py`, `test_phase0.py`, `test_phase1.py`. Postgres 17 and FalkorDB run as service containers |
+| `frontend` | `tsc --noEmit`, `eslint app components` |
+| `smoke` | After both: backend with the dev seed, `next build` + `next start` (a production build, never dev mode), then `scripts/smoke.py` for every role, the policy flow and rollback. Screenshots and logs are uploaded as an artifact |
+| `images` | After all three: builds `backend/Dockerfile` and `frontend/Dockerfile`. Pushes `ghcr.io/prateek1771/azentio-hr-{backend,frontend}:{sha,latest}` **only on a push to `main`**; on PRs it only builds, so a broken Dockerfile fails the PR |
+
+CI has no secrets: `LLM_LOCAL_FALLBACK=0` and `LLM_KEYLESS_FALLBACK=0`, no Gmail credentials, so nothing calls a model or sends mail. Deployment is deliberately not automated yet. The diagram below is the target pipeline; security scans, evals in CI, staging and canary are still to come.
 
 ```mermaid
 flowchart LR
@@ -178,13 +187,11 @@ Every SEV1 or SEV2 action item that changes a boundary gets an ADR.
 
 | # | Gap | Effort |
 |---|---|---|
-Done: `.pyc` files untracked; tests use throwaway databases and graphs; a UI smoke test covers every role.
+Done: `.pyc` files untracked; tests use throwaway databases and graphs; a UI smoke test covers every role; GitHub Actions runs lint, the boundary guard, every test suite and the smoke test against a production build, and publishes images to GHCR (§5).
 
 | # | Gap | When |
 |---|---|---|
-| 1 | GitHub Actions: tsc, eslint, `test_core.py`, `test_phaseN.py` with Postgres and FalkorDB service containers | Phase 4 |
 | 2 | Security scans in CI (pip-audit, npm audit, gitleaks) | Phase 4 |
 | 3 | Nightly `pg_dump` and a tested restore runbook | Phase 4 |
 | 4 | Extraction gold set (about 20 sample documents with expected fields) in the eval suite | Phase 2 |
-| 5 | Run `scripts/smoke.py` in CI against a built stack | Phase 4 |
 | 6 | Staging environment with a paid LLM and a test Gmail mailbox | Before the P1 pilot |
