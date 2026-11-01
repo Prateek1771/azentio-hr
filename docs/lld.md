@@ -218,9 +218,9 @@ Two stores. Postgres is the system of record for everything built in Phases 0 to
 | `item_notices` (Phase 1) | `employee_id, version_id (PK together), sent_at` | One "new requirements" notice per joiner per published version |
 | `documents` (Phase 2) | `id, employee_id, item_id (NULL = not on the checklist), filename, path, mime, size, sha256, source, status (Submitted, Under Review, Accepted, Correction Requested, Rejected), doc_type, tier, confidence, extracted, issues, checks (jsonb), model, prompt_version, policy_version_id, current_decision_id, received_at, decided_at, extra` | Documents. `status` is the result of the current decision, never set on its own |
 | `document_mismatches` (Phase 2) | `document_id, field (PK together), expected, found` | Replaces the graph's `MISMATCH` edges |
-| `doc_decisions` (Phase 2) | `id, document_id, kind (auto_accept, auto_correction, routed_review, human_accept, human_reject, human_correction, human_override, spot_check_pass, spot_check_fail, backfill), decided_by (NULL = system), reason_code, reason_text, status_after, model, prompt_version, confidence, tier, threshold, policy_version_id, checks, extracted, corrected_fields, work_item_id, idempotency_key (unique), at` | Append-only decision history with provenance. Triggers refuse UPDATE/DELETE and any `auto_accept` of a `high` tier. Human and spot-check rows need a user and a reason (CHECK) |
+| `doc_decisions` (Phase 2) | `id, document_id, kind (auto_accept, auto_correction, routed_review, human_accept, human_reject, human_correction, human_override, spot_check_pass, spot_check_fail, backfill, demo_seed), decided_by (NULL = system), reason_code, reason_text, status_after, model, prompt_version, confidence, tier, threshold, policy_version_id, checks, extracted, corrected_fields, work_item_id, idempotency_key (unique), at` | Append-only decision history with provenance. Triggers refuse UPDATE/DELETE and any `auto_accept` of a `high` tier. Human and spot-check rows need a user and a reason (CHECK) |
 
-`rule_set_versions.config.doc_policy` (Phase 2) holds the document tiers and thresholds; a trigger freezes `config` once a version leaves draft. **Planned:** connectors, integrations and runs (Phase 3). Schemas are in the [phase plans](plans/).
+On `items`, trigger `items_status_from_document` (migration 010) refuses a document item status that no document of that item backs: only `Not Submitted`, `Cancelled`, or `doc_item_status(document.status)` of one of its documents is allowed (the one-time graph backfill sets `azentio.backfill` to copy history). `rule_set_versions.config.doc_policy` (Phase 2) holds the document tiers and thresholds; a trigger freezes `config` once a version leaves draft. **Planned:** connectors, integrations and runs (Phase 3). Schemas are in the [phase plans](plans/).
 
 ### 4.2 FalkorDB graph `hr`
 
@@ -351,7 +351,7 @@ sequenceDiagram
     BE->>G: doc.after_decision job: projection, recompute(), feed, integrations
 ```
 
-Every state change above writes one `doc_decisions` row and derives the item status from it (`documents.service.item_status_for`), in one transaction with the follow-up jobs. The routing table, in order (first match wins, `documents/route.py`):
+Every state change above writes one `doc_decisions` row and derives the item status from it (`documents.service.item_status_for`), in one transaction with the follow-up jobs. The database enforces the derivation (trigger `items_status_from_document`), so no other code path can set a document item's status. The routing table, in order (first match wins, `documents/route.py`):
 
 | Condition | Status | Decision kind / reason | Human? |
 |---|---|---|---|

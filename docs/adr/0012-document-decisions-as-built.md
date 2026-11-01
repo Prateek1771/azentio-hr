@@ -26,6 +26,7 @@ Three decisions remained open:
    - `doc_decisions` is append-only: a trigger refuses UPDATE and DELETE.
    - `documents.current_decision_id` points at the one active decision, and `documents.status` is that decision's result.
    - A document item's status is derived from it through `documents.service.item_status_for` and is never set directly; `POST /api/items/{id}/status` returns 409 for document items.
+   - **Hardening (migration 010):** the database enforces the derivation too. Trigger `items_status_from_document` lets a document item change status only to `Not Submitted`, `Cancelled`, or a status some document of that item maps to (`doc_item_status` mirrors `item_status_for`). Demo data is recorded as decision kind `demo_seed` through `documents.seed.accept_for_demo`, never as an AI or human decision, and is excluded from metrics.
    - Every write locks the document and checks the state it expects. An idempotency key on each decision (`doc.extract:<id>:route`, or the client's `decision_key`) turns a retry or a double click into a no-op.
 4. **The AI's role ends at evidence.**
    - `extract` returns facts and a confidence score, and `validate.evaluate` returns checks; neither returns a status.

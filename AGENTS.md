@@ -70,6 +70,7 @@ cd backend && uv run python test_phase2.py    # document routing, provenance, re
 4. `work_queue.open_item` uses a kind not registered in `work_queue.KINDS`.
 5. Code updates, deletes or truncates `audit_log`, or disables its trigger (tests excepted).
 6. Something writes `Document` nodes or their `HAS_DOC` / `SUBMITTED` / `MISMATCH` edges to the graph outside `documents/store.py`.
+7. Something bulk-sets a document item status (`set_items_status` with a `"document"` key) outside `documents/`.
 
 ## Where things live
 | Path | Owns |
@@ -107,7 +108,7 @@ cd backend && uv run python test_phase2.py    # document routing, provenance, re
   - Anything that waits on people or timers becomes a Temporal workflow from Phase 4.
   - Always enqueue inside the transaction of the change that caused it.
 - **Employees and items only through `records.py`; documents only through `documents/store.py`.** Never write `Employee`/`Item`/`Document` or document edges with Cypher; the graph is a projection refreshed by `records.project`.
-- **AI perceives; policy decides** ([ADR 0012](docs/adr/0012-document-decisions-as-built.md)). Document outcomes come only from `documents.route.decide` and recorded `doc_decisions` rows; item status for a document item is derived (`item_status_for`), never set. `ALWAYS_HIGH` types are never auto-accepted (code + DB trigger).
+- **AI perceives; policy decides** ([ADR 0012](docs/adr/0012-document-decisions-as-built.md)). Document outcomes come only from `documents.route.decide` and recorded `doc_decisions` rows; item status for a document item is derived (`item_status_for`), never set, and the database enforces it (trigger `items_status_from_document`). Demo/test data uses `documents.seed.accept_for_demo`. `ALWAYS_HIGH` types are never auto-accepted (code + DB trigger).
 - **Rules change only by publishing a version** (`policy/`). Replay never deletes an item: not-started items are cancelled, done items or items with documents are kept as evidence.
 - **One open draft at a time is a deliberate limit**, not a bug: two drafts of the same rule set would need merging. Revisit only if HR asks for parallel drafts.
 - **Every `work_queue` kind is a contract** in `work_queue.KINDS`: an SLA, an escalation role and resolution steps. Register a kind before opening items of it.
