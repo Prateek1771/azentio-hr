@@ -20,6 +20,12 @@ KINDS: dict[str, dict] = {
     "policy.approval": {"sla": timedelta(days=2), "escalate_to": "admin",
                         "steps": "Review the rule diff and its impact preview, then approve or reject with a reason. "
                                  "Compliance changes need a second approver."},
+    "doc.review": {"sla": "caller", "escalate_to": "admin",
+                   "steps": "Compare the document with the extracted fields and the profile, then accept, request a "
+                            "correction or reject, with a reason. High-risk documents need an approver."},
+    "doc.spot_check": {"sla": timedelta(days=5), "escalate_to": "admin",
+                       "steps": "Check an automatically accepted document against the original: mark it correct, or wrong "
+                                "with a reason (it goes back to review and counts against AI precision)."},
     "policy.near_start": {"sla": "caller", "escalate_to": "admin",
                           "steps": "Check whether the joiner can still meet the new requirements before day one, then apply "
                                    "the change or skip it, with a reason."},

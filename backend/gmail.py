@@ -135,7 +135,7 @@ async def poll() -> int:
         eid = emp["id"]
         event(eid, "email", f"Reply received from {m['from']} with {len(m['attachments'])} attachment(s) — running verification")
         for filename, mime, data in m["attachments"]:
-            await pipeline.intake(eid, filename, data, mime, "email", notify=send_correction)
+            await pipeline.intake(eid, filename, data, mime, "email")
             processed += 1
     return processed
 

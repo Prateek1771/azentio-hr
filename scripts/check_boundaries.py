@@ -30,6 +30,7 @@ ROLE_ALLOWLIST = {
     "backend/main.py": 1,          # _visible: managers see only their own reports
     "backend/work_queue.py": 2,    # admins/auditors see every item; only the assignee role (or admin) resolves
     "backend/policy/store.py": 1,  # only the author or an admin may discard a draft
+    "backend/documents/service.py": 1,  # can_decide: hr_ops may decide only low-tier documents (the tier is data)
 }
 
 

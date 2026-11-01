@@ -465,8 +465,7 @@ def portal(token: str):
 async def portal_upload(token: str, file: UploadFile = File(...), item_key: str = Form("")):
     e = emp_by_token(token)
     data = await file.read()
-    notify = gmail.send_correction if gmail.configured() else None
-    return await pipeline.intake(e["id"], file.filename, data, file.content_type, "portal", item_key or None, notify=notify)
+    return await pipeline.intake(e["id"], file.filename, data, file.content_type, "portal", item_key or None)
 
 
 @app.post("/api/portal/{token}/ack/{item_id}")
@@ -584,6 +583,7 @@ from identity.routes import router as identity_router  # noqa: E402
 import work_queue  # noqa: E402
 from policy.routes import router as policy_router  # noqa: E402
 import policy.service  # noqa: E402,F401  (registers policy.publish / notify.item_added job handlers)
+import documents.service  # noqa: E402,F401  (registers doc.extract / doc.after_decision / notify.correction handlers)
 
 app.include_router(identity_router)
 app.include_router(work_queue.router)

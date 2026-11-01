@@ -6,7 +6,6 @@ from difflib import SequenceMatcher
 
 ALLOWED_MIME = {"application/pdf", "image/jpeg", "image/png", "image/webp"}
 MAX_BYTES = 10 * 1024 * 1024
-LOW_CONFIDENCE = 0.6
 
 
 def norm_name(s: str) -> str:
@@ -44,29 +43,37 @@ def check_file(mime: str, size: int) -> list[str]:
 
 
 def evaluate(ex: dict, emp: dict, doc_type: dict) -> dict:
-    """ex: extraction dict. Returns {status, issues[], mismatches[]}."""
-    issues, mismatches = [], []
-    if not ex.get("legible", True):
+    """Deterministic checks on an extraction. Returns {issues[], mismatches[], checks[{name, ok, detail}]}.
+    It never decides a status: documents.route.decide() does, from these checks plus the governed tier and threshold."""
+    issues, mismatches, checks = [], [], []
+
+    def check(name, ok, detail=""):
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    legible = ex.get("legible", True)
+    check("legible", legible, "" if legible else "illegible or cut off")
+    if not legible:
         issues.append("The document is illegible or cut off. Please send a clear scan with all corners visible.")
     for f in doc_type.get("fields", []):
+        check(f"has_{f}", ex.get(f), "" if ex.get(f) else "not found")
         if not ex.get(f):
             issues.append(f"Could not find the {f.replace('_', ' ')} on the document.")
-    if ex.get("full_name") and not names_match(ex["full_name"], emp["name"]):
-        mismatches.append({"field": "name", "expected": emp["name"], "found": ex["full_name"]})
-        issues.append(f"Name on document ('{ex['full_name']}') does not match your profile ('{emp['name']}').")
+    if ex.get("full_name"):
+        ok = names_match(ex["full_name"], emp["name"])
+        check("name_matches_profile", ok, "" if ok else f"'{ex['full_name']}' vs profile '{emp['name']}'")
+        if not ok:
+            mismatches.append({"field": "name", "expected": emp["name"], "found": ex["full_name"]})
+            issues.append(f"Name on document ('{ex['full_name']}') does not match your profile ('{emp['name']}').")
     dob_doc, dob_emp = parse_date(ex.get("date_of_birth")), parse_date(emp.get("date_of_birth"))
-    if dob_doc and dob_emp and dob_doc != dob_emp:
-        mismatches.append({"field": "date_of_birth", "expected": dob_emp.isoformat(), "found": dob_doc.isoformat()})
-        issues.append(f"Date of birth on document ({dob_doc}) does not match your profile ({dob_emp}).")
+    if dob_doc and dob_emp:
+        check("dob_matches_profile", dob_doc == dob_emp, "" if dob_doc == dob_emp else f"{dob_doc} vs profile {dob_emp}")
+        if dob_doc != dob_emp:
+            mismatches.append({"field": "date_of_birth", "expected": dob_emp.isoformat(), "found": dob_doc.isoformat()})
+            issues.append(f"Date of birth on document ({dob_doc}) does not match your profile ({dob_emp}).")
     exp = parse_date(ex.get("expiry_date"))
     joining = parse_date(emp.get("joining_date")) or date.today()
-    if doc_type.get("expires") and exp and exp < joining:
-        issues.append(f"The document expired on {exp} (before your joining date {joining}). Please send a valid one.")
-
-    if issues:
-        status = "Correction Requested"
-    elif float(ex.get("confidence", 1)) < LOW_CONFIDENCE:
-        status = "Under Review"
-    else:
-        status = "Accepted"
-    return {"status": status, "issues": issues, "mismatches": mismatches}
+    if doc_type.get("expires") and exp:
+        check("valid_on_joining_date", exp >= joining, f"expires {exp}, joining {joining}")
+        if exp < joining:
+            issues.append(f"The document expired on {exp} (before your joining date {joining}). Please send a valid one.")
+    return {"issues": issues, "mismatches": mismatches, "checks": checks}
