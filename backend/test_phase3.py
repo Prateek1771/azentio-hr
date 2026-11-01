@@ -87,6 +87,13 @@ check("schema_diff_dropped_keys_are_listed_not_unmapped", rep["unmapped_keys"] =
 q("MATCH (n:P3Probe {id:'p0'}) SET n.surprise = 1")
 check("schema_diff_catches_unmapped_key", gm.label_report(spec)["unmapped_keys"] == ["surprise"])
 q("MATCH (n:P3Probe {id:'p0'}) REMOVE n.surprise")
+rx = gm.label_rx("P3Scan")
+SCAN = {'MATCH (o:P3Scan) RETURN o': True, 'MATCH (:P3Scan {id:$i})': True, 'MATCH (e)-[:X]->(o:P3Scan)': True,
+        '-[:SCANNED_BY]->(o:P3Scan) RETURN o': True, 'MATCH (o) WHERE o:P3Scan': True, 'match (o) where o:P3Scan': True,
+        'MATCH (o:Person:P3Scan)': True, 'MERGE (o:P3Scan {id:$i})': True, 'MATCH (o:P3ScanHistory)': False,
+        'def f(o: P3Scan) -> P3Scan:': False, 'MATCH ()-[r:P3Scan]->()': False, 'MATCH (o:p3scan)': False}
+wrong = {s: w for s, w in SCAN.items() if bool(rx.search(s)) != w}
+check("read_path_scan_patterns", not wrong, wrong)
 check("read_path_scan_allows_listed_files", gm.read_paths("P3Probe", (ME,)) == [])
 check("read_path_scan_finds_graph_reads", any(h.startswith(ME) for h in gm.read_paths("P3Probe")))
 
@@ -158,7 +165,15 @@ check("migration_report_admin_and_auditor_only", perms.allowed("GET", "/api/admi
 # ---------- rollback round trip ----------
 db.execute("INSERT INTO p3_probe (id, name, n, created_at, meta) VALUES ('p9', 'written after cutover', 9, now(), '{}')")
 db.execute("UPDATE p3_probe SET name='edited after cutover' WHERE id='p2'")
-rb = gm.rollback("probe")
+jobs.heartbeat("live-app:7")
+stop.clear()
+t = threading.Thread(target=lambda: [jobs.heartbeat("live-app:7") or time.sleep(0.2) for _ in range(8)], daemon=True)
+t.start()
+err = raises(lambda: gm.rollback("probe", watch=1.5), gm.FreezeError)
+t.join()
+check("rollback_refuses_while_the_app_is_live", err and "live-app:7" in err
+      and gm._state("P3Probe")["source"] == "postgres", err)
+rb = gm.rollback("probe", watch=0)
 g = {x["n"]["id"]: x["n"] for x in q("MATCH (n:P3Probe) RETURN n")}
 check("rollback_writes_postgres_rows_back", "p9" in g and g["p2"]["name"] == "edited after cutover"
       and rb["labels"][0]["ok"], rb)

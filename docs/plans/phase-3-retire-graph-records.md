@@ -22,9 +22,14 @@
   `graph_migration: drift` when a switched label's graph checksum has changed since its cutover.
 - `scripts/api_contract.py --capture|--check` records the shape of 24 read endpoints on a deterministic fixture
   (`backend/tests_snapshots/api_contract.json`). `test_phase3` runs `--check`.
+- The read-path scan matches any node pattern naming the label (`(x:A:Label`, also on continuation lines of a multi-line
+  query, reads and writes) and label tests after `WHERE`/`AND`/`OR`/`NOT`. It ignores type hints and edge types. It can't see
+  a label built at runtime (`f"(n:{label})"`); the runtime `graph.q()` check (PR E) covers that.
+- `rollback` takes the same lock and freeze check as `cutover`: it refuses while any instance is live, because a running
+  app would keep writing to Postgres after the switch back.
 - `test_phase3.py` proves the engine on a synthetic label (`P3Probe`): schema diff, read-path scan, freeze (a live
   heartbeat, a stopped one, a held lock), refusal when not clean, cutover, idempotency, drift, the report, and a
-  rollback round trip that includes rows written after cutover.
+  rollback round trip that includes rows written after cutover, and refusal to roll back while the app is live.
 
 ## The approved plan
 
