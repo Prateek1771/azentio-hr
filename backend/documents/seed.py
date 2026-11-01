@@ -50,7 +50,7 @@ def accept_for_demo(eid: str, key: str, conn=None) -> str | None:
     def write(c):
         store.insert({"id": doc_id, "employee_id": eid, "item_id": item["id"], "filename": f"demo_{key}.png", "path": str(path),
                       "mime": "image/png", "size": len(data), "source": "portal", "status": "Submitted", "doc_type": key,
-                      "seed": "demo"}, c)
+                      "seed": "demo_progress"}, c)
         store.add_decision({"document_id": doc_id, "kind": "demo_seed", "reason_code": "demo_seed", "status_after": "Accepted",
                             "reason_text": "Sample data so the demo shows progress; not a real check",
                             "idempotency_key": f"demo_seed:{doc_id}"}, c)
