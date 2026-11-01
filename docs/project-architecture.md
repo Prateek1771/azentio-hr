@@ -1,13 +1,27 @@
 # Azentio Onboard: Project Architecture
 
-Part of the [design docs](README.md). This covers how the code is organised today, the layering rules we follow, and the modular structure we're moving to. Module-by-module detail is in the [LLD](lld.md#32-backend-modules).
+Part of the [design docs](README.md). This covers how the code is organised today, the boundary rules we enforce, and the modular structure we're moving to. Module-by-module detail is in the [LLD](lld.md#32-backend-modules); the phase plan is in the [hardening design](plans/2026-11-01-hardening-design.md).
+
+Parts are labelled **Built** (on `main`) or **Planned (Phase N)**.
 
 ## 1. Repository layout today
 
 ```
 azentio-hr/
+├── AGENTS.md · CLAUDE.md        brief for coding agents (kept current with every structural change)
 ├── backend/                     FastAPI app (Python 3.12, uv)
-│   ├── main.py                  app setup, lifespan, onboarding/portal/rules/template routes
+│   ├── main.py                  app setup, lifespan, auth middleware, manager scoping, /health, /ready,
+│   │                            onboarding/portal/rules/template routes
+│   ├── shared/                  Built (Phase 0): cross-cutting foundation
+│   │   ├── db.py                Postgres pool, tx(), fetch/fetch1/execute, migrate(), use_test_database()
+│   │   ├── jobs.py              transactional outbox + short-task queue (enqueue, @handler, worker)
+│   │   ├── bridge.py            which store each migrating record type is read from; parity gate
+│   │   └── bootstrap.py         idempotent startup: config check, DB wait, migrations, users
+│   ├── migrations/              Built (Phase 0): 001_identity, 002_audit, 003_jobs, 004_approvals_work_queue
+│   ├── identity/                Built (Phase 0): perms.py (the one permission table), service.py, routes.py
+│   ├── audit_log/service.py     Built (Phase 0): hash-chained audit log in Postgres
+│   ├── audit.py                 audit entry point used everywhere (actor from the signed-in user)
+│   ├── work_queue.py            Built (Phase 0): exception queue + routes
 │   ├── connector_routes.py      /api/connectors/*
 │   ├── integration_routes.py    /api/integrations/*, /approvals, /logs/*
 │   ├── quality_routes.py        /api/quality/*
@@ -19,22 +33,53 @@ azentio-hr/
 │   ├── chat.py · guardrails.py  assistants and their guardrails
 │   ├── ingest.py                CSV/Excel/JSON import, seeding
 │   ├── evals.py                 Ragas evaluation
-│   ├── audit.py · logging_setup.py
+│   ├── logging_setup.py
 │   ├── graph.py                 FalkorDB client and helpers
 │   ├── connectors/              base, registry, candidates, hr_portal, apps, sync, seed
 │   ├── integrations/            store, service, chat, agent, engine, mapping, expr, delivery, run_log
 │   ├── seed/                    sample data, policies, eval set
-│   └── test_core.py             assert-based self-checks
+│   └── test_core.py · test_phase0.py   assert-based self-checks on throwaway databases
 ├── frontend/                    Next.js 16 app
-│   ├── app/(hr)/<page>/         HR pages, one folder per route
-│   ├── app/portal/[token]/      employee portal
-│   ├── components/              feature components + ui/ (shadcn primitives)
-│   └── lib/                     api client and types, utils
-├── docs/                        these docs
-└── docker-compose.yml           FalkorDB only
+│   ├── next.config.ts           rewrites /api/* to BACKEND_URL (same origin, httpOnly cookie)
+│   ├── app/login/               sign-in
+│   ├── app/(hr)/<page>/         HR pages, one folder per route (incl. users/)
+│   ├── app/portal/[token]/      employee portal (public, token-scoped)
+│   ├── components/              feature components, auth.tsx (MeProvider, can, RoleGate), app-shell.tsx, ui/
+│   └── lib/                     api client (401 → /login) and types, utils
+├── scripts/smoke.py             UI smoke test: every role signs in, navigates, runs a workflow
+├── docs/                        these docs, plans/, adr/, screenshots/
+└── docker-compose.yml           Postgres 17 + FalkorDB
 ```
 
-## 2. Layers
+## 2. Boundary rules (enforced today)
+
+These hold now and are checked in review. The first column says where each rule lives in the code.
+
+| Rule | Where | Why |
+|---|---|---|
+| **Permissions are defined once.** Every `/api` call passes one middleware (`main.authenticate`) and one ordered table (`identity/perms.py`); unlisted paths are denied. Routes never check roles; the only exception is data scoping (`main._visible` for managers) | `identity/perms.py`, `main.py` | One place to review, one matrix test (`test_phase0.py`) covers every role |
+| **Every human action is audited** through `audit.record_audit(...)`. Pass `conn=` so the entry commits with the change | `audit.py` → `audit_log/service.py` | The actor is resolved from the request; the chain stays continuous |
+| **Follow-up work is enqueued in the same transaction** as the change that caused it (`jobs.enqueue(..., conn=c)`), with an idempotency key on every external side effect | `shared/jobs.py` | The outbox can't lose work; retries can't duplicate side effects |
+| **Background work has one owner** ([ADR 0011](adr/0011-temporal-orchestration.md)) | see the table below | No double retries; it's clear which system is responsible |
+| **Read migrating records through the bridge.** A record type is read from exactly one store; it switches to Postgres only after `parity()` passes; graph writes stop only after every read path has switched | `shared/bridge.py` | Two stores never answer the same question differently |
+| **Postgres schema changes are new numbered migrations.** Never edit an applied file; each must run inside a transaction | `backend/migrations/` | Startup applies them automatically on every environment |
+| **Anything that needs a person opens an exception** in `work_queue`, assigned to a role, deduplicated by cause | `work_queue.py` | Humans act at policy gates, not by watching dashboards |
+| **Required config fails fast** at startup with a clear message | `shared/bootstrap.py` | A missing secret is a startup error, not a half-working app |
+| **The frontend never calls the backend directly**; it calls `/api/*` on its own origin | `next.config.ts`, `lib/api.ts` | The session cookie stays httpOnly; the backend can stay private |
+| **Write buttons are hidden with `can()`**, but the backend is the authority | `components/auth.tsx` | No dead clicks, no security in the UI |
+
+**Ownership of background work**
+
+| Work | Owner | Status |
+|---|---|---|
+| A single side effect outside any workflow; local ops tasks (audit import, graph rebuild, alert evaluation) | Postgres job | Built |
+| Handing a committed change to Temporal | Outbox row (`temporal.start` / `temporal.signal`), relayed by the jobs worker; idempotency key = workflow id | Planned (Phase 4) |
+| Waiting on people, timers, multi-day state machines | Temporal workflow | Planned (Phase 4) |
+| A single side effect inside a workflow | Temporal activity with a retry policy | Planned (Phase 4) |
+
+Business state always lives in Postgres. Neither the jobs table nor Temporal is an authority on HR data.
+
+## 3. Layers
 
 Every backend module belongs to one layer. A layer may only import the layers below it.
 
@@ -44,8 +89,8 @@ flowchart TB
     SVC["<b>Services</b><br/>use cases: onboarding, intake, assistants, integration engine"]
     DOM["<b>Domain</b><br/>pure rules: checklist matching, validation, stage machine, expressions"]
     ADP["<b>Adapters</b><br/>LLM, Gmail, connectors, AwaitVerify, file storage"]
-    REPO["<b>Repositories</b><br/>graph queries per aggregate"]
-    CORE["<b>Core</b><br/>config, logging, audit, ids, errors"]
+    REPO["<b>Repositories</b><br/>graph queries per aggregate; SQL as records move to Postgres"]
+    CORE["<b>Core</b><br/>shared/ (db, jobs, bridge, bootstrap), identity, audit, logging"]
     API --> SVC
     SVC --> DOM & ADP & REPO
     ADP --> CORE
@@ -55,107 +100,85 @@ flowchart TB
 
 | Rule | Why |
 |---|---|
-| Domain code imports nothing from FastAPI, the graph or any adapter | It stays pure and unit-testable in milliseconds |
-| Only repositories run Cypher | The database can change (see [production §5](production-architecture.md#5-data-architecture)) without touching business logic |
+| Domain code imports nothing from FastAPI, the databases or any adapter | It stays pure and testable in milliseconds |
+| Only repositories (and `shared/db.py`) run queries | The storage move to Postgres touches repositories, not business logic |
 | Only adapters talk to the outside world | Every external call has one place for timeouts, retries and fakes in tests |
-| Routers hold no business logic | The same use case can run from HTTP, a worker or the setup agent |
-| Settings are read once, in `core/config` | No `os.getenv` scattered through the code |
+| Routers hold no business logic | The same use case can run from HTTP, a job, a Temporal activity or the setup agent |
 | Errors raised below the API layer are domain errors | The API layer maps them to HTTP status codes |
 
-## 3. Where the code stands against these rules
+## 4. Where the code stands against these rules
 
-| Finding | Evidence | Effect |
-|---|---|---|
-| Graph queries everywhere | 23 modules import `graph` directly | Moving off FalkorDB means touching nearly every file |
-| `main.py` mixes app setup and use cases | 555 lines, 27 routes, plus `create_joiner`, summaries and flags | Hard to reuse `create_joiner` without importing the app |
-| Settings read ad hoc | 24 `os.getenv` calls across modules | Configuration isn't validated at startup |
-| Engine depends on the web framework | `integrations/engine.py` imports `fastapi.HTTPException` | The engine can't run cleanly in a worker |
-| Flat module namespace | `chat.py` exists at the top level and in `integrations/` | Confusing imports |
-| Tests in one file against a live graph | `test_core.py` defaults to the `hr` graph unless `FALKORDB_GRAPH=test` | A careless run can write to dev data |
+| Finding | Evidence | Effect | Fixed by |
+|---|---|---|---|
+| Graph queries everywhere | 24 modules import `graph` directly | Moving records to Postgres touches many files | Phases 1–3, one record type at a time behind the bridge |
+| `main.py` mixes app setup and use cases | 621 lines, 28 routes, plus `create_joiner`, summaries, flags and the auth middleware | Hard to reuse `create_joiner` without importing the app | Phase 1 (`lifecycle/`, `policy/` services) |
+| Settings read ad hoc | 42 `os.getenv`/`os.environ` reads | Only the production-required ones are validated (by bootstrap) | Gradually, as modules move |
+| Engine depends on the web framework | `integrations/engine.py` imports `fastapi.HTTPException` | Can't run cleanly as a job or Temporal activity | Phase 4 |
+| Gmail poller and scheduler are bare loops | `gmail.poll_forever`, `main._scheduler` | No retries or dead-lettering | Phase 4 (Temporal schedules, job-backed calls) |
 
-What's already in good shape:
-- `integrations/service.py` is a real service layer, and the agent's tools and the UI both go through it.
-- `connectors/base.py` is a clean adapter interface.
-- `validate.py` and `checklist.build_items` are pure.
-- `expr.py` is a sandboxed domain module.
+What's in good shape:
+- **Permissions and audit** each have exactly one entry point.
+- **Tests** run on throwaway databases (`azentio_test*` and the `test` graph), so a careless run can't touch dev data.
+- **`integrations/service.py`** is a real service layer: the agent's tools and the UI both go through it.
+- **`connectors/base.py`** is a clean adapter interface.
+- **Pure code:** `validate.py` and `checklist.build_items` are pure, and `expr.py` is a sandboxed domain module.
 
-## 4. Target structure
+## 5. Target structure (Planned)
+
+Modules follow the hardening design: a modular monolith where each module owns its tables and exposes a `service.py` (the only thing other modules call) and a `routes.py`. The module boundaries are where services would be split off later, if team ownership or load ever demand it.
 
 ```
 backend/
-├── app/
-│   ├── main.py                   create_app(): routers, middleware, lifespan only
-│   ├── core/
-│   │   ├── config.py             pydantic-settings; every env var, validated at startup
-│   │   ├── logging.py            (logging_setup.py)
-│   │   ├── audit.py
-│   │   └── errors.py             NotFound, Conflict, Rejected → mapped to HTTP in api/
-│   ├── api/                      one router per area; no business logic
-│   │   ├── employees.py · portal.py · rules.py · templates.py · ingest.py
-│   │   ├── connectors.py · integrations.py · approvals.py · logs.py · quality.py
-│   │   └── deps.py               auth, tenant, request id
-│   ├── domain/                   pure: no I/O
-│   │   ├── checklist.py          match_rule, build_items, view_state
-│   │   ├── validation.py         (validate.py)
-│   │   ├── integration_stages.py stage transitions as a table
-│   │   └── expressions.py        (integrations/expr.py)
-│   ├── services/                 use cases
-│   │   ├── onboarding.py         create_joiner, regenerate, recompute, escalate
-│   │   ├── documents.py          (pipeline.py) intake → extract → validate → act
-│   │   ├── assistant.py          retrieval, prompts, streaming, guardrails
-│   │   ├── integrations/         service, engine, setup agent, chat tools
-│   │   └── evaluation.py         (evals.py)
-│   ├── adapters/
-│   │   ├── llm.py · gmail.py · storage.py · verification.py
-│   │   └── connectors/           base, registry, candidates, hr_portal, apps
-│   ├── repositories/             the only Cypher (later SQL) in the codebase
-│   │   ├── employees.py · items.py · documents.py · rules.py
-│   │   ├── integrations.py · logs.py · quality.py
-│   │   └── db.py                 (graph.py) connection, q, q1
-│   └── workers/                  entry points for background work
-│       ├── gmail_poller.py · scheduler.py · eval_runner.py
-├── tests/
-│   ├── unit/                     domain, no DB
-│   ├── integration/              services against a throwaway graph
-│   └── contract/                 one suite every connector must pass
-└── pyproject.toml
+├── shared/          Built: db (pool, tx, migrate), jobs (outbox), bridge, bootstrap · Planned: clock, config
+├── identity/        Built: users, roles, sessions, perms table
+├── audit_log/       Built: hash-chained log, verify_chain · Planned: lineage queries
+├── work_queue.py    Built: exception inbox (becomes a module with its own screen in Phase 1)
+├── policy/          Planned (Phase 1): rule and threshold versions, drafts, impact preview, approvals, rollback
+│                    (wraps checklist.build_items / match_rule unchanged)
+├── documents/       Planned (Phase 2): intake, extraction, validation, risk tiers, review queue
+│                    (absorbs pipeline.py, extract.py, validate.py)
+├── lifecycle/       Planned (Phase 1 start, Phase 5 full): onboard, transfer, leave, offboard,
+│                    rechecks, rehire, worker type
+├── notifications/   Planned (Phase 4): Gmail send/poll as jobs or activities, reminders, escalations
+├── integrations/    Existing; moves to Postgres in Phase 3; idempotent upserts kept
+├── workflows/       Planned (Phase 4): Temporal workflows and activities; activities call module services
+└── analytics/       Planned (Phase 6): readiness, SLA, exceptions, AI quality
 
 frontend/
-├── app/                          routes only: thin pages that compose features
-├── features/                     one folder per area
-│   ├── employees/ · portal/ · integrations/ · connectors/ · quality/ · logs/
-│   │   ├── components/
-│   │   ├── api.ts                calls for this feature only
-│   │   └── types.ts
-├── components/ui/                shared primitives (shadcn)
-└── lib/                          fetch wrapper, formatting
+├── app/             routes only: thin pages that compose features
+├── components/      shared feature components, auth.tsx, ui/ (shadcn primitives)
+└── lib/             fetch wrapper (same-origin, 401 → login), types, formatting
 ```
 
-## 5. Migration plan
+| Module rule | Why |
+|---|---|
+| Other modules call a module's `service.py`, never its tables or internals | One owner per table; the boundary is where a service could later be split out |
+| Workflows and activities (Phase 4) write state only through module services | Temporal orchestrates; Postgres stays the system of record |
+| `checklist.py`'s rules logic moves under `policy/` unchanged | It's the strongest part of the codebase and already pure |
 
-We'll move in small, separately shippable steps. Each step keeps `test_core.py` green and changes no behaviour.
+## 6. Migration plan
 
-| Step | Change | Done when |
+Each step keeps `test_core.py` and the current `test_phaseN.py` green, and ships behind its own phase's exit criteria ([phase plans](plans/)).
+
+| Phase | Structural change | Done when |
 |---|---|---|
-| 1 | Add `core/config.py` and replace every `os.getenv` | The app refuses to start with a clear message when required config is missing |
-| 2 | Move `create_joiner`, summaries and flags out of `main.py` into `services/onboarding.py` | `main.py` holds only app setup and routers |
-| 3 | Split `main.py` routes into `api/` routers | Each router is under 200 lines |
-| 4 | Add domain errors; remove `HTTPException` below the API layer | `grep -r HTTPException app/services app/domain` is empty |
-| 5 | Introduce repositories one aggregate at a time, starting with integrations (already behind `store.py`) | Only `repositories/` imports `db` |
-| 6 | Split `test_core.py` into `tests/unit` and `tests/integration` with pytest; force a throwaway graph per run | CI runs unit tests without a database |
-| 7 | Move background loops into `workers/` with their own entry points | Workers can run as separate processes ([production §4](production-architecture.md#4-target-topology)) |
-| 8 | Frontend: move feature components and API calls into `features/` | Pages are thin composition |
+| 0 | `shared/`, `identity/`, `audit_log/`, `work_queue.py`, migrations, bootstrap, auth middleware | **Built.** Every API call authorised; every action audited with a user; startup needs no manual steps |
+| 1 | `policy/` and `lifecycle/` services; Employee, Item, Rule tables; reads switched through the bridge | `main.py` holds no rule or joiner logic; parity passes; the exception inbox screen exists |
+| 2 | `documents/` module; Document and review-decision tables | The pipeline runs through `documents/service.py`; no high-risk document is auto-accepted |
+| 3 | Connectors, integrations and runs in Postgres; graph writes for records removed; `rebuild_graph()` | Only rebuild code writes to the graph |
+| 4 | `notifications/`, `workflows/`; Temporal; no `HTTPException` below routers; CI | The poller and scheduler are Temporal schedules; every external call is job- or activity-backed |
+| 5–6 | `lifecycle/` complete; `analytics/` | Per the phase plans |
 
-Steps 1–4 are mechanical and low risk. Step 5 is the one that pays for the PostgreSQL move. Don't do steps in parallel with large feature work on the same files.
-
-## 6. Conventions
+## 7. Conventions
 
 | Area | Convention |
 |---|---|
-| Python | Ruff for lint and format; type hints on public functions; mypy in CI on `domain/` and `services/` first |
-| TypeScript | `tsc --noEmit` and ESLint in CI; API types live with their feature |
+| Python | Type hints on public functions; plain SQL through `shared/db.py`; no ORM. Lint and type checks in CI arrive with Phase 4 |
+| TypeScript | `tsc --noEmit` and `eslint app components` before every frontend commit |
 | Naming | Modules are nouns (`onboarding.py`), functions are verbs (`create_joiner`) |
-| Errors | Raise a domain error with a message HR can act on; never swallow without logging |
+| Errors | Raise an error with a message HR can act on; never swallow without logging |
 | Logging | `log_event(log, "area.event", id=…, count=…)`: ids and counts only, never personal data |
 | Simplifications | Mark deliberate shortcuts with a `ponytail:` comment that names the limit and the upgrade path |
-| Tests | One runnable check for every branch, loop or parser that matters; pure domain code gets unit tests |
+| Tests | Plain `assert` self-checks: `test_core.py`, one `test_phaseN.py` per phase, and `scripts/smoke.py` for the UI. One runnable check for every branch, loop or parser that matters |
+| Docs | Behaviour changes update the LLD and the phase doc; boundary changes add an ADR; structure, command or phase changes update `AGENTS.md` and `CLAUDE.md` |
+| Commits | Small, imperative mood, no co-author or AI attribution lines |

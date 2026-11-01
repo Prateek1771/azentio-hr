@@ -2,7 +2,7 @@
 
 Part of the [design docs](README.md). For the big picture read the [HLD](hld.md) first.
 
-This document describes how the HR Onboarding Agent is built and how the agent behaves. It covers the system as it exists in this repository: what each part does, how data moves, what the agent decides on its own, and where the design is deliberately simplified.
+This document describes how the HR Onboarding Agent is built and how the agent behaves. It covers the system as it exists on `main`: what each part does, how data moves, what the agent decides on its own, and where the design is deliberately simplified. Parts still on the roadmap are marked **Planned (Phase N)**; see the [hardening design](plans/2026-11-01-hardening-design.md) and the [phase plans](plans/).
 
 ---
 
@@ -20,8 +20,10 @@ Onboarding a new joiner involves HR, IT, Facilities and Compliance. Documents ar
 - Escalates overdue tasks to the owner and says what each one is blocking.
 - Answers joiner and HR questions from approved policies and live onboarding data, with citations.
 - Brings candidates in from source systems and writes employees to a target HR system.
-- Runs **integrations**: staged, repeat-safe workflows that take a candidate from source record through document checks, HR approval and offer letter to an employee in the target, with app access (Slack, Jira, Google Workspace, ServiceNow) granted afterwards. HR sets each one up by chatting with an AI setup agent.
-- Records everything three ways: an append-only audit log, a per-run integration log HR can redact, and structured console logs. LLM calls can also be traced in Langfuse.
+- Runs **integrations**: staged, repeat-safe workflows that take a candidate from source record through document checks, approval and offer letter to an employee in the target, with app access (Slack, Jira, Google Workspace, ServiceNow) granted afterwards. HR sets each one up by chatting with an AI setup agent.
+- Signs staff in with one of five roles (admin, HR Ops, approver, manager, auditor) and checks every API call against one permission table.
+- Records everything three ways: a hash-chained, append-only audit log that names the signed-in user, a per-run integration log HR can redact, and structured console logs. LLM calls can also be traced in Langfuse.
+- Runs follow-up work on a durable Postgres job queue, and sends anything that needs a person to an exception queue assigned to a role.
 - Guards both chat assistants against prompt injection and unverified citations, and scores the employee assistant with Ragas on a fixed question set.
 
 ### Scope against the brief
@@ -36,15 +38,19 @@ Onboarding a new joiner involves HR, IT, Facilities and Compliance. Documents ar
 | Extra: connectors, integrations, HR co-pilot, knowledge-graph view | Built |
 | Extra: agent-led integration setup, Approval Center, app access, offer letters | Built |
 | Extra: audit and integration logs, Langfuse tracing, guardrails, Ragas evaluation | Built |
+| Hardening Phase 0: sign-in, 5 roles, permission table, audit chain, jobs/outbox, exception queue, self-bootstrap, `/ready` | Built |
+| Hardening Phases 1–6: governed rules, risk-tiered AI, Postgres migration, Temporal ops backbone, lifecycle, HR ops platform | Planned ([roadmap](plans/2026-11-01-hardening-design.md)) |
 
 ### Design principles
 1. **The LLM perceives; rules decide.** The model reads documents and writes answers. Whether a document is accepted, a task is blocked or a record is written is decided by deterministic code.
 2. **Every item explains itself.** Each checklist item stores the rule that created it and the criteria that matched.
-3. **The graph is the plan.** Dependencies are edges in FalkorDB, so recalculation means walking edges, not rebuilding spreadsheets.
+3. **The graph is the plan; Postgres is the record.** Dependencies are edges in FalkorDB, so recalculation means walking edges. Authoritative records are moving to Postgres one type at a time ([ADR 0005](adr/0005-postgres-system-of-record.md)); afterwards the graph is a rebuild-only read model ([ADR 0006](adr/0006-graph-as-read-model.md)).
 4. **Fail toward a human.** If extraction fails or confidence is low, the document goes to *Under Review*. It is never accepted silently and never lost.
 5. **Cheap by default.** Free models, capped tokens, one fallback, and the spend of every call logged.
 6. **The agent proposes; the service layer decides.** The integration setup agent can only call tools, and every tool goes through the same validation as the UI buttons.
 7. **Logs are safe to share.** Console lines carry ids, field names and counts, never names, emails, tokens or document contents.
+8. **One permission table.** Every `/api` call passes one middleware and one ordered rule table; unlisted paths are denied ([ADR 0008](adr/0008-five-role-rbac.md)).
+9. **Follow-ups can't be lost.** Background work is enqueued in the same transaction as the change that caused it ([ADR 0007](adr/0007-postgres-job-queue.md)); from Phase 4 the same table is the outbox for Temporal workflows ([ADR 0011](adr/0011-temporal-orchestration.md)).
 
 ---
 
@@ -52,13 +58,15 @@ Onboarding a new joiner involves HR, IT, Facilities and Compliance. Documents ar
 
 ```mermaid
 flowchart LR
-    HR["HR team<br/>(browser)"]
+    HR["HR staff<br/>(signed in, 5 roles)"]
     EMP["New joiner<br/>(email + portal link)"]
     subgraph App["Azentio Onboard"]
-        FE["Next.js 16 frontend<br/>HR app + employee portal"]
-        BE["FastAPI backend<br/>rules · pipeline · assistants<br/>connectors · integration engine"]
+        FE["Next.js 16 frontend<br/>HR app + employee portal<br/>rewrites /api/* to the backend"]
+        BE["FastAPI backend<br/>auth middleware · rules · pipeline<br/>assistants · connectors · integration engine<br/>job worker"]
+        PG[("PostgreSQL<br/>users · sessions · audit<br/>jobs · approvals · work_queue")]
         DB[("FalkorDB<br/>graph 'hr'")]
         FS[["uploads/<br/>document files"]]
+        TP["Temporal<br/>(planned, Phase 4)"]
     end
     GM["Gmail API<br/>(HR mailbox)"]
     LLM["OpenRouter<br/>vision + chat models"]
@@ -69,8 +77,10 @@ flowchart LR
     HR --> FE
     EMP --> FE
     EMP <-->|"request · reply with attachments · corrections"| GM
-    FE <-->|"REST + streamed text"| BE
+    FE <-->|"REST + streamed text<br/>(same origin, session cookie)"| BE
+    BE <--> PG
     BE <--> DB
+    BE -.->|"outbox relay (Phase 4)"| TP
     BE <--> FS
     BE <-->|"send · poll · label"| GM
     BE -->|"extract · answer"| LLM
@@ -86,9 +96,11 @@ flowchart LR
 ### 3.1 Runtime
 | Container | Technology | Notes |
 |---|---|---|
-| Frontend | Next.js 16 (App Router, Turbopack), React 19, Tailwind v4, shadcn/ui on Base UI, lucide icons | All pages are client components fetching live data. Cache Components and PPR are off. |
-| Backend | Python 3.12, FastAPI, uvicorn, managed by `uv` | Single process. Two background asyncio tasks: the Gmail poller (every 60 s) and the integration scheduler (every 30 s). |
-| Database | FalkorDB (Redis-compatible graph, Cypher) in Docker | One graph, `hr`. A separate `test` graph is used by the self-checks. |
+| Frontend | Next.js 16 (App Router, Turbopack), React 19, Tailwind v4, shadcn/ui on Base UI, lucide icons | All pages are client components fetching live data. Cache Components and PPR are off. `next.config.ts` rewrites `/api/*` to `BACKEND_URL` so the browser only talks to one origin. |
+| Backend | Python 3.12, FastAPI, uvicorn, managed by `uv` | Single process. Three background asyncio tasks: the job worker (`shared/jobs.worker`), the Gmail poller (every 60 s) and the integration scheduler (every 30 s). |
+| Postgres | Postgres 17 in Docker, `psycopg` 3 with a connection pool, plain SQL | **Built (Phase 0):** users, sessions, audit chain, jobs, approvals, work_queue. Migrations in `backend/migrations/` apply on start. Self-checks use throwaway databases `azentio_test*`. |
+| Graph | FalkorDB (Redis-compatible graph, Cypher) in Docker | One graph, `hr`, holding joiners, items, documents, rules, connectors and integrations until they move to Postgres (Phases 1–3). A separate `test` graph is used by the self-checks. |
+| Workflows | Temporal | **Planned (Phase 4)** ([ADR 0011](adr/0011-temporal-orchestration.md)). |
 | File store | Local `backend/uploads/` | Original document files, served back for preview. |
 | LLM | Any OpenAI-compatible endpoint; OpenRouter by default | Free vision model with a free fallback. |
 | Email | Gmail API with an OAuth refresh token | One HR mailbox sends and receives. Without Gmail, integration emails are recorded as simulated sends. |
@@ -98,7 +110,17 @@ flowchart LR
 ### 3.2 Backend modules
 | File | Responsibility | Key functions |
 |---|---|---|
-| `main.py` | App setup, lifespan (seed, start Gmail poller), HR, portal, ingestion, template, rule and assistant routes | `items_with_state`, `summarize`, `flags`, `create_joiner` |
+| `main.py` | App setup; lifespan (bootstrap, seed, start job worker, Gmail poller and scheduler); the auth middleware; manager scoping; `/health` and `/ready`; HR, portal, ingestion, template, rule and assistant routes | `authenticate`, `_visible`, `get_emp`, `items_with_state`, `summarize`, `flags`, `create_joiner`, `ready` |
+| `shared/db.py` | Postgres pool, transactions, migrations | `init`, `tx`, `fetch`, `fetch1`, `execute`, `ping`, `migrate`, `use_test_database` |
+| `shared/jobs.py` | Transactional outbox and short-task queue | `enqueue`, `handler`, `claim`, `run_once`, `worker`, `requeue_stuck`, `heartbeat`, `worker_alive` |
+| `shared/bootstrap.py` | Idempotent startup steps | `run`, `check_config`, `connect`, `ensure_users`, `ensure_dev_manager_reports`, `graph_ok` |
+| `shared/bridge.py` | Which store each record type is read from during the migration | `SOURCE`, `source`, `parity`, `switch` |
+| `migrations/NNN_*.sql` | Postgres schema, applied in order on start | `001_identity`, `002_audit`, `003_jobs`, `004_approvals_work_queue` |
+| `identity/perms.py` | The single permission table | `RULES`, `allowed`, `is_public` |
+| `identity/service.py` | Users, scrypt passwords, sessions, login throttle, last-admin guard | `login`, `user_for_token`, `logout`, `change_password`, `create_user`, `update_user`, `ensure_user`, `current_user` |
+| `identity/routes.py` | `/api/auth/*` and `/api/users*` | router under `/api` |
+| `audit_log/service.py` | Hash-chained audit log in Postgres | `record`, `verify_chain`, `list_entries`, `import_graph_rows` |
+| `work_queue.py` | Exception queue and its routes | `open_item`, `list_items`, `resolve` |
 | `graph.py` | FalkorDB client and Cypher helpers | `q`, `q1`, `event`, `ensure_indexes` |
 | `checklist.py` | Rules engine: applicability, reasons, due dates, blocking, automatic task progression | `match_rule`, `build_items`, `view_state`, `regenerate`, `recompute` |
 | `validate.py` | Deterministic document checks | `check_file`, `names_match`, `evaluate` |
@@ -110,7 +132,7 @@ flowchart LR
 | `guardrails.py` | Input checks (prompt injection, length) and output checks (citations, unknown emails, prompt leak) for both assistants | `check_input`, `check_output`, `record` |
 | `evals.py` | Ragas evaluation of the employee assistant against `seed/eval_assistant.json` | `start_run`, `run`, `running` |
 | `quality_routes.py` | AI quality API: eval runs, per-question results, guardrail hits | router under `/api/quality` |
-| `audit.py` | Append-only audit log of who did what | `record_audit`, `list_audit` |
+| `audit.py` | Entry point used across the app; resolves the actor from the signed-in user and writes through `audit_log/service.py` | `record_audit`, `list_audit` |
 | `logging_setup.py` | `key=value` console logs tied together by a request id; portal tokens masked | `setup`, `log_event`, `Timer`, `safe_path` |
 | `ingest.py` | CSV, Excel and JSON parsing and validation, employee upsert, seeding | `read_table`, `validate_employees`, `upsert_employee`, `import_requirements`, `seed` |
 | `connector_routes.py` | Connector API: records, schema, custom fields, connection settings, imports, start onboarding | router mounted under `/api` |
@@ -131,29 +153,34 @@ flowchart LR
 | `connectors/sync.py` | Field aliases and the original one-shot sync (kept for the self-checks; integrations now run through `integrations/engine.py`) | `suggest_mapping`, `apply_mapping` |
 | `connectors/seed.py` | Catalog, instances and demo records | `seed_connectors` |
 | `seed/` | Sample joiners, owners, requirement rules, roles, email templates, policies, the eval question set | — |
-| `test_core.py` | Assert-based self-checks | — |
+| `test_core.py`, `test_phase0.py` | Assert-based self-checks (throwaway Postgres databases and the `test` graph) | — |
 
 ### 3.3 Frontend
+Every HR route sits inside the app shell, which loads the signed-in user and shows only the pages that role may see (§9.6). The Audience column lists the roles that see each page; write buttons inside a page are shown only to roles that can use them.
+
 | Route | Audience | Purpose |
 |---|---|---|
-| `/dashboard` | HR | KPIs, filters (department, location, status, joining range, search), readiness per joiner, inbox check, escalation |
-| `/employees/[id]` | HR | Checklist with reasons, documents with extracted-vs-profile comparison, HR record, knowledge graph, activity; send request, change date or role, accept or reject |
-| `/import` ("Add joiners") | HR | One-step "Onboard a candidate" form plus bulk import of joiners, owners, requirements and policies |
-| `/templates` | HR | Email template editor with live preview |
-| `/rules` | HR | Requirement rules editor; saving recalculates every checklist |
-| `/connectors`, `/connectors/[id]` | HR | Sources and targets; Records, Fields and Import history tabs; custom fields; start onboarding from a candidate |
-| `/integrations` | HR | Every integration with status, schedule and last run |
-| `/integrations/new` | HR | Describe the integration in a sentence; the agent creates it and asks the first question |
-| `/integrations/[id]` | HR | Tabs: Agent (setup chat with quick replies), Candidates (stage per candidate, decisions, access), Log, Sent messages |
-| `/approvals` | HR | Approval Center: candidates whose documents passed the AI checks, and offer letter formats |
-| `/logs` | HR | Integration log (per run, per candidate, with exclusions applied) and searchable audit log |
-| `/quality` ("AI quality") | HR | Ragas scores with trend and change since the last run, per-question answers, guardrail hits, run history |
-| `/activity` | HR | Global event feed, refreshed every 10 s |
-| `/portal/[token]` | Joiner | Progress and countdown, checklist timeline, drag-and-drop upload, policy acknowledgement, assistant |
+| `/login` | Anyone | Sign-in form; returns to `?next=` (same-origin paths only) |
+| `/dashboard` | All roles (managers: own reports) | KPIs, filters (department, location, status, joining range, search), readiness per joiner, inbox check, escalation |
+| `/employees/[id]` | All roles (managers: own reports; actions for HR Ops) | Checklist with reasons, documents with extracted-vs-profile comparison, HR record, knowledge graph, activity; send request, change date or role, accept or reject |
+| `/import` ("Add joiners") | HR Ops | One-step "Onboard a candidate" form plus bulk import of joiners, owners, requirements and policies |
+| `/templates` | Staff (edit: HR Ops) | Email template editor with live preview |
+| `/rules` | Staff (edit: HR Ops) | Requirement rules editor; saving recalculates every checklist |
+| `/connectors`, `/connectors/[id]` | Staff (configure: admin; import and onboard: HR Ops, admin) | Sources and targets; Records, Fields and Import history tabs; custom fields; start onboarding from a candidate |
+| `/integrations` | Staff (change: admin) | Every integration with status, schedule and last run |
+| `/integrations/new` | Admin | Describe the integration in a sentence; the agent creates it and asks the first question |
+| `/integrations/[id]` | Staff (change: admin; candidate decisions: approver) | Tabs: Agent (setup chat with quick replies), Candidates (stage per candidate, decisions, access), Log, Sent messages |
+| `/approvals` | Staff (decide: approver) | Approval Center: candidates whose documents passed the AI checks, and offer letter formats |
+| `/logs` | Staff | Integration log (per run, per candidate, with exclusions applied) and searchable audit log |
+| `/quality` ("AI quality") | Staff (run eval: admin) | Ragas scores with trend and change since the last run, per-question answers, guardrail hits, run history |
+| `/activity` | All roles (managers: own reports) | Global event feed, refreshed every 10 s |
+| `/portal/[token]` | Joiner (no account) | Progress and countdown, checklist timeline, drag-and-drop upload, policy acknowledgement, assistant |
+| `/users` | Admin | Users and roles: add, change role, reset password, deactivate |
 
 | Shared component | Purpose |
 |---|---|
-| `app-shell.tsx` | Sidebar, theme toggle, Gmail status; mounts the HR co-pilot |
+| `app-shell.tsx` | Loads the user (`MeProvider`), role-filtered sidebar (`NAV`), page gate, user menu (change password, sign out), theme toggle, Gmail status; mounts the HR co-pilot for every role except manager |
+| `auth.tsx` | `MeProvider`/`useMe`, `can(user, action)`, `RoleGate`, `RoleBadge`, role labels and hints |
 | `hr-assistant.tsx` | Floating co-pilot; becomes page-aware on an employee record |
 | `chat-panel.tsx` | Streaming chat used by both assistants; parses the `__SOURCES__` header |
 | `graph-view.tsx` | Hand-drawn SVG radial view of an employee's subgraph |
@@ -166,7 +193,27 @@ flowchart LR
 
 ---
 
-## 4. Data model (FalkorDB graph `hr`)
+## 4. Data model
+
+Two stores. Postgres is the system of record for everything built in Phase 0 and, phase by phase, for the records below that still live in the graph ([ADR 0005](adr/0005-postgres-system-of-record.md)). `shared/bridge.py` names the one store each migrating record type is read from (§12.3).
+
+### 4.1 Postgres (Built, Phase 0)
+
+| Table | Key columns | Purpose |
+|---|---|---|
+| `users` | `id, email (unique, lower-case), name, role (user_role enum: admin, hr_ops, approver, manager, auditor), pw_hash, active, created_at, last_login` | Staff accounts |
+| `sessions` | `token_hash (sha256 of the cookie value, PK), user_id, created_at, expires_at, revoked_at` | Server-side sessions; the raw token is never stored |
+| `audit_log` | `seq, ts, actor, actor_role, action, entity_type, entity_id, summary, metadata (jsonb), reason, prev_hash, hash (unique)` | Hash-chained, append-only audit log (§10). A trigger refuses UPDATE and DELETE |
+| `jobs` | `id, kind, payload (jsonb), idempotency_key (unique), state (job_state: queued, running, done, dead), attempts, max_attempts, run_at, locked_by, locked_at, last_error, created_at, finished_at` | Transactional outbox and short-task queue (§11) |
+| `worker_heartbeat` | `worker, seen_at` | Liveness of job workers, read by `/ready` |
+| `approval_requests` | `id, subject_type, subject_id, requested_by, required (1–3), status (pending, approved, rejected, withdrawn), reason, created_at, decided_at` | Created in Phase 0, used from Phase 1 (rule versions) and Phase 2 (documents) |
+| `approvals` | `request_id, approver_id (PK together), decision (approve, reject), reason, ts` | One vote per person per request |
+| `work_queue` | `id, kind, entity_type, entity_id, reason, detail (jsonb), assignee_role, assignee_id, status (open, in_progress, resolved, dismissed), sla_due, resolution, resolved_by, created_at, resolved_at, dedupe_key (unique)` | Exception queue (§11.3) |
+| `schema_migrations` | `name, applied_at` | Which migration files have run |
+
+**Planned:** Employee, Item, Rule tables (Phase 1); Document and review decisions (Phase 2); connectors, integrations and runs (Phase 3). Schemas are in the [phase plans](plans/).
+
+### 4.2 FalkorDB graph `hr`
 
 ```mermaid
 flowchart LR
@@ -212,7 +259,7 @@ Integration nodes link by id properties rather than edges, because each one is r
 | `IntegrationLogRecord` | `run_id, item_id, actions, mapping snapshot` | What happened to one candidate in one run, minus HR's exclusions |
 | `AgentMessage` | `integration_id, role, content, ts` | The setup chat history |
 | `OutboundMessage` | `integration_id, item_id, kind, to, subject, content, attempt, delivered_by (gmail, simulated), provider_ref` | Every email an integration sent, exactly as sent |
-| `AuditLog` | `action, entity_type, entity_id, summary, actor, ts` | Append-only audit trail. Never affected by log exclusions |
+| `AuditLog` | `action, entity_type, entity_id, summary, actor, ts` | **Legacy.** No longer written. Bootstrap copies these rows once into the Postgres chain (§10.4) |
 | `GuardrailEvent` | `surface, rule, action (blocked, flagged), ts` | A guardrail hit. Rule and surface only, no message text |
 | `EvalRun` / `EvalResult` | run: `status, judge, model, done, total, summary (json)`; result: `question, reference, answer, sources, faithfulness, context_precision, context_recall, guardrail_ok` | Ragas evaluation history |
 
@@ -391,7 +438,7 @@ HR creates an integration on `/integrations/new` by describing it in a sentence 
 | Mapping | How source fields fill target fields: direct, a transform, a default, or an expression; a generated unique work email | `suggest_mapping`, `set_mapping_field`, `generate_unique_email`, `remove_mapping_field`, `approve_mapping` |
 | Notifications | Members and addresses to notify, on run start, success or failure | `set_notifications` |
 | Documents | Whether to verify documents; which documents each role is asked for (defaults to the Requirement rules) | `set_document_verification`, `set_role_documents` |
-| Offer | Whether to send an offer letter; generate or edit the template; HR approves the format | `set_offer_letter` and the offer template tools |
+| Offer | Whether to send an offer letter; generate or edit the template; an approver approves the format | `set_offer_letter` and the offer template tools |
 | Access | Which apps joiners get, per role, department or location (suggested from the rules) | `set_app_access` |
 | Schedule | Manual, every N minutes, or daily at a time in a timezone | schedule tool |
 | Review | Activation blockers, then activate | activate tool |
@@ -412,7 +459,7 @@ stateDiagram-v2
     documents_requested --> documents_rejected: AI checks fail
     documents_rejected --> documents_requested: asked again on the next run
     documents_requested --> awaiting_hr_approval: all required documents verified
-    awaiting_hr_approval --> approved: HR approves (Approval Center)
+    awaiting_hr_approval --> approved: approver approves (Approval Center)
     awaiting_hr_approval --> hr_rejected: HR rejects
     approved --> offer_sent: offer letter emailed (or straight through when offers are off)
     offer_sent --> completed: employee upserted in target, then app access
@@ -551,9 +598,226 @@ App connectors call no external API. Each action is written as a `Record` in the
 
 ---
 
-## 9. API reference
+## 9. Identity and access
 
-All routes are under `/api`. JSON in and out; the chat routes stream `text/plain`, with the first line `__SOURCES__[...]`.
+**Built (Phase 0)** ([ADR 0008](adr/0008-five-role-rbac.md)).
+
+### 9.1 Roles
+| Role | Scope |
+|---|---|
+| `admin` | Users, connectors, integrations, evals, every read. Doesn't run onboarding |
+| `hr_ops` | Runs onboarding: joiners, items, templates, rules, ingest, emails, portal links, adding joiners from connectors |
+| `approver` | Candidate document and offer-format decisions. Can't author what they approve |
+| `manager` | Read-only, and only for joiners whose `manager_email` equals their email |
+| `auditor` | Read-only on everything, including the audit log |
+
+Joiners have no account. Their portal token is the credential, and `/api/portal/*` is public.
+
+### 9.2 Passwords and sessions (`identity/service.py`)
+- **Passwords:** `hashlib.scrypt` (N=2¹⁴, r=8, p=1, 32-byte key, 16-byte random salt), stored as `scrypt$N$r$p$salt$hash`. At least 10 characters.
+- **Unknown emails** are checked against a dummy hash, so a miss takes as long as a wrong password.
+- **Login** creates a random 32-byte token. The cookie `session` carries it (httpOnly, `SameSite=Lax`, `Secure` when `COOKIE_SECURE=true`, lifetime `SESSION_DAYS`, default 7). Only `sha256(token)` is stored in `sessions`.
+- **Every request** looks the session up again (`user_for_token`): not revoked, not expired, user still active. Revocation therefore takes effect on the next request:
+  - logout revokes the session
+  - a password change revokes the user's other sessions
+  - an admin resetting a password, changing a role or deactivating a user revokes all of that user's sessions
+- **Login throttle:** 5 failures per email within 15 minutes returns `429`. `ponytail:` it's an in-process counter; it moves to Postgres when there are several replicas.
+- **Last-admin guard:** demoting or deactivating the last active admin returns `409`. The check runs under a Postgres advisory lock, so two concurrent changes can't both pass it.
+- Every sign-in, failed sign-in, sign-out, password change, user creation and user update is audited.
+
+### 9.3 The permission table (`identity/perms.py`)
+`RULES` is one ordered list of `(methods, path regex, allowed roles)`, and the first match wins. Any `/api` path that matches no rule is denied. Read = GET/HEAD; write = POST/PUT/PATCH/DELETE. STAFF = admin, hr_ops, approver, auditor.
+
+| Methods | Path | Allowed |
+|---|---|---|
+| any | `/api/auth/login` | public |
+| any | `/api/auth/me`, `/logout`, `/password` | any signed-in user |
+| any | `/api/portal/*` | public (token-scoped) |
+| any | `/api/users*` | admin |
+| read | `/api/work-queue` | STAFF |
+| write | `/api/work-queue/{id}/resolve` | admin, hr_ops, approver |
+| write | `/api/integrations/*/candidates/*/decision`, `/api/integrations/*/offer/decision` | approver |
+| read | `/api/approvals` | STAFF |
+| write | `/api/connectors/*/import`, `/api/connectors/*/records/*/onboard` | hr_ops, admin |
+| read | `/api/connectors*`, `/api/integrations*` | STAFF |
+| write | `/api/connectors*`, `/api/integrations*` | admin |
+| read | `/api/logs/*` | STAFF |
+| read / write | `/api/quality` / `/api/quality/eval` | STAFF / admin |
+| read | `/api/employees/*/portal-link` | hr_ops (the link lets its holder act as the joiner) |
+| read | `/api/employees*`, `/api/stats`, `/api/events`, `/api/documents/*/file` | STAFF + manager (scoped) |
+| read | `/api/templates*`, `/api/rules*`, `/api/policies*` | STAFF |
+| write | `/api/hr/chat` | STAFF |
+| write | `/api/employees*`, `/api/items/*`, `/api/escalate`, `/api/gmail/poll`, `/api/ingest`, `/api/onboard`, `/api/templates*`, `/api/rules*` | hr_ops |
+
+`test_phase0.py` checks 40 representative routes against all 5 roles, including the default deny.
+
+### 9.4 The middleware (`main.authenticate`)
+1. `OPTIONS` requests, non-`/api` paths and public rules pass straight through.
+2. The session is resolved in a worker thread. If Postgres is unreachable, the request gets `503`.
+3. No valid session returns `401 Sign in required`.
+4. A role the table doesn't allow returns `403`.
+5. Otherwise `identity.service.current_user` (a `ContextVar`) is set for the request, so audit entries and data scoping can read it without passing it around.
+
+Routes never check roles themselves.
+
+### 9.5 Data scoping
+`main._visible(employee)` returns false when the signed-in user is a manager and the employee's `manager_email` isn't theirs. It's applied in:
+- `get_emp`, which every `/api/employees/{eid}…` route uses
+- `list_employees`, which `/api/stats` reuses
+- `/api/events`
+- `/api/documents/{id}/file`
+
+A hidden employee returns `404`, not `403`, so the response doesn't reveal that someone else's report exists. In dev, bootstrap makes `manager@azentio.local` the manager of E1006 and E1002.
+
+### 9.6 Frontend auth flow
+- **Same origin.** `next.config.ts` rewrites `/api/:path*` to `${BACKEND_URL}/api/:path*` (default `http://localhost:8000`). `lib/api.ts` uses `API = ""`. The browser never calls the backend directly, so the httpOnly cookie works and the backend can stay private in production.
+- **401 handling.** `api()` sends the browser to `/login?next=<current path>` on any `401`, except from `/api/auth/*` and `/api/portal/*`. It returns `undefined` for `204`.
+- **Login page** (`app/login/page.tsx`): calls `/api/auth/me` first and skips the form if a session exists. On submit it posts `/api/auth/login`, then goes to `next` (same-origin paths only, never `/login`) or `/dashboard`. In development it lists the seed accounts, and clicking one fills the form.
+- **App shell:**
+  - `MeProvider` loads `/api/auth/me` and shows a skeleton until the user is known. Failure goes to login.
+  - `NAV` lists the roles for each page, and the sidebar shows only those.
+  - Visiting a page the role can't see renders `RoleGate` (an "ask an admin" card).
+  - The user menu offers Change password and Sign out. Sign out posts `/api/auth/logout`, then does a full reload to `/login` so no cached data survives.
+- **Write buttons.** `can(user, "onboarding" | "approve" | "system" | "import")` mirrors the write rules and hides buttons a role can't use: dashboard actions, employee actions, rules and templates editing, approval decisions. The backend enforces the rules regardless.
+- **Users page** (`/users`, admin):
+  - role counts, search, and a table with inline role change
+  - reset password (generated, shown once)
+  - deactivate and reactivate
+  - the last active admin and the admin's own row can't be demoted or deactivated
+
+### 9.7 Endpoints
+| Method | Path | Body | Returns | Roles |
+|---|---|---|---|---|
+| POST | `/api/auth/login` | `{email, password}` | `{user}`, sets the cookie; 401 wrong credentials; 429 throttled | public |
+| POST | `/api/auth/logout` | — | 204; session revoked, cookie cleared | signed in |
+| GET | `/api/auth/me` | — | `{id, email, name, role}` | signed in |
+| POST | `/api/auth/password` | `{current, new}` | 204; the user's other sessions revoked | signed in |
+| GET | `/api/users` | — | users, no hashes | admin |
+| POST | `/api/users` | `{email, name, role, password}` | 201 user; 409 duplicate email; 422 weak password or unknown role | admin |
+| PATCH | `/api/users/{id}` | `{name?, role?, active?, password?}` | user; 409 last admin | admin |
+| GET | `/api/work-queue?status=open` | — | the caller role's items (admin and auditor see all) | STAFF |
+| POST | `/api/work-queue/{id}/resolve` | `{resolution, dismiss?}` | item; 403 other role's item; 409 already closed | admin, hr_ops, approver |
+| GET | `/health` | — | `{"ok": true}` | public (outside `/api`) |
+| GET | `/ready` | — | `{postgres, graph, worker, llm}`; 503 if Postgres, graph or worker is down | public (outside `/api`) |
+
+---
+
+## 10. Audit chain
+
+**Built (Phase 0).**
+
+### 10.1 Storage
+`audit_log` (migration `002_audit.sql`) is append-only at the database: a `BEFORE UPDATE OR DELETE` trigger raises `audit_log is append-only`.
+
+Each row stores `hash = sha256(prev_hash + canonical_json(row))`:
+- The canonical JSON covers `ts` (UTC, microseconds), `actor`, `actor_role`, `action`, `entity_type`, `entity_id`, `summary`, `metadata` and `reason`, with sorted keys.
+- The first row's `prev_hash` is 64 zeros.
+- `audit_log/service.record()` takes `pg_advisory_xact_lock` before reading the last hash, so two concurrent writers can't chain from the same row.
+- Passing `conn=` writes the entry inside the caller's transaction, so it commits or rolls back with the change it describes.
+
+### 10.2 Verification
+`verify_chain()` walks every row in `seq` order and returns `(ok, first_bad_seq)`. Editing, deleting or reordering any row breaks it, even if someone with superuser rights disables the trigger first (`test_phase0.py: audit_tamper_detected`).
+
+### 10.3 Who acted
+`audit.record_audit(action, entity_type, entity_id, summary, actor="HR", metadata=None, reason="", conn=None, actor_role="")` is the single entry point. The actor is resolved as follows:
+
+| Caller passes | Recorded actor |
+|---|---|
+| `"HR"` (the default) inside a request | the signed-in user's email, plus their role |
+| `"HR"` outside a request (jobs, poller, scheduler) | `system` |
+| `"HR (via agent)"` | `<user email> (via agent)` |
+| anything else (e.g. `"Agent"`) | kept as given |
+
+This is why every call site that existed before Phase 0 (14 of them) now names real users without having been changed.
+
+### 10.4 Legacy history
+On first start, `import_graph_rows()` copies the graph's `AuditLog` nodes into the chain, oldest first. It runs **before** anything else writes an audit row (bootstrap step 4, §12.1), and only while `audit_log` is empty. The old history therefore stays at the head of one continuous chain.
+
+### 10.5 Reading
+`GET /api/logs/audit?q&page&page_size&action&entity_type` (`list_entries`) searches the summary and actor, pages newest first, and lists the distinct actions.
+
+---
+
+## 11. Jobs, outbox and exception queue
+
+**Built (Phase 0)** ([ADR 0007](adr/0007-postgres-job-queue.md), narrowed by [ADR 0011](adr/0011-temporal-orchestration.md)).
+
+### 11.1 The jobs table: transactional outbox + short-task queue
+- **`enqueue(kind, payload, idempotency_key=None, run_at=None, max_attempts=5, conn=None)`** inserts with `ON CONFLICT (idempotency_key) DO NOTHING`. It returns the job id, or `None` when that key was already used, so the same work enqueued twice runs once. Pass `conn=` to enqueue inside the transaction of the change that caused it. That's what makes the table an outbox: the change and its follow-up commit together or not at all.
+- **Handlers** register with `@jobs.handler(kind)` and may be sync or async. A handler with an external side effect must key it on `job["idempotency_key"]`, so a retry after a crash can't repeat it (`test_phase0.py: job_side_effect_once`).
+- **Claiming:**
+  ```sql
+  UPDATE jobs SET state='running', locked_by=$w, locked_at=now(), attempts=attempts+1
+  WHERE id = (SELECT id FROM jobs WHERE state='queued' AND run_at <= now()
+              ORDER BY run_at, id FOR UPDATE SKIP LOCKED LIMIT 1)
+  RETURNING *
+  ```
+  Concurrent workers never claim the same job (`job_no_double_claim`).
+- **Failure:** the job returns to `queued` with `run_at = now() + min(5·2^attempts, 3600)` seconds. A job with no registered handler fails the same way. Once `attempts ≥ max_attempts`, the job becomes `dead`, and an `ops` exception is opened in `work_queue` for admin in the same transaction (dedupe key `job-dead:<id>`).
+- **Stuck jobs:** a job left `running` for more than 10 minutes (its worker died) is put back in the queue by `requeue_stuck()`. The attempt still counts.
+- **Worker:** `jobs.worker()` runs in the app lifespan. It polls every 2 s when idle, writes `worker_heartbeat` and re-queues stuck jobs every 5 ticks, and survives database blips. `/ready` reports the worker down when no heartbeat is newer than 30 s.
+- **Planned (Phase 4):** job kinds `temporal.start` and `temporal.signal` relay committed outbox rows to Temporal, with the idempotency key used as the workflow id. Long-lived workflows (lifecycle cases, escalation ladders, approval waits) run there. Single side effects outside a workflow and local ops tasks stay on this table. No schema change is needed.
+
+### 11.2 Approvals tables
+`approval_requests` and `approvals` exist from Phase 0 and are first used in Phase 1:
+- rule versions: author ≠ approver, and `required = 2` for compliance rules
+- Phase 2: high-risk documents
+
+### 11.3 Exception queue (`work_queue.py`)
+- **`open_item(kind, entity_type, entity_id, reason, assignee_role, detail, dedupe_key, sla_due, conn)`** opens one item per cause; a repeated `dedupe_key` is ignored.
+- **`list_items(role, status)`** returns the role's items; admin and auditor see all of them.
+- **`POST /api/work-queue/{id}/resolve`** closes an item as `resolved` or `dismissed` with a required resolution text. It locks the row, allows only the assigned role or admin, and audits `work_queue.resolved|dismissed`.
+- **Producers today:** dead jobs (`ops`, admin).
+- **Planned producers:**
+  - rule approvals and near-start changes (Phase 1)
+  - document reviews (Phase 2)
+  - escalations and appeals (Phase 6)
+- **Screen:** the inbox UI arrives with its first human-facing producer (Phase 1).
+
+---
+
+## 12. Bootstrap, health and the migration bridge
+
+**Built (Phase 0).**
+
+### 12.1 Startup (`shared/bootstrap.run`, then the lifespan)
+Every step is idempotent: running it twice gives the same state as running it once (`bootstrap_idempotent`).
+1. **`check_config`:** with `ENV=production`, `DATABASE_URL`, `ADMIN_EMAIL` and `ADMIN_PASSWORD` are required. If any is missing, startup exits with `bootstrap: missing required config: …`.
+2. **`connect`:** opens the pool, waiting up to 20 s for Postgres. If it can't, startup exits with the host and a hint to run `docker compose up -d postgres`.
+3. **`db.migrate()`:** applies `migrations/NNN_*.sql` in order under an advisory lock (safe with several replicas). Each file runs in its own transaction and is recorded in `schema_migrations`.
+4. **`import_graph_rows()`:** imports the legacy audit history (§10.4), if the graph is reachable.
+5. **`ensure_users()`:** creates the admin from `ADMIN_EMAIL`/`ADMIN_PASSWORD` if missing. In dev the defaults are `admin@azentio.local` / `admin-dev-pass`. An existing password is never overwritten. Outside production it also creates the dev accounts `hrops@`, `approver@`, `manager@` and `auditor@azentio.local`, and prints them once.
+6. **Lifespan:** if the graph is up, it runs `ingest.seed()` (default rules, templates, sample joiners, connectors, policies) and `ensure_dev_manager_reports()`. Then it starts the job worker, the Gmail poller and the integration scheduler.
+
+### 12.2 Health
+- **`GET /health`** reports only that the process is up.
+- **`GET /ready`** checks:
+  - Postgres (`SELECT 1`)
+  - the graph (`RETURN 1`)
+  - the job worker's heartbeat
+  - the LLM configuration, which is informational and never causes a 503
+
+  It returns 503 with the failing component named, and recovers without a restart once the dependency is back.
+
+### 12.3 The migration bridge (`shared/bridge.py`)
+- `SOURCE` maps each migrating record type to the one store it's read from. Today `Employee`, `Item`, `Rule` and `Document` are all `graph`.
+- `parity(graph_rows, pg_rows)` compares row counts and an order-independent sha256 over canonical rows, and lists missing or extra keys.
+- `switch(type, …)` moves reads to Postgres only if parity passes, and raises `ParityError` otherwise.
+- **Steps for each record type (Phases 1–3):**
+  1. dual-write
+  2. backfill
+  3. switch the bridge once parity passes
+  4. stop graph writes, once every read path has switched
+
+  The graph then becomes a rebuild-only read model.
+
+---
+
+## 13. API reference
+
+All routes are under `/api`, apart from `/health` and `/ready`. JSON in and out; the chat routes stream `text/plain`, with the first line `__SOURCES__[...]`.
+
+Every route needs a signed-in session, except `/api/auth/login` and `/api/portal/*`. Which roles may call each route is set by the permission table in §9.3; the sign-in, user, exception-queue and health endpoints are listed in §9.7. Roles below are noted where they aren't obvious from §9.3.
 
 **Dashboard and joiners**
 | Method | Path | Purpose |
@@ -565,7 +829,7 @@ All routes are under `/api`. JSON in and out; the chat routes stream `text/plain
 | PATCH | `/employees/{eid}` | Change date, role, grade, department, location or email → recalculate |
 | GET | `/employees/{eid}/preview-email?template_id` | Rendered request email |
 | POST | `/employees/{eid}/send-request` | Send the request via Gmail |
-| GET | `/employees/{eid}/portal-link` | Portal token |
+| GET | `/employees/{eid}/portal-link` | Portal token (HR Ops only) |
 | GET | `/employees/{eid}/links` | Connector links (from candidate, synced to HR) |
 | POST | `/items/{item_id}/status` | HR sets a status; a correction triggers an email |
 | POST | `/onboard` | One-step create (+ optional send) |
@@ -620,10 +884,12 @@ All routes are under `/api`. JSON in and out; the chat routes stream `text/plain
 | PUT | `/integrations/{iid}/basics`, `/records`, `/mapping`, `/notifications`, `/documents`, `/access`, `/offer`, `/schedule`, `/log-settings` | Save one setup step |
 | POST | `/integrations/{iid}/mapping/suggest`, `/mapping/preview`, `/mapping/approve`, `/mapping/test-expression` | Mapping help and approval |
 | GET / PUT / DELETE | `/integrations/{iid}/documents/options`, `/documents/roles` | Documents per role |
-| POST / PUT | `/integrations/{iid}/offer/generate`, `/offer/template`, `/offer/decision` | Offer letter template and its approval |
+| POST / PUT | `/integrations/{iid}/offer/generate`, `/offer/template` | Offer letter template (admin) |
+| POST | `/integrations/{iid}/offer/decision` | Approve the offer format (approver only) |
 | POST | `/integrations/{iid}/activate`, `/pause`, `/run` | Lifecycle and Run now |
 | GET | `/integrations/{iid}/candidates` | Candidates with stage, documents and access |
-| POST | `/integrations/{iid}/candidates/{item_id}/decision`, `/check-documents`, `/access` | HR decision, recheck documents, grant one access |
+| POST | `/integrations/{iid}/candidates/{item_id}/decision` | Approve or reject a candidate's documents (approver only) |
+| POST | `/integrations/{iid}/candidates/{item_id}/check-documents`, `/access` | Recheck documents, grant one access (admin) |
 | GET | `/integrations/{iid}/messages` | Sent messages |
 | GET | `/approvals` | Approval Center queue |
 
@@ -631,18 +897,19 @@ All routes are under `/api`. JSON in and out; the chat routes stream `text/plain
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/logs/integration?integration_id`, `/logs/integration/{run_id}/records` | Integration runs and per-candidate log entries, exclusions applied |
-| GET | `/logs/audit?q&page&page_size&action&entity_type` | Audit log |
+| GET | `/logs/audit?q&page&page_size&action&entity_type` | Audit log from the Postgres chain (§10.5) |
 | GET | `/quality?days` | Eval runs, latest per-question results, guardrail hits |
 | POST | `/quality/eval` | Start an evaluation in the background (409 if one is running) |
 
 ---
 
-## 10. Security and privacy
+## 14. Security and privacy
 
 | Area | Current posture | Gap or next step |
 |---|---|---|
-| Authentication | None for HR pages (single workspace, demo) | Add SSO and roles; enforce `connectors.manage` |
-| Joiner access | Unguessable portal token (`secrets.token_urlsafe(16)`); the portal never returns owner emails | Expiry and rotation; signed links |
+| Authentication | Email and password; scrypt hashes; server-side sessions behind an httpOnly, SameSite=Lax cookie on one origin; revocation takes effect on the next request; login throttle (§9.2) | SSO (OIDC), MFA, email-based password reset |
+| Authorisation | Five roles, one permission table enforced by one middleware, default deny; managers scoped to their own reports; approvers separate from operators (§9.3–9.5) | Custom roles or SSO group mapping if a customer needs them |
+| Joiner access | Unguessable portal token (`secrets.token_urlsafe(16)`); the portal never returns owner emails; only HR Ops can fetch a joiner's link | Expiry and rotation; signed links |
 | Gmail | OAuth refresh token in `.env`. The poller only searches mail from known employee addresses and labels only what it processes | Narrow scopes; a dedicated mailbox |
 | Secrets | `.env` is git-ignored | A secrets manager |
 | Personal data | Document files on local disk, extracted fields in the graph, sent to the LLM provider for extraction | Encryption at rest, retention policy, a provider with a DPA |
@@ -650,16 +917,22 @@ All routes are under `/api`. JSON in and out; the chat routes stream `text/plain
 | HR-written expressions | Parsed with `ast` against an allow-list, never `eval`'d | — |
 | Connector secrets | Stored in the graph as is; never returned by the API | Encrypt with a KMS or env key |
 | Tracing | Langfuse is off by default. Document scans are redacted; prompt text (names, checklists, policy text) is sent | Self-host Langfuse, or mask names too |
-| Logs | Console lines hold ids and counts only; portal tokens masked. The integration log honours HR's exclusions, old runs included. The audit log is append-only | Ship to a log store with retention |
-| CORS | `*` | Restrict to the frontend origin |
+| Logs | Console lines hold ids and counts only; portal tokens masked. The integration log honours HR's exclusions, old runs included | Ship to a log store with retention |
+| Audit | Append-only at the database (trigger), hash-chained and verifiable, actor and role on every entry (§10) | Periodic `verify_chain` job and an exportable, signed audit trail |
+| CORS | The browser uses the same-origin rewrite, so CORS only affects direct callers: `CORS_ORIGINS` (default `http://localhost:3000`) with credentials | — |
+| Configuration | Required production config is checked at startup; startup stops with a clear message if anything is missing | A secrets manager |
 
 ---
 
-## 11. Limitations and upgrade paths
+## 15. Limitations and upgrade paths
 
 | Simplification | Ceiling | Upgrade path |
 |---|---|---|
-| Single workspace; connector methods take no `conn` or `customer_id` | One organisation | Add a workspace id to every node and query; reinstate per-customer instances |
+| One organisation; connector methods take no `conn` or `customer_id` | One tenant | Add a workspace id to every table, node and query; reinstate per-customer instances |
+| Most HR records still in the graph | No cross-record transactions for joiners, items and documents yet | Phases 1–3 move them to Postgres through the bridge (§12.3) |
+| Login throttle is an in-process counter | Resets on restart; not shared across replicas | Store failures in Postgres (noted in code with `ponytail:`) |
+| Gmail poller and scheduler are bare loops in the lifespan | No retries or dead-lettering for them yet | Phase 4: Temporal schedules; all external calls job- or workflow-backed |
+| No exception-queue screen yet | Dead jobs are visible through `GET /api/work-queue` only | The inbox UI ships with Phase 1's first human-facing producers |
 | Keyword retrieval when no embedding model is set | Fine for dozens of policy chunks | Set `LLM_EMBED_MODEL` (the vector index already exists) |
 | HR co-pilot loads every joiner's open items | About 40 joiners (then trims to named, soon-joining or focused) | Per-joiner digests retrieved by embedding |
 | Connector records matched by scanning JSON values | Demo-sized connectors | Promote `work_email` and `candidate_id` to indexed properties |
@@ -670,7 +943,6 @@ All routes are under `/api`. JSON in and out; the chat routes stream `text/plain
 | Correction emails thread by `threadId` only | Gmail may start a new thread | Set `In-Reply-To` and `References` headers |
 | AwaitVerify optional and off | No human-in-the-loop extraction | Install `awaithumans`, set `AWAITVERIFY_ENABLED=true` |
 | App connectors are demos | Access actions are recorded, not performed | Replace `AppConnector.perform` with the vendor SDK call |
-| No sign-in, so the audit actor is "HR", "Agent" or "System" | No per-person accountability | Pass the user id once authentication exists |
 | Output guardrails run after streaming | A flagged answer is annotated, not withheld | Buffer the answer before sending, at the cost of streaming |
 | Regex input guardrails | Common injection phrasings only | Add a classifier model |
 | Eval covers the employee assistant only, with a free judge by default | Noisy scores; a full run exceeds the free daily limit; extraction and the agent unscored | Paid judge; extraction gold set; scripted agent conversations |
@@ -678,9 +950,11 @@ All routes are under `/api`. JSON in and out; the chat routes stream `text/plain
 
 ---
 
-## 12. Operations
+## 16. Operations
 
-**Run** (see the README for full steps): `docker compose up -d` → `cd backend && uv run uvicorn main:app --port 8000` → `cd frontend && npm run dev`. On first start the backend seeds joiners, owners, rules, roles, templates, policies and connectors. Seeding is additive and skips anything already present.
+**Run** (see the README for full steps): `docker compose up -d` (Postgres and FalkorDB) → `cd backend && uv run uvicorn main:app --port 8000` → `cd frontend && npm run dev`, then sign in at `/login`.
+
+On start, the backend bootstraps itself (§12.1): migrations, the admin and dev accounts, and the legacy audit import. It then seeds joiners, owners, rules, roles, templates, policies and connectors into the graph. Seeding is additive and skips anything already present.
 
 **Configuration** (`.env`):
 | Area | Variables |
@@ -688,12 +962,14 @@ All routes are under `/api`. JSON in and out; the chat routes stream `text/plain
 | LLM | `OPENROUTER_API_KEY`, optional `LLM_BASE_URL`, `LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_EMBED_MODEL` |
 | Gmail | `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`, `HR_MAILBOX`, optional `EMAIL_REDIRECT_TO` (demo: send every candidate email to one inbox) |
 | Human verification | `AWAITVERIFY_ENABLED`, `AWAITVERIFY_API_KEY` |
+| Runtime and sign-in | `ENV` (`production` makes the next three required and turns off dev accounts), `DATABASE_URL`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SESSION_DAYS`, `COOKIE_SECURE`, `CORS_ORIGINS`, `DB_POOL_MAX` |
+| Frontend | `BACKEND_URL` (where the `/api` rewrite points; default `http://localhost:8000`) |
 | Storage and links | `FALKORDB_URL`, `FALKORDB_GRAPH`, `PUBLIC_BASE_URL` |
 | Logging | `LOG_LEVEL` (`DEBUG` adds every graph query) |
 | Tracing | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` |
 | Evaluation | `RAGAS_JUDGE_MODEL`, `RAGAS_JUDGE_BASE_URL`, `RAGAS_JUDGE_API_KEY` |
 
-**Tests:** `cd backend && FALKORDB_GRAPH=test uv run python test_core.py` covers:
+**Tests:** `cd backend && uv run python test_core.py` (it uses the `test` graph and a throwaway Postgres database `azentio_test_core` by itself) covers:
 - Rule matching for India, US, intern and engineer profiles, plus dependency pruning.
 - Blocked and overdue states.
 - Name and DOB matching, expiry, legibility and confidence routing.
@@ -706,15 +982,33 @@ All routes are under `/api`. JSON in and out; the chat routes stream `text/plain
 - An end-to-end integration workflow: documents requested, HR approval, offer sent, employee created.
 - Langfuse redaction of document scans.
 
+`cd backend && uv run python test_phase0.py` (throwaway database `azentio_test`) covers:
+- the permission matrix (40 routes × 5 roles, plus default deny)
+- password hashing, session revocation on logout and on deactivation, the login throttle, the last-admin guard
+- the audit chain: valid chain, UPDATE refused, tamper detected, actor resolved from context
+- jobs: idempotent enqueue, backoff then `dead` plus one `ops` exception, a side effect happening once, no double claim, stuck-job requeue
+- `work_queue` dedupe and role scoping, the bridge parity gate
+- bootstrap: idempotent, and failing fast on missing config
+- manager scoping
+
 `uv run python guardrails.py` runs the guardrail self-checks. `uv run python evals.py` runs a full Ragas evaluation and prints the summary.
 
-The frontend is checked with `npx tsc --noEmit` and `npx eslint`.
+The frontend is checked with `npx tsc --noEmit` and `npx eslint app components`.
+
+`backend/.venv/Scripts/python scripts/smoke.py --base http://localhost:3000` drives headless Chrome against the running stack. For every role it:
+- signs in through the real form
+- checks the navigation and that forbidden pages are gated
+- runs one workflow (HR Ops previews a request email, admin lists users, the manager sees only their reports, the auditor reads sign-ins in the audit log)
+- signs out
+- refreshes `docs/screenshots/`
 
 **Observability**
 | Layer | What it holds | Where to see it |
 |---|---|---|
 | `Event` | Every decision and side effect: emails, verifications, automatic actions, AI calls with model and token count, checklist changes with their reason, escalations, syncs, errors | Per joiner and on `/activity` |
-| Audit log | Who did what, append-only | `/logs` → Audit log |
+| Audit log | Who did what (user email and role), append-only and hash-chained | `/logs` → Audit log; `audit_log.service.verify_chain()` |
+| Jobs and exceptions | Job state, attempts, last error; dead jobs as `ops` exceptions | `jobs` and `work_queue` tables; `GET /api/work-queue` |
+| Health | Process up / dependencies ready | `GET /health`, `GET /ready` |
 | Integration log | Per run and per candidate: actions and how each field was filled, minus HR's exclusions | `/logs` → Integration log, and each integration's Log tab |
 | Console | One `key=value` line per event with a request id; safe to share | Backend stdout |
 | Langfuse (optional) | Every LLM call with prompt, output, latency, tokens and request id | Langfuse UI |
