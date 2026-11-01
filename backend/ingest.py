@@ -218,5 +218,8 @@ DEMO_PROGRESS = {  # employee -> item keys already done, so the dashboard shows 
 
 def demo_progress():
     for eid, keys in DEMO_PROGRESS.items():
-        records.set_items_status(eid, keys, {"document": "Accepted", "ack": "Acknowledged", "task": "Completed"})
+        records.set_items_status(eid, keys, {"ack": "Acknowledged", "task": "Completed"})
+        from documents.seed import accept_for_demo  # documents only through a recorded decision, even for demo data
+        for key in keys:
+            accept_for_demo(eid, key)
         checklist.recompute(eid)

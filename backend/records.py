@@ -253,6 +253,7 @@ def backfill() -> dict:
     skipped = [i["id"] for i in its if i.get("employee_id") not in ids]
     extra_keys = sorted({k for e in emps for k in _split(e, EMP_COLS)[1]} | {k for i in its for k in _split(i, ITEM_COLS)[1]})
     with db.tx() as c:
+        c.execute("SET LOCAL azentio.backfill = '1'")  # history copied as it was; see migration 010
         for e in emps:
             _upsert("employees", EMP_COLS, e, c)
         for i in its:

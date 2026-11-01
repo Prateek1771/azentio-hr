@@ -117,7 +117,7 @@ def decision_history(days: int = BACKTEST_DAYS) -> list[dict]:
                               (SELECT CASE s.kind WHEN 'spot_check_pass' THEN 'pass' ELSE 'fail' END FROM doc_decisions s
                                WHERE s.document_id = dd.document_id AND s.kind LIKE 'spot_check_%%' ORDER BY s.at DESC LIMIT 1) AS spot_check
                        FROM doc_decisions dd JOIN documents d ON d.id = dd.document_id
-                       WHERE dd.decided_by IS NULL AND dd.kind <> 'backfill' AND dd.at > now() - make_interval(days => %s)
+                       WHERE dd.decided_by IS NULL AND dd.kind NOT IN ('backfill', 'demo_seed') AND dd.at > now() - make_interval(days => %s)
                        ORDER BY dd.document_id, dd.at""", (days,))
 
 

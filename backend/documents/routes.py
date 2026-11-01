@@ -149,7 +149,7 @@ def ai_accuracy(days: int = 90):
     since = datetime.now(timezone.utc) - timedelta(days=days)
     first = db.fetch("""SELECT DISTINCT ON (dd.document_id) dd.document_id, dd.kind, dd.reason_code, d.doc_type, dd.model
                         FROM doc_decisions dd JOIN documents d ON d.id = dd.document_id
-                        WHERE dd.at >= %s AND dd.decided_by IS NULL AND dd.kind <> 'backfill'
+                        WHERE dd.at >= %s AND dd.decided_by IS NULL AND dd.kind NOT IN ('backfill', 'demo_seed')
                         ORDER BY dd.document_id, dd.at""", (since,))
     spots = db.fetch("""SELECT dd.kind, d.doc_type FROM doc_decisions dd JOIN documents d ON d.id = dd.document_id
                         WHERE dd.at >= %s AND dd.kind IN ('spot_check_pass','spot_check_fail')""", (since,))

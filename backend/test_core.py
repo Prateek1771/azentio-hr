@@ -172,7 +172,12 @@ gq("MERGE (c:Config {key:'locations'}) SET c.value=$v", v=json.dumps(cfg["locati
 gq("MERGE (c:Config {key:'doc_types'}) SET c.value=$v", v=json.dumps(cfg["doc_types"]))
 gq("MERGE (c:Config {key:'roles'}) SET c.value=$v", v=json.dumps(cfg["roles"]))
 import ingest as _ingest  # noqa: E402
-import records  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+from documents import service as _docsvc  # noqa: E402
+from documents.seed import accept_for_demo  # noqa: E402
+
+_docsvc.UPLOADS = _Path(tempfile.mkdtemp(prefix="azentio-core-"))  # demo documents never land in the real uploads folder
 if not gq1("MATCH (r:Rule) RETURN r LIMIT 1"):
     _ingest.import_requirements("requirements.json", (Path(__file__).parent / "seed" / "requirements.json").read_bytes())
 if not gq1("MATCH (o:Owner {type:'manager'}) RETURN o LIMIT 1"):
@@ -247,7 +252,7 @@ async def _wf():
     first = asked[0]
     for i in _cl.employee_items(first["joiner_id"]):
         if i["kind"] == "document":
-            records.update_item(i["id"], status="Accepted")
+            accept_for_demo(first["joiner_id"], i["key"])  # a document item is Accepted only through a recorded decision
     assert wf_engine.on_documents_changed(first["joiner_id"]) == "applied"
     assert wf_store.item(first["id"])["stage"] == "awaiting_hr_approval"
     try:
