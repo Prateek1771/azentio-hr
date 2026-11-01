@@ -153,11 +153,16 @@ flowchart TD
 - 10% of auto-accepted documents are spot-checked.
 
 ### 3.6 Maintain rules and templates
-**Screens:** Requirement rules, Email templates.
-- **Rule edits** take effect at once today: saving re-derives every joiner's checklist and logs why each item changed.
-  - **Planned (Phase 1):** HR Ops edits a *draft*, and an impact preview shows which joiners gain or lose items and which dates move.
-  - A different person (an Approver) publishes it; compliance rules need two approvers.
-  - Joiners starting within a few days are flagged for HR instead of changed, completed items and documents are never removed, and any version can be rolled back.
+**Screens:** Requirement rules, Draft, Impact preview, Version history, Approval Center, Email templates.
+- **Rule changes (Built, Phase 1)** never take effect directly:
+  1. **HR Ops** clicks *Propose changes* (or the pencil on a rule). A draft opens as a copy of the active version; added, changed and removed rules are marked. A *Compliance rule* toggle marks rules that need two approvers.
+  2. **Preview impact** shows, for every joiner still onboarding, which items are added, cancelled, kept as evidence, which due dates move and who becomes blocked. It's filterable like the dashboard. Joiners starting within 3 days show *HR review: won't change automatically*.
+  3. **Submit for approval** needs a title and a reason.
+  4. **An Approver** (never the author) approves or rejects with a reason on *Approval Center → Policy changes*. Compliance changes need two different approvers. The card warns if the impact has changed since submission.
+  5. **Publishing is automatic** once approved. Completed items and documents are never removed. Each affected joiner gets an activity entry, and new items show in their portal.
+  6. **Joiners starting soon** appear on *Approval Center → Joiners needing review*. HR Ops chooses **Apply** or **Skip** with a reason.
+  7. **Rollback:** *Version history → Roll back to this* creates a new version copied from the old one and sends it for approval.
+- **Requirement uploads** on *Add joiners* become a draft too.
 - **Template edits** show a live preview with a sample joiner.
 
 ### 3.7 Set up an integration with the agent

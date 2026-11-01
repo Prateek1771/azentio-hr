@@ -121,7 +121,7 @@ flowchart TB
 | Web | Built (Phase 0) | Next.js. The only public origin; `next.config.ts` rewrites `/api/*` to `BACKEND_URL` | The browser talks to one origin, so the httpOnly cookie just works and the backend can stay private |
 | API | Built → Planned (Phase 4) | FastAPI. Today one process; from Phase 4, 3+ stateless pods across zones | Becomes stateless once the poller and scheduler move to Temporal |
 | Auth | Built (Phase 0) | Five roles, one permission table, server-side sessions ([ADR 0008](adr/0008-five-role-rbac.md)). OIDC SSO is Proposed | See §7 |
-| System of record | Built (Phase 0) → Planned (Phases 1–3) | PostgreSQL 17 with plain-SQL migrations applied at startup. Employee/Item/Rule move in Phase 1, Document in Phase 2, connectors and integrations in Phase 3. Managed HA with PITR in production | [ADR 0005](adr/0005-postgres-system-of-record.md) |
+| System of record | Built (Phases 0–1) → Planned (Phases 2–3) | PostgreSQL 17 with plain-SQL migrations applied at startup. Employee/Item/Rule moved in Phase 1 (built), Document moves in Phase 2, connectors and integrations in Phase 3. Managed HA with PITR in production | [ADR 0005](adr/0005-postgres-system-of-record.md) |
 | Graph | Built → Planned (Phase 3) | FalkorDB as a rebuild-only read model | [ADR 0006](adr/0006-graph-as-read-model.md) |
 | Job queue / outbox | Built (Phase 0) | The Postgres `jobs` table: the transactional outbox and short-task queue. Idempotency keys, `FOR UPDATE SKIP LOCKED`, exponential backoff, `dead` after `max_attempts` | No broker to run; a change and its follow-up commit together ([ADR 0007](adr/0007-postgres-job-queue.md)) |
 | Workflow orchestration | Planned (Phase 4) | Temporal. Locally `temporalio/auto-setup` with its own `temporal` database in the same Postgres; in production self-hosted or Temporal Cloud, chosen by env. Worker task queue `azentio` | Durable waits on people, timers and schedules ([ADR 0011](adr/0011-temporal-orchestration.md)) |
@@ -162,7 +162,7 @@ flowchart TB
 | `jobs`, `worker_heartbeat` | Built (Phase 0) | Outbox and short-task queue; unique `idempotency_key` |
 | `approval_requests`, `approvals` | Built (Phase 0), used from Phase 1 | One vote per approver; `required` = 2 for compliance rules |
 | `work_queue` | Built (Phase 0) | The single exceptions inbox: assignee role, SLA, `dedupe_key` |
-| `employees`, `checklist_items`, `rule_versions` | Planned (Phase 1) | Immutable rule versions with author, approvers, diff |
+| `employees`, `items`, `rule_set_versions`, `rules` | Built (Phase 1) | Immutable rule versions with author, approvers, diff; items never deleted |
 | `documents`, review decisions, threshold versions | Planned (Phase 2) | Decision provenance: model, prompt version, confidence, threshold version |
 | `connectors`, `integrations`, runs | Planned (Phase 3) | Connector secrets encrypted |
 | `lifecycle_cases` | Planned (Phase 5) | One model for transfer, offboarding, rechecks, rehire, leave |

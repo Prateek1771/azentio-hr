@@ -1,6 +1,13 @@
 # Phase 1: Policy governance + Employee/Item/Rule migration
 
-- **Status:** planned
+- **Status:** done (2026-11-01). `test_phase1.py`: 38 checks; `scripts/smoke.py` runs the policy flow end to end through the UI
+- **Deviations from this plan (decided while building, after reading the code):**
+  1. **Graph projection is updated in place, never dropped and recreated.** Documents stay in the graph until Phase 2 and hang off `Item`/`Employee` nodes (`HAS_DOC`, `SUBMITTED`, `MISMATCH`); recreating nodes would cut those edges. `records.project(eid)` `MERGE`s by id and only rebuilds `HAS_ITEM`, `DEPENDS_ON`, `OWNED_BY`, `REPORTS_TO`.
+  2. **No dual read path.** Every write goes to Postgres and then to the graph projection in the same request, so the stores stay identical. Startup backfills once, switches only if parity passes and records the report in `bridge_state`; if parity fails, startup stops instead of serving graph reads. Rollback of the migration is `git revert` (the graph stays complete because every write still projects to it).
+  3. **Owners aren't snapshotted in versions.** They're directory data, so they stay live; versions hold `doc_types`, `locations`, `departments`, `roles`.
+  4. **Notifications are portal/activity events; email is opt-in** (`POLICY_NOTIFY_EMAIL=true`), so publishing demo data doesn't email seeded joiners.
+  5. **Seed:** the near-start exception for Kabir isn't fabricated; it appears naturally when the seeded v2 is published. A second dev approver (`approver2@azentio.local`) exists so the two-approver flow can be demonstrated. `author_id` is nullable (NULL = system, for v1).
+  6. **`PUT/DELETE /api/rules/*` return 403**, not 404: the permission table refuses writes to that path before routing.
 - **Depends on:** Phase 0 (`shared/db.py`, `shared/jobs.py`, `shared/bridge.py`, `audit/service.py`, `identity/perms.py`, `work_queue`, `approval_requests`/`approvals` tables)
 - **Branch:** `phase-1-policy-governance`
 - **Orchestration note:** in this phase, waiting for an approval is plain Postgres state: the `approval_requests` and `approvals` tables plus the `work_queue` row, with publishing done by a job. Phase 4 wraps this in a Temporal `RuleVersionApprovalWorkflow` ([ADR 0011](../adr/0011-temporal-orchestration.md)) **without changing these tables**, so nothing built here has to be redone.

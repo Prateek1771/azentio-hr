@@ -11,13 +11,16 @@ azentio-hr/
 ├── AGENTS.md · CLAUDE.md        brief for coding agents (kept current with every structural change)
 ├── backend/                     FastAPI app (Python 3.12, uv)
 │   ├── main.py                  app setup, lifespan, auth middleware, manager scoping, /health, /ready,
-│   │                            onboarding/portal/rules/template routes
+│   │                            onboarding/portal/template routes, GET /api/rules (active version)
 │   ├── shared/                  Built (Phase 0): cross-cutting foundation
 │   │   ├── db.py                Postgres pool, tx(), fetch/fetch1/execute, migrate(), use_test_database()
 │   │   ├── jobs.py              transactional outbox + short-task queue (enqueue, @handler, worker)
 │   │   ├── bridge.py            which store each migrating record type is read from; parity gate
-│   │   └── bootstrap.py         idempotent startup: config check, DB wait, migrations, users
-│   ├── migrations/              Built (Phase 0): 001_identity, 002_audit, 003_jobs, 004_approvals_work_queue
+│   │   └── bootstrap.py         idempotent startup: config check, DB wait, migrations, users, records migration gate
+│   ├── migrations/              001–004 (Phase 0), 005_core_records, 006_policy_versions, 007_item_notices (Phase 1)
+│   ├── records.py               Built (Phase 1): every Employee/Item read and write; graph projection; backfill + parity
+│   ├── policy/                  Built (Phase 1): store (versions, drafts, diff), replay (pure plan_diff + apply),
+│   │                            service (preview, submit/approve/reject/rollback, publish + notify jobs), routes
 │   ├── identity/                Built (Phase 0): perms.py (the one permission table), service.py, routes.py
 │   ├── audit_log/service.py     Built (Phase 0): hash-chained audit log in Postgres
 │   ├── audit.py                 audit entry point used everywhere (actor from the signed-in user)
@@ -25,7 +28,7 @@ azentio-hr/
 │   ├── connector_routes.py      /api/connectors/*
 │   ├── integration_routes.py    /api/integrations/*, /approvals, /logs/*
 │   ├── quality_routes.py        /api/quality/*
-│   ├── checklist.py             rules engine
+│   ├── checklist.py             rules engine (pure build_items/view_state; reads the active rule-set version)
 │   ├── validate.py              deterministic document checks
 │   ├── extract.py · llm.py      vision extraction, LLM client
 │   ├── pipeline.py              shared document intake
@@ -38,15 +41,16 @@ azentio-hr/
 │   ├── connectors/              base, registry, candidates, hr_portal, apps, sync, seed
 │   ├── integrations/            store, service, chat, agent, engine, mapping, expr, delivery, run_log
 │   ├── seed/                    sample data, policies, eval set
-│   └── test_core.py · test_phase0.py   assert-based self-checks on throwaway databases
+│   └── test_core.py · test_phase0.py · test_phase1.py   assert-based self-checks on throwaway databases
 ├── frontend/                    Next.js 16 app
 │   ├── next.config.ts           rewrites /api/* to BACKEND_URL (same origin, httpOnly cookie)
 │   ├── app/login/               sign-in
-│   ├── app/(hr)/<page>/         HR pages, one folder per route (incl. users/)
+│   ├── app/(hr)/<page>/         HR pages, one folder per route (incl. users/, rules/draft, rules/draft/preview, rules/history)
 │   ├── app/portal/[token]/      employee portal (public, token-scoped)
-│   ├── components/              feature components, auth.tsx (MeProvider, can, RoleGate), app-shell.tsx, ui/
-│   └── lib/                     api client (401 → /login) and types, utils
-├── scripts/smoke.py             UI smoke test: every role signs in, navigates, runs a workflow
+│   ├── components/              feature components, auth.tsx (MeProvider, can, RoleGate), app-shell.tsx,
+│   │                            rule-form.tsx, policy-diff.tsx, impact-preview.tsx, ui/
+│   └── lib/                     api client (401 → /login) and types, policy.ts (openDraft), utils
+├── scripts/smoke.py             UI smoke test: every role signs in, navigates, runs a workflow; full policy flow
 ├── docs/                        these docs, plans/, adr/, screenshots/
 └── docker-compose.yml           Postgres 17 + FalkorDB
 ```
@@ -61,6 +65,8 @@ These hold now and are checked in review. The first column says where each rule 
 | **Every human action is audited** through `audit.record_audit(...)`. Pass `conn=` so the entry commits with the change | `audit.py` → `audit_log/service.py` | The actor is resolved from the request; the chain stays continuous |
 | **Follow-up work is enqueued in the same transaction** as the change that caused it (`jobs.enqueue(..., conn=c)`), with an idempotency key on every external side effect | `shared/jobs.py` | The outbox can't lose work; retries can't duplicate side effects |
 | **Background work has one owner** ([ADR 0011](adr/0011-temporal-orchestration.md)) | see the table below | No double retries; it's clear which system is responsible |
+| **Employees and items go through `records.py`.** No direct Cypher writes to `Employee`/`Item`; after a write, the graph projection is refreshed in place in the same request. Queries that join documents, events or connector records may read the projection | `records.py` | One write path keeps Postgres and the projection identical |
+| **Rules change only by publishing a version.** No code writes rules for live joiners; replay never deletes items (cancel or keep as evidence) | `policy/` | Policy changes are reviewable, reversible and never lose evidence |
 | **Read migrating records through the bridge.** A record type is read from exactly one store; it switches to Postgres only after `parity()` passes; graph writes stop only after every read path has switched | `shared/bridge.py` | Two stores never answer the same question differently |
 | **Postgres schema changes are new numbered migrations.** Never edit an applied file; each must run inside a transaction | `backend/migrations/` | Startup applies them automatically on every environment |
 | **Anything that needs a person opens an exception** in `work_queue`, assigned to a role, deduplicated by cause | `work_queue.py` | Humans act at policy gates, not by watching dashboards |

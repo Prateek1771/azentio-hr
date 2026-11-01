@@ -88,8 +88,8 @@ flowchart TB
         WQ["Exception queue<br/>work_queue"]
     end
     subgraph Data
-        PG[("PostgreSQL<br/>users · sessions · audit · jobs<br/>approvals · work_queue")]
-        G[("FalkorDB graph 'hr'<br/>joiners · items · documents · rules<br/>connectors · integrations")]
+        PG[("PostgreSQL<br/>users · sessions · audit · jobs<br/>approvals · work_queue<br/>employees · items · rule-set versions")]
+        G[("FalkorDB graph 'hr'<br/>projection of joiners · items · dependencies<br/>documents · connectors · integrations (until Phases 2–3)")]
         F[["uploads/"]]
     end
     TP["Temporal<br/>(planned, Phase 4)"]
@@ -112,8 +112,8 @@ flowchart TB
 | Employee portal | Checklist timeline, uploads, policy acknowledgements, assistant | Same Next.js app, token-scoped routes, no account |
 | Next.js server | Serves the app and rewrites `/api/*` to the backend, so browser and API share one origin and the session cookie stays httpOnly | `next.config.ts` rewrites |
 | Backend | All business logic, permission checks, the LLM calls, email, background work | Python 3.12, FastAPI, uv |
-| PostgreSQL | **Built (Phase 0):** system of record for users, sessions, the audit chain, jobs (outbox + short-task queue), approvals and the exception queue. **Planned:** Employee, Item and Rule (Phase 1); Document (Phase 2); connectors and integrations (Phase 3) | Postgres 17, plain SQL via `psycopg`, migrations applied on start |
-| Graph DB | Until Phases 1–3 finish, it still holds joiners, items, dependencies, documents, rules, connectors and integrations. Afterwards it's a read model only: dependency graph, relationship view, policy chunks | FalkorDB (Cypher) |
+| PostgreSQL | **Built (Phases 0–1):** system of record for users, sessions, the audit chain, jobs (outbox + short-task queue), approvals, the exception queue, **employees, checklist items and versioned rule sets**. **Planned:** Document (Phase 2); connectors and integrations (Phase 3) | Postgres 17, plain SQL via `psycopg`, migrations applied on start |
+| Graph DB | A projection of joiners, items and dependencies (refreshed in place after every write, Phase 1), plus documents, connectors and integrations until Phases 2–3. Afterwards it's a read model only: dependency graph, relationship view, policy chunks | FalkorDB (Cypher) |
 | File store | Original documents | Local disk |
 | Temporal | **Planned (Phase 4):** durable workflows (lifecycle cases, escalation ladders, approval waits). Business state stays in Postgres | Temporal server + Python SDK |
 
@@ -178,7 +178,7 @@ The repository runs as one backend process, Postgres and FalkorDB in Docker, and
 | Phase | Theme | Status |
 |---|---|---|
 | 0 | Trust + foundation: sign-in, 5 roles, audit chain, jobs/outbox, exception queue, bootstrap, `/ready` | **Built** |
-| 1 | Policy governance; Employee, Item, Rule move to Postgres | Planned |
+| 1 | Policy governance; Employee, Item, Rule move to Postgres | **Built** |
 | 2 | AI control (risk tiers, review queue); Document moves to Postgres | Planned |
 | 3 | Retire graph record storage; graph becomes a rebuild-only read model | Planned |
 | 4 | Ops backbone: all external calls job- or workflow-backed, Temporal, DLQ screen, alerts, backups, CI | Planned |

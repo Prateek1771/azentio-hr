@@ -195,9 +195,9 @@ Every HR route sits inside the app shell, which loads the signed-in user and sho
 
 ## 4. Data model
 
-Two stores. Postgres is the system of record for everything built in Phase 0 and, phase by phase, for the records below that still live in the graph ([ADR 0005](adr/0005-postgres-system-of-record.md)). `shared/bridge.py` names the one store each migrating record type is read from (§12.3).
+Two stores. Postgres is the system of record for everything built in Phases 0 and 1 (including employees, checklist items and rule-set versions) and, phase by phase, for the records below that still live in the graph ([ADR 0005](adr/0005-postgres-system-of-record.md)). `shared/bridge.py` names the one store each migrating record type is read from (§12.3).
 
-### 4.1 Postgres (Built, Phase 0)
+### 4.1 Postgres (Built, Phases 0–1)
 
 | Table | Key columns | Purpose |
 |---|---|---|
@@ -210,8 +210,14 @@ Two stores. Postgres is the system of record for everything built in Phase 0 and
 | `approvals` | `request_id, approver_id (PK together), decision (approve, reject), reason, ts` | One vote per person per request |
 | `work_queue` | `id, kind, entity_type, entity_id, reason, detail (jsonb), assignee_role, assignee_id, status (open, in_progress, resolved, dismissed), sla_due, resolution, resolved_by, created_at, resolved_at, dedupe_key (unique)` | Exception queue (§11.3) |
 | `schema_migrations` | `name, applied_at` | Which migration files have run |
+| `employees` (Phase 1) | `id, name, email (unique lower), role, grade, department, location, manager_email, joining_date, date_of_birth, worker_type, token (unique), thread_id, doc_scope[], status (active, archived), extra (jsonb), created_at, updated_at` | Joiners. Graph-only properties (`created`, `request_sent`, `integration_id`) live in `extra` and come back merged |
+| `items` (Phase 1) | `id, employee_id, key (unique per employee), name, kind, category, status, due, reason, policy_ref, auto, depends[], owner_name, owner_email, rule_id, rule_version_id, superseded_by_version, cancelled_by_version, extra` | Checklist items. Never deleted: a removed requirement is either cancelled or kept as evidence |
+| `bridge_state` (Phase 1) | `record_type, source, report (jsonb), switched_at` | Which store a migrated record type is read from, with the parity report that allowed the switch |
+| `rule_set_versions` (Phase 1) | `id, number (unique), state (draft, pending_approval, approved, active, superseded, rejected), based_on, rollback_of, title, reason, config (jsonb), required_approvals (1–2), preview (jsonb), author_id (NULL = system), created_at, submitted_at, published_at` | Rule-set versions. Partial unique indexes allow one `active` and one open draft |
+| `rules` (Phase 1) | `version_id, id (PK together), ord, item, name, kind, category, match (jsonb), offset_days, depends_on[], description, policy_ref, auto, compliance` | The rules of each version. A trigger freezes every version except an open draft |
+| `item_notices` (Phase 1) | `employee_id, version_id (PK together), sent_at` | One "new requirements" notice per joiner per published version |
 
-**Planned:** Employee, Item, Rule tables (Phase 1); Document and review decisions (Phase 2); connectors, integrations and runs (Phase 3). Schemas are in the [phase plans](plans/).
+**Planned:** Document and review decisions (Phase 2); connectors, integrations and runs (Phase 3). Schemas are in the [phase plans](plans/).
 
 ### 4.2 FalkorDB graph `hr`
 
@@ -364,13 +370,13 @@ sequenceDiagram
 ```
 
 ### 5.6 Joining-date or role change (scenario 4)
-`PATCH /employees/{id}` → `checklist.regenerate(eid, reason)`:
-1. Re-run every rule against the updated profile.
-2. Remove items that no longer apply, add new ones, recalculate due dates and owners. Each change is logged as an event that names the reason (for example, "due date moved 2026-11-06 → 2026-11-27 (joining date 2026-11-16 → 2026-12-07)").
-3. Items that still apply keep their progress (accepted documents stay accepted).
-4. Rebuild the `DEPENDS_ON` and `OWNED_BY` edges, then run `recompute()`.
+`PATCH /employees/{id}` → `checklist.regenerate(eid, reason)` → `policy.service.replay_one`:
+1. Build the plan from the **active rule-set version** for the updated profile.
+2. Apply the safe replay (§6.3): add new items, refresh due dates and owners on kept items, cancel items that no longer apply if they aren't done, keep done items or items with documents as evidence. Each change is logged as an event naming the reason (for example, "due date moved 2026-11-06 → 2026-11-27 (joining date 2026-11-16 → 2026-12-07)").
+3. Items that still apply keep their progress; nothing is deleted.
+4. Refresh the graph projection (`records.project`), then run `recompute()`.
 
-Editing a rule on `/rules` runs the same regeneration for every joiner.
+A direct HR edit is itself the human decision, so it skips the near-start gate. Rule changes reach joiners only by publishing a version (§6.2).
 
 ### 5.7 Overdue escalation (scenario 5)
 `POST /escalate` finds every task in the derived `overdue` state that has an owner email, works out which items it is blocking (reverse dependencies), and sends the escalation template to the owner. The seed routes owner emails to `+it`, `+facilities`, `+compliance` and `+hr` aliases of the HR mailbox, so escalations can be seen in one inbox during a demo.
@@ -503,12 +509,12 @@ A later upload never downgrades an item that is already *Accepted*.
 
 ## 6. Rules engine
 
-**Rule shape** (`seed/requirements.json`, editable on `/rules`):
+**Rule shape** (each rule-set version holds a full set; `seed/requirements.json` seeds v1):
 ```json
 {"id": "R-EXP", "item": "experience_letter", "kind": "document", "category": "HR",
  "match": {"grade_min": 3}, "offset_days": -7, "depends_on": [],
  "description": "Lateral hires at grade G3 and above must provide a relieving letter",
- "policy_ref": "document-submission-policy.md", "auto": ""}
+ "policy_ref": "document-submission-policy.md", "auto": "", "compliance": false}
 ```
 
 | Concept | Behaviour |
@@ -521,7 +527,42 @@ A later upload never downgrades an item that is already *Accepted*.
 | `auto` | `complete`: finishes itself when unblocked (HR record). `request`: moves to Requested when unblocked (laptop, email account, badge, access). |
 | `regenerate` vs `recompute` | `regenerate` re-derives *which* items exist (profile or rule change). `recompute` only advances *statuses* (any state change). |
 
-Seeded rules cover identity and address (everyone), PAN and bank (India), education (Engineering), experience letter (G3+), I-9 and W-4 (US), BGV, HR record, laptop, email account, badge, orientation, infosec and code-of-conduct acknowledgements, developer tools (Engineering) and CRM (Sales).
+Seeded rules cover identity and address (everyone), PAN and bank (India), education (Engineering), experience letter (G3+), I-9 and W-4 (US), BGV, HR record, laptop, email account, badge, orientation, infosec and code-of-conduct acknowledgements, developer tools (Engineering) and CRM (Sales). `R-ID`, `R-I9` and `R-BGV` are flagged `compliance`.
+
+### 6.1 Rule-set versions (Built, Phase 1; [ADR 0009](adr/0009-governed-policy-versions.md))
+- A version is a snapshot of **all** rules plus the engine config (`doc_types`, `locations`, `departments`, `roles`). Owners are directory data and stay live in the graph.
+- `checklist.load_rules()` and `config()` read the active version (`policy/store.ensure_active()` creates v1 from the legacy graph rules the first time, so behaviour didn't change).
+- Exactly one version is `active` and at most one is open (`draft`, `pending_approval` or `approved`); partial unique indexes enforce both. The `rules_frozen` trigger refuses writes to any version that isn't a draft.
+- Requirement uploads on **Add joiners** become a draft (`ingest.import_requirements_draft`); they never go live directly.
+
+### 6.2 Workflow (`policy/service.py`)
+```
+draft ──submit──▶ pending_approval ──approve ×1 (×2 if a compliance rule changed)──▶ approved ──policy.publish job──▶ active
+  ▲                       │                                                                         │
+  └──── (new draft) ◀─ reject                                                     superseded ◀───┘ (when a newer one goes active)
+```
+- `submit(vid)`: needs at least one rule change; stores the impact summary in `preview`; computes `required_approvals` (2 when any added, removed or changed rule is or was `compliance`); opens an `approval_requests` row and a `policy.approval` item in `work_queue` for approvers.
+- `approve` / `reject`: an approver, never the author (checked in the service **and** by the `approvals_not_author` trigger), one vote per person. Reject needs a reason. Reaching the required count sets `approved` and enqueues `policy.publish` with key `policy.publish:<id>` in the same transaction.
+- `rollback(vid)`: copies an older published version into a new draft (`rollback_of` set) and submits it straight away. It still needs approval.
+
+### 6.3 Safe in-flight replay (`policy/replay.py`)
+`plan_diff(current_items, plan, has_docs)` is pure; preview and publish both call it, so the preview always matches what publishing does.
+
+| Case | What happens |
+|---|---|
+| Key in the new plan, not in the checklist | Insert with the initial status; enqueue `notify.item_added` (key `notify.item_added:<eid>:<vid>`) |
+| Key in the plan, item previously cancelled or kept as evidence | Reactivate the same row: documents stay linked; a cancelled item restarts, a done item stays done |
+| Key in both | Refresh due, owner, reason, dependencies and `rule_version_id`; status and documents untouched |
+| Key no longer in the plan, item done or has documents | Keep it, set `superseded_by_version` (evidence) |
+| Key no longer in the plan, not started | `status = 'Cancelled'`, set `cancelled_by_version` |
+
+Nothing is deleted. `records.items()` hides cancelled and superseded rows from the live checklist; `include_closed=True` returns them.
+
+**Publish** (`publish(vid)`): in-flight joiners are those with `status='active'` and a joining date no more than 30 days ago. Joiners are processed in batches of 50, one transaction per batch. A joiner starting within `NEAR_START_DAYS` (default 3) isn't changed: a `policy.near_start` item opens in `work_queue` for HR Ops (SLA: the day before joining) with the computed changes. Only after every batch does the version flip to `active` and the previous one to `superseded`. Re-running is a no-op: `plan_diff` against the updated state finds nothing to do.
+
+**Near-start resolution:** `POST /api/work-queue/{id}/resolve` with `action: apply | skip` and a reason. `apply` runs `replay_one` for that joiner against the active version; both are audited.
+
+**Notifications:** `notify.item_added` records one `item_notices` row per joiner per version and writes an activity event. Email is opt-in with `POLICY_NOTIFY_EMAIL=true`.
 
 ---
 
@@ -645,9 +686,11 @@ Joiners have no account. Their portal token is the credential, and `/api/portal/
 | read / write | `/api/quality` / `/api/quality/eval` | STAFF / admin |
 | read | `/api/employees/*/portal-link` | hr_ops (the link lets its holder act as the joiner) |
 | read | `/api/employees*`, `/api/stats`, `/api/events`, `/api/documents/*/file` | STAFF + manager (scoped) |
-| read | `/api/templates*`, `/api/rules*`, `/api/policies*` | STAFF |
+| read | `/api/templates*`, `/api/rules*`, `/api/policies*`, `/api/policy/*` | STAFF |
+| write | `/api/policy/drafts*` (open, edit, discard, submit), `/api/policy/versions/{id}/rollback` | hr_ops |
+| write | `/api/policy/versions/{id}/approve`, `/reject` | approver |
 | write | `/api/hr/chat` | STAFF |
-| write | `/api/employees*`, `/api/items/*`, `/api/escalate`, `/api/gmail/poll`, `/api/ingest`, `/api/onboard`, `/api/templates*`, `/api/rules*` | hr_ops |
+| write | `/api/employees*`, `/api/items/*`, `/api/escalate`, `/api/gmail/poll`, `/api/ingest`, `/api/onboard`, `/api/templates*` | hr_ops |
 
 `test_phase0.py` checks 40 representative routes against all 5 roles, including the default deny.
 
@@ -800,7 +843,9 @@ Every step is idempotent: running it twice gives the same state as running it on
   It returns 503 with the failing component named, and recovers without a restart once the dependency is back.
 
 ### 12.3 The migration bridge (`shared/bridge.py`)
-- `SOURCE` maps each migrating record type to the one store it's read from. Today `Employee`, `Item`, `Rule` and `Document` are all `graph`.
+- `SOURCE` maps each migrating record type to the one store it's read from. `Employee` and `Item` are `postgres` (Phase 1, persisted in `bridge_state`); rules are versioned in Postgres; `Document` is still `graph` until Phase 2.
+- **Phase 1 records** (`records.py`): every Employee/Item read and write goes through it. After each write, `project(eid)` refreshes that employee's nodes in the graph in place (`MERGE` by id), so document edges stay attached. `rebuild_graph()` repairs the projection from Postgres.
+- **Startup gate** (`bootstrap.migrate_records`): on first run it backfills from the graph, switches only if parity passes and records the report. If parity fails, startup stops with the mismatch instead of falling back to graph reads, so there's never a second read path to maintain.
 - `parity(graph_rows, pg_rows)` compares row counts and an order-independent sha256 over canonical rows, and lists missing or extra keys.
 - `switch(type, …)` moves reads to Postgres only if parity passes, and raises `ParityError` otherwise.
 - **Steps for each record type (Phases 1–3):**
@@ -843,7 +888,10 @@ Every route needs a signed-in session, except `/api/auth/login` and `/api/portal
 |---|---|---|
 | POST | `/ingest` (multipart `kind`, `file`) | Import employees, owners, requirements or policies |
 | GET / PUT | `/templates`, `/templates/{tid}` | Email templates |
-| GET / PUT / DELETE | `/rules`, `/rules/{rid}` | Rules plus doc types, departments, locations, roles, owners |
+| GET | `/rules` | The active version's rules plus doc types, departments, locations, roles, owners and `version {id, number, published_at, author_email}`. Rules can't be edited here |
+| GET | `/policy/versions`, `/policy/versions/{id}`, `/policy/versions/{id}/diff?against=`, `/policy/versions/{id}/preview?department=&role=&location=&join_from=&join_to=&status=` | Version history, one version with its diff and approvals, rule diff, impact preview |
+| POST / PUT / DELETE | `/policy/drafts`, `/policy/drafts/{id}/rules/{rid}`, `/policy/drafts/{id}`, `/policy/drafts/{id}/submit` | Open a draft (copy of active), edit or remove a rule, discard, submit `{title, reason}` |
+| POST | `/policy/versions/{id}/approve`, `/reject`, `/rollback` | Decide `{reason}` (required to reject); roll back to a published version |
 | GET | `/policies` | Policy texts |
 
 **Employee portal** (token-scoped)

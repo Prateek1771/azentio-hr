@@ -30,9 +30,25 @@ This app coordinates a new joiner's onboarding from offer to day one:
 
 ![Document request preview](docs/screenshots/hr_ops-email-preview.png)
 
-**Requirement rules**: Which documents and tasks apply by role, department, grade and location, and why.
+**Requirement rules**: Which documents and tasks apply by role, department, grade and location, and why. The active rule set is a numbered version; compliance rules are flagged.
 
-![Requirement rules](docs/screenshots/hr_ops-rules.png)
+![Requirement rules](docs/screenshots/rules.png)
+
+**Rule changes go through a draft**: HR Ops edits a copy. Nothing reaches joiners until it's approved.
+
+![Draft rule set](docs/screenshots/rules-draft.png)
+
+**Impact preview**: Before submitting, see exactly what publishing would do to every joiner still onboarding. Joiners starting within a few days are held for HR review instead of changing automatically.
+
+![Impact preview](docs/screenshots/rules-preview.png)
+
+**Approval**: Someone other than the author approves; changes to compliance rules need two approvers. Publishing then runs automatically and never deletes completed work or documents.
+
+![Policy approval](docs/screenshots/approvals-policy.png)
+
+**Version history**: Every version is kept with who wrote it, who approved it and why. Rolling back creates a new version that goes through approval too.
+
+![Version history](docs/screenshots/rules-history.png)
 
 **Email templates**: Document-request emails with per-employee variables and a live preview.
 
@@ -78,6 +94,7 @@ Sign in at http://localhost:3000/login. In development the backend creates one a
 | `admin@azentio.local` | Admin: users, connectors, integrations | `admin-dev-pass` (or `ADMIN_PASSWORD`) |
 | `hrops@azentio.local` | HR Ops: runs onboarding | `hrops-dev-pass` |
 | `approver@azentio.local` | Approver: signs off documents and policy | `approver-dev-pass` |
+| `approver2@azentio.local` | Approver: second sign-off for compliance rules | `approver2-dev-pass` |
 | `manager@azentio.local` | Manager: read-only, own reports | `manager-dev-pass` |
 | `auditor@azentio.local` | Auditor: read-only, including the audit log | `auditor-dev-pass` |
 
@@ -96,7 +113,8 @@ Self-checks (each uses a throwaway database, never live data):
 ```bash
 cd backend && uv run python test_core.py     # rules, validation, ingestion, connectors, integrations
 cd backend && uv run python test_phase0.py   # sign-in, permissions for every role, audit chain, job queue, bootstrap
-backend/.venv/Scripts/python scripts/smoke.py --base http://localhost:3000   # UI: every role signs in, navigates, runs a workflow
+cd backend && uv run python test_phase1.py   # rule-set versions, approvals, safe replay, rollback, migration parity
+backend/.venv/Scripts/python scripts/smoke.py --base http://localhost:3000   # UI: every role signs in, navigates, runs a workflow; full rule-change flow
 ```
 
 ## What's where
