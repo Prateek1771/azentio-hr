@@ -300,5 +300,50 @@ check("test_ai_accuracy", acc["documents"] >= 8 and acc["spot_checks"] == 1 and 
 from documents.routes import wilson  # noqa: E402
 check("test_wilson_interval", wilson(27, 30)[0] > 0.7 and wilson(0, 0) is None)
 
+# ---------- thresholds live in rule-set versions: governed like rules ----------
+from policy import service as psvc  # noqa: E402
+from policy.store import PolicyError  # noqa: E402
+
+fixed = [{"doc_type": "bank_details", "kind": "routed_review", "reason_code": "low_confidence", "confidence": 0.90},
+         {"doc_type": "bank_details", "kind": "routed_review", "reason_code": "low_confidence", "confidence": 0.85},
+         {"doc_type": "address_proof", "kind": "auto_accept", "reason_code": "auto_accept", "confidence": 0.91, "spot_check": "fail"},
+         {"doc_type": "photo_id", "kind": "routed_review", "reason_code": "high_risk", "confidence": 0.99},
+         {"doc_type": "pan_card", "kind": "auto_correction", "reason_code": "content_issues", "confidence": 0.99}]
+bt = route.backtest(fixed, route.policy_for({"doc_policy": {"types": {"bank_details": {"auto_accept_min": 0.88},
+                                                                      "address_proof": {"auto_accept_min": 0.95}}}}))
+check("test_backtest_pure", bt == route.backtest(fixed, route.policy_for({"doc_policy": {"types": {
+    "bank_details": {"auto_accept_min": 0.88}, "address_proof": {"auto_accept_min": 0.95}}}}))
+      and bt["decisions"] == 4 and bt["changed"] == 2 and bt["newly_auto_accepted"] == 1 and bt["newly_reviewed"] == 1, bt)
+
+vid = pstore.open_draft(hr["id"])
+e = raises(lambda: pstore.set_draft_doc_policy(vid, {"types": {"photo_id": {"tier": "low"}}}), PolicyError)
+check("test_always_high_floor", e is not None and e.status == 422)
+e = raises(lambda: pstore.set_draft_doc_policy(vid, {"default": {"auto_accept_min": 0.3}}), PolicyError)
+check("test_threshold_bounds", e is not None and e.status == 422)
+pstore.set_draft_doc_policy(vid, {"types": {"bank_details": {"auto_accept_min": 0.95}}})
+check("test_threshold_raise_needs_one", psvc.required_approvals(vid) == 1)
+pstore.set_draft_doc_policy(vid, {"types": {"bank_details": {"auto_accept_min": 0.88}}})
+detail = psvc.version_detail(vid)
+check("test_threshold_change_in_diff", detail["diff"]["doc_policy"] == [
+    {"type": "bank_details", "field": "auto_accept_min", "from": 0.92, "to": 0.88}], detail["diff"]["doc_policy"])
+check("test_threshold_change_needs_two", psvc.required_approvals(vid) == 2)
+pv = psvc.preview(vid)
+check("test_preview_backtest", pv["backtest"] and pv["backtest"]["newly_auto_accepted"] >= 1
+      and pv["summary"]["joiners"] == 0, pv["backtest"])  # thresholds don't touch anyone's checklist
+psvc.submit(vid, hr, "Bank letters at 0.88", "Backtest shows the misses were all fine")
+check("test_submitted_needs_two", pstore.version(vid)["required_approvals"] == 2 and pstore.version(vid)["preview"]["backtest"])
+e = raises(lambda: db.execute("UPDATE rule_set_versions SET config = config || '{\"x\": 1}' WHERE id=%s", (vid,)), psycopg.Error)
+check("test_config_frozen_after_draft", e is not None)
+psvc.approve(vid, ap1, "ok")
+psvc.approve(vid, ap2, "ok too")
+before = docs.get(b_id)
+drain()
+check("test_threshold_publish", pstore.active_version()["id"] == vid)
+n_id = upload(aarav, "bank_details", "cheque2.png", good("bank_details", "Aarav Sharma", 0.90))
+drain()
+check("test_new_threshold_applies_to_new_documents", docs.get(n_id)["status"] == "Accepted"
+      and last_decision(n_id)["policy_version_id"] == vid and abs(last_decision(n_id)["threshold"] - 0.88) < 1e-6)
+check("test_old_documents_not_redecided", docs.get(b_id)["current_decision_id"] == before["current_decision_id"])
+
 check("audit_chain_verifies", verify_chain()[0])
 print(f"\nphase 2: {ok} checks passed")

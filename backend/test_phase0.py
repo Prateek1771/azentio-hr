@@ -45,6 +45,7 @@ MATRIX = [  # method, path, roles allowed
     ("POST", "/api/policy/drafts/3/submit", {H}), ("DELETE", "/api/policy/drafts/3", {H}),
     ("POST", "/api/policy/versions/3/approve", {P}), ("POST", "/api/policy/versions/3/reject", {P}),
     ("POST", "/api/policy/versions/3/rollback", {H}),
+    ("PUT", "/api/policy/drafts/3/doc-policy", {H}),
     ("POST", "/api/items/i1/status", {H}), ("POST", "/api/escalate", {H}), ("POST", "/api/ingest", {H}),
     ("POST", "/api/onboard", {H}), ("POST", "/api/gmail/poll", {H}), ("POST", "/api/hr/chat", {A, H, P, U}),
     ("GET", "/api/approvals", {A, H, P, U}),

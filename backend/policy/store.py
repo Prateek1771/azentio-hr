@@ -7,7 +7,7 @@ import json
 
 from shared import db
 
-CONFIG_KEYS = ("doc_types", "locations", "departments", "roles")
+CONFIG_KEYS = ("doc_types", "locations", "departments", "roles", "doc_policy")  # doc_policy: Phase 2 tiers/thresholds
 RULE_FIELDS = ("id", "item", "name", "kind", "category", "match", "offset_days", "depends_on", "description",
                "policy_ref", "auto", "compliance")
 COMPLIANCE_DEFAULT = {"R-ID", "R-I9", "R-BGV"}  # identity, work authorisation, background verification
@@ -158,6 +158,58 @@ def discard_draft(vid: int, user: dict) -> None:
 
 
 # ---------- diff ----------
+
+def set_draft_doc_policy(vid: int, doc_policy: dict) -> dict:
+    """Replace the draft's document policy (tiers, auto-accept thresholds, spot-check rate, extraction deadline).
+    The legal floor (documents.route.ALWAYS_HIGH) can't be lowered: that needs a code change and an ADR."""
+    from documents.route import ALWAYS_HIGH, policy_for
+    dp = {"default": dict(doc_policy.get("default") or {}), "types": {k: dict(v or {}) for k, v in (doc_policy.get("types") or {}).items()}}
+    for k in ("spot_check_rate", "extraction_deadline_minutes"):
+        if k in doc_policy:
+            dp[k] = doc_policy[k]
+    for name, t in [("default", dp["default"]), *dp["types"].items()]:
+        if "tier" in t and t["tier"] not in ("low", "high"):
+            raise PolicyError(422, f"{name}: tier must be low or high")
+        if "auto_accept_min" in t and not (isinstance(t["auto_accept_min"], (int, float)) and 0.5 <= t["auto_accept_min"] <= 1.0):
+            raise PolicyError(422, f"{name}: auto_accept_min must be between 0.5 and 1.0")
+        if name in ALWAYS_HIGH and t.get("tier") == "low":
+            raise PolicyError(422, f"{name} is on the legal floor (always high risk) and can't be made low risk by a policy change")
+    if "spot_check_rate" in dp and not (isinstance(dp["spot_check_rate"], (int, float)) and 0 <= dp["spot_check_rate"] <= 1):
+        raise PolicyError(422, "spot_check_rate must be between 0 and 1")
+    if "extraction_deadline_minutes" in dp and not (isinstance(dp["extraction_deadline_minutes"], (int, float))
+                                                    and 1 <= dp["extraction_deadline_minutes"] <= 1440):
+        raise PolicyError(422, "extraction_deadline_minutes must be between 1 and 1440")
+    with db.tx() as c:
+        _draft(vid, c)
+        c.execute("UPDATE rule_set_versions SET config = config || %s WHERE id=%s", (db.Json({"doc_policy": dp}), vid))
+    return policy_for({"doc_policy": dp})
+
+
+def doc_policy_diff(old_cfg: dict, new_cfg: dict) -> list[dict]:
+    """Changes to the *effective* document policy: [{type, field, from, to}]. `type` is a doc type, or '*' for
+    policy-wide settings. Comparing effective values means restating a default is not a change."""
+    from documents.route import policy_for, tier_for
+    a, b = policy_for(old_cfg), policy_for(new_cfg)
+    out = []
+    for k in ("spot_check_rate", "extraction_deadline_minutes"):
+        if a[k] != b[k]:
+            out.append({"type": "*", "field": k, "from": a[k], "to": b[k]})
+    types = sorted(set((old_cfg or {}).get("doc_types") or {}) | set((new_cfg or {}).get("doc_types") or {})
+                   | set(a["types"]) | set(b["types"]))
+    for t in types:
+        (ta, ma), (tb, mb) = tier_for(t, a), tier_for(t, b)
+        if ta != tb:
+            out.append({"type": t, "field": "tier", "from": ta, "to": tb})
+        if ma != mb:
+            out.append({"type": t, "field": "auto_accept_min", "from": ma, "to": mb})
+    return out
+
+
+def loosens_controls(changes: list[dict]) -> bool:
+    """Lowering a threshold, changing a tier, or sampling fewer automatic acceptances needs two approvers."""
+    return any(c["field"] == "tier" or (c["field"] in ("auto_accept_min", "spot_check_rate") and c["to"] < c["from"])
+               for c in changes)
+
 
 def diff(old: list[dict], new: list[dict]) -> dict:
     """Rule-level diff by rule id: added, removed, and changed fields."""

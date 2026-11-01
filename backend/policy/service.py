@@ -98,7 +98,27 @@ def preview(vid: int, filters: dict | None = None) -> dict:
                                 "cancelled": [{"key": o["key"], "name": o["name"]} for o in d["cancel"]],
                                 "kept_as_evidence": [{"key": o["key"], "name": o["name"], "status": o["status"]} for o in d["keep_evidence"]],
                                 "due_moved": d["due_moved"], "newly_blocked": d["newly_blocked"]}})
-    return {"summary": summary, "rows": rows}
+    act = store.active_version()
+    changes = store.doc_policy_diff(dict(act["config"]) if act else {}, config)
+    out = {"summary": summary, "rows": rows, "doc_policy_changes": changes, "backtest": None}
+    if changes:
+        from documents.route import backtest, policy_for
+        out["backtest"] = {**backtest(decision_history(), policy_for(config)), "days": BACKTEST_DAYS}
+    return out
+
+
+BACKTEST_DAYS = 90
+
+
+def decision_history(days: int = BACKTEST_DAYS) -> list[dict]:
+    """Each document's first automatic decision in the window, plus its spot-check verdict if it had one.
+    Read-only input for the pure backtest: no live document is ever re-decided."""
+    return db.fetch("""SELECT DISTINCT ON (dd.document_id) dd.document_id, d.doc_type, dd.kind, dd.reason_code, dd.confidence,
+                              (SELECT CASE s.kind WHEN 'spot_check_pass' THEN 'pass' ELSE 'fail' END FROM doc_decisions s
+                               WHERE s.document_id = dd.document_id AND s.kind LIKE 'spot_check_%%' ORDER BY s.at DESC LIMIT 1) AS spot_check
+                       FROM doc_decisions dd JOIN documents d ON d.id = dd.document_id
+                       WHERE dd.decided_by IS NULL AND dd.kind <> 'backfill' AND dd.at > now() - make_interval(days => %s)
+                       ORDER BY dd.document_id, dd.at""", (days,))
 
 
 # ---------- workflow ----------
@@ -124,7 +144,11 @@ def version_detail(vid: int) -> dict:
     base = store.active_version()
     against = v["based_on"] if v["state"] in ("active", "superseded") or not base else base["id"]
     d = store.diff(store.rules_of(against), rules) if against else {"added": rules, "removed": [], "changed": []}
-    return {**_public(v), "rules": rules, "diff": d, "diff_against": against, "approvals": approvals_for(vid)}
+    from documents.route import policy_for
+    base_cfg = dict(store.version(against)["config"]) if against else {}
+    d["doc_policy"] = store.doc_policy_diff(base_cfg, dict(v["config"]))
+    return {**_public(v), "rules": rules, "diff": d, "diff_against": against, "approvals": approvals_for(vid),
+            "doc_policy": policy_for(dict(v["config"]))}
 
 
 def _public(v: dict) -> dict:
@@ -136,7 +160,8 @@ def required_approvals(vid: int, conn=None) -> int:
     act = store.active_version(conn=conn)
     old = store.rules_of(act["id"], conn=conn) if act else []
     new = store.rules_of(vid, conn=conn)
-    return 2 if store.touches_compliance(store.diff(old, new), old, new) else 1
+    doc_changes = store.doc_policy_diff(dict(act["config"]) if act else {}, dict(store.version(vid, conn=conn)["config"]))
+    return 2 if store.touches_compliance(store.diff(old, new), old, new) or store.loosens_controls(doc_changes) else 1
 
 
 def submit(vid: int, user: dict, title: str, reason: str) -> dict:
@@ -147,14 +172,15 @@ def submit(vid: int, user: dict, title: str, reason: str) -> dict:
         raise PolicyError(403, "Only the author can submit this draft")
     act = store.active_version()
     d = store.diff(store.rules_of(act["id"]) if act else [], store.rules_of(vid))
-    if not (d["added"] or d["removed"] or d["changed"]):
-        raise PolicyError(422, "This draft doesn't change any rule")
+    doc_changes = store.doc_policy_diff(dict(act["config"]) if act else {}, dict(v["config"]))
+    if not (d["added"] or d["removed"] or d["changed"] or doc_changes):
+        raise PolicyError(422, "This draft doesn't change any rule or document policy")
     pv = preview(vid)
     need = required_approvals(vid)
     with db.tx() as c:
         c.execute("""UPDATE rule_set_versions SET state='pending_approval', title=%s, reason=%s, preview=%s,
                      required_approvals=%s, submitted_at=now() WHERE id=%s""",
-                  (title, reason, db.Json(pv["summary"]), need, vid))
+                  (title, reason, db.Json({**pv["summary"], "backtest": pv["backtest"]}), need, vid))
         rid = c.execute("""INSERT INTO approval_requests (subject_type, subject_id, requested_by, required, reason)
                            VALUES ('rule_set_version', %s, %s, %s, %s) RETURNING id""",
                         (str(vid), user["id"], need, reason)).fetchone()["id"]

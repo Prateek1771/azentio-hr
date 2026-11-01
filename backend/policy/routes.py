@@ -82,6 +82,19 @@ def upsert_rule(vid: int, rid: str, body: RuleBody):
     return _call(service.version_detail, vid)
 
 
+class DocPolicyBody(BaseModel):
+    default: dict = Field(default_factory=dict)
+    types: dict = Field(default_factory=dict)
+    spot_check_rate: float | None = None
+    extraction_deadline_minutes: float | None = None
+
+
+@router.put("/drafts/{vid}/doc-policy")
+def set_doc_policy(vid: int, body: DocPolicyBody):
+    _call(store.set_draft_doc_policy, vid, body.model_dump(exclude_none=True))
+    return _call(service.version_detail, vid)
+
+
 @router.delete("/drafts/{vid}/rules/{rid}")
 def delete_rule(vid: int, rid: str):
     _call(store.delete_draft_rule, vid, rid)
