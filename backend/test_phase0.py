@@ -214,6 +214,16 @@ check("job_stuck_requeued", jobs.requeue_stuck() == 1)
 a = work_queue.open_item("ops", "job", "x", "r", "admin", dedupe_key="same")
 b = work_queue.open_item("ops", "job", "x", "r", "admin", dedupe_key="same")
 check("work_queue_dedupe", a is not None and b is None)
+check("work_queue_kinds_are_contracts", all(k.get("sla") and k.get("escalate_to") and len(k.get("steps", "")) > 20
+                                           for k in work_queue.KINDS.values()))
+try:
+    work_queue.open_item("mystery", "job", "x", "r", "admin")
+    check("work_queue_unknown_kind_refused", False)
+except work_queue.UnknownKind:
+    check("work_queue_unknown_kind_refused", True)
+ops = db.fetch1("SELECT sla_due FROM work_queue WHERE dedupe_key='same'")
+check("work_queue_sla_filled_from_registry", ops["sla_due"] is not None)
+check("work_queue_items_carry_escalation", all(i["escalate_to"] and i["steps"] for i in work_queue.list_items("admin")))
 check("work_queue_role_scope", all(i["assignee_role"] == "hr_ops" for i in work_queue.list_items("hr_ops"))
       and len(work_queue.list_items("admin")) >= 1)
 

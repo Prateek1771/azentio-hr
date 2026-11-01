@@ -1,5 +1,7 @@
 """The single exceptions inbox. Anything that needs a human (a dead job now; doc reviews, rule approvals,
 near-start changes and appeals in later phases) opens one item here, assigned to a role."""
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -9,10 +11,35 @@ router = APIRouter(prefix="/api/work-queue")
 # kind -> resolver(item, action, user, reason) -> final status. Registered by the module that owns the kind.
 RESOLVERS: dict[str, callable] = {}
 
+# Every kind of exception is a contract, not a generic inbox entry: who owns it, by when, who it escalates to, and
+# what resolving it means. open_item() refuses kinds that aren't registered here (also checked by
+# scripts/check_boundaries.py). Escalation is *declared* now; the Phase 6 ladder / Temporal acts on it.
+KINDS: dict[str, dict] = {
+    "ops": {"sla": timedelta(days=1), "escalate_to": "admin",
+            "steps": "Read the job error, fix the cause (config, credentials, an upstream outage), then retry or discard the job."},
+    "policy.approval": {"sla": timedelta(days=2), "escalate_to": "admin",
+                        "steps": "Review the rule diff and its impact preview, then approve or reject with a reason. "
+                                 "Compliance changes need a second approver."},
+    "policy.near_start": {"sla": "caller", "escalate_to": "admin",
+                          "steps": "Check whether the joiner can still meet the new requirements before day one, then apply "
+                                   "the change or skip it, with a reason."},
+}
+
+
+class UnknownKind(ValueError):
+    pass
+
 
 def open_item(kind: str, entity_type: str, entity_id: str, reason: str, assignee_role: str,
               detail: dict | None = None, dedupe_key: str | None = None, sla_due=None, conn=None) -> int | None:
     """Open an exception. A repeat with the same dedupe_key is ignored (one open item per cause)."""
+    spec = KINDS.get(kind)
+    if spec is None:
+        raise UnknownKind(f"work_queue kind '{kind}' isn't registered in work_queue.KINDS")
+    if sla_due is None:
+        if spec["sla"] == "caller":
+            raise ValueError(f"work_queue kind '{kind}' needs an explicit sla_due")
+        sla_due = datetime.now(timezone.utc) + spec["sla"]
     row = db.fetch1("""INSERT INTO work_queue (kind, entity_type, entity_id, reason, detail, assignee_role, dedupe_key, sla_due)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (dedupe_key) DO NOTHING RETURNING id""",
                     (kind, entity_type, entity_id, reason, db.Json(detail or {}), assignee_role, dedupe_key, sla_due),
@@ -29,7 +56,9 @@ def list_items(role: str, status: str = "open", kind: str = "") -> list[dict]:
     if kind:
         where.append("kind = %s")
         params.append(kind)
-    return db.fetch(f"SELECT * FROM work_queue WHERE {' AND '.join(where)} ORDER BY sla_due NULLS LAST, created_at", params)
+    rows = db.fetch(f"SELECT * FROM work_queue WHERE {' AND '.join(where)} ORDER BY sla_due NULLS LAST, created_at", params)
+    return [{**r, "escalate_to": KINDS.get(r["kind"], {}).get("escalate_to"), "steps": KINDS.get(r["kind"], {}).get("steps", "")}
+            for r in rows]
 
 
 @router.get("")
