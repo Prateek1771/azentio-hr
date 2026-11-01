@@ -10,13 +10,29 @@ This app coordinates a new joiner's onboarding from offer to day one:
 
 ## Screenshots
 
-**Dashboard**: Every new joiner, readiness, overdue and blocked items at a glance.
+**Sign in**: Staff sign in with an invited work email. Joiners never sign in; they use the secure link in their email.
 
-![Dashboard](docs/screenshots/dashboard.png)
+![Sign in](docs/screenshots/login.png)
+
+**Dashboard**: Every new joiner, readiness, overdue and blocked items at a glance (shown here for HR Ops).
+
+![Dashboard](docs/screenshots/hr_ops-dashboard.png)
+
+**Users and roles** (admin): Five roles, each limited to its own job. Admins add people, change roles, reset passwords and deactivate accounts.
+
+![Users](docs/screenshots/users.png)
+
+**Manager view**: Managers see only their own reports, read-only.
+
+![Manager dashboard](docs/screenshots/manager-dashboard.png)
+
+**Document request**: HR Ops previews the templated email before sending it through Gmail.
+
+![Document request preview](docs/screenshots/hr_ops-email-preview.png)
 
 **Requirement rules**: Which documents and tasks apply by role, department, grade and location, and why.
 
-![Requirement rules](docs/screenshots/rules.png)
+![Requirement rules](docs/screenshots/hr_ops-rules.png)
 
 **Email templates**: Document-request emails with per-employee variables and a live preview.
 
@@ -24,19 +40,19 @@ This app coordinates a new joiner's onboarding from offer to day one:
 
 **Connectors**: Sources, targets and the apps joiners get access to.
 
-![Connectors](docs/screenshots/connectors.png)
+![Connectors](docs/screenshots/admin-connectors.png)
 
 **Integrations**: Flows that move candidates from a source to a target.
 
 ![Integrations](docs/screenshots/integrations.png)
 
-**Approvals**: Everything waiting on an HR decision.
+**Approvals**: Everything waiting on a decision. Only approvers can approve or reject.
 
-![Approvals](docs/screenshots/approvals.png)
+![Approvals](docs/screenshots/approver-approvals.png)
 
-**Logs**: Integration runs and the audit log.
+**Audit log**: Every action under the name of the person (or system) that did it, in a tamper-evident chain.
 
-![Logs](docs/screenshots/logs.png)
+![Audit log](docs/screenshots/audit-log.png)
 
 **AI quality**: Assistant evaluation scores and guardrail hits.
 
@@ -45,15 +61,27 @@ This app coordinates a new joiner's onboarding from offer to day one:
 ## Run it
 
 ```bash
-# 1. Graph database
-docker compose up -d                      # FalkorDB on :6379 (browser UI on :3001)
+# 1. Databases
+docker compose up -d                      # Postgres on :5432 (system of record), FalkorDB on :6379 (UI on :3001)
 
-# 2. Backend (seeds sample data on first run)
+# 2. Backend: sets itself up on start (migrations, admin user, sample data). No manual steps.
 cd backend && uv run uvicorn main:app --port 8000
 
 # 3. Frontend
 cd frontend && npm install && npm run dev  # http://localhost:3000
 ```
+
+Sign in at http://localhost:3000/login. In development the backend creates one account per role and the login page lists them:
+
+| Email | Role | Password |
+|---|---|---|
+| `admin@azentio.local` | Admin: users, connectors, integrations | `admin-dev-pass` (or `ADMIN_PASSWORD`) |
+| `hrops@azentio.local` | HR Ops: runs onboarding | `hrops-dev-pass` |
+| `approver@azentio.local` | Approver: signs off documents and policy | `approver-dev-pass` |
+| `manager@azentio.local` | Manager: read-only, own reports | `manager-dev-pass` |
+| `auditor@azentio.local` | Auditor: read-only, including the audit log | `auditor-dev-pass` |
+
+With `ENV=production`, `DATABASE_URL`, `ADMIN_EMAIL` and `ADMIN_PASSWORD` are required and no dev accounts are created. `GET /ready` reports whether Postgres, the graph and the job worker are up.
 
 Configuration lives in `.env` at the repo root (see `.env.example`):
 
@@ -62,8 +90,14 @@ Configuration lives in `.env` at the repo root (see `.env.example`):
 | LLM (any OpenAI-compatible provider, OpenRouter free models by default) | `OPENROUTER_API_KEY`, optional `LLM_BASE_URL`, `LLM_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_EMBED_MODEL` |
 | Gmail | `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`, `HR_MAILBOX` |
 | Optional human verification | `AWAITVERIFY_ENABLED`, `AWAITVERIFY_API_KEY` |
+| Runtime and sign-in | `ENV`, `DATABASE_URL`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SESSION_DAYS`, `COOKIE_SECURE`, `CORS_ORIGINS` |
 
-Self-checks: `cd backend && uv run python test_core.py`
+Self-checks (each uses a throwaway database, never live data):
+```bash
+cd backend && uv run python test_core.py     # rules, validation, ingestion, connectors, integrations
+cd backend && uv run python test_phase0.py   # sign-in, permissions for every role, audit chain, job queue, bootstrap
+backend/.venv/Scripts/python scripts/smoke.py --base http://localhost:3000   # UI: every role signs in, navigates, runs a workflow
+```
 
 ## What's where
 

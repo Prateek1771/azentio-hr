@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
+import { can, useMe } from "@/components/auth";
 
 type Approval =
   | { kind: "candidate_documents"; integration_id: string; integration_name: string; item_id: string; candidate_name: string; joiner_id: string | null;
@@ -18,12 +19,14 @@ type Approval =
 
 export default function ApprovalsPage() {
   const [rows, setRows] = useState<Approval[] | null>(null);
+  const { me } = useMe();
+  const canDecide = can(me, "approve");
   const load = useCallback(() => { api<Approval[]>("/api/approvals").then(setRows).catch(() => setRows([])); }, []);
   useEffect(load, [load]);
 
   return (
     <>
-      <PageHeader title="Approval Center" subtitle="Everything waiting on an HR decision: candidates whose documents passed AI checks, and offer letter formats." />
+      <PageHeader title="Approval Center" subtitle="Everything waiting on a decision: candidates whose documents passed AI checks, and offer letter formats. Only approvers can decide." />
       {rows === null ? <Skeleton className="h-48 rounded-xl" /> : rows.length === 0 ? (
         <Card className="items-center gap-2 p-14 text-center">
           <Inbox className="size-8 text-muted-foreground" />
@@ -48,7 +51,8 @@ export default function ApprovalsPage() {
                   ))}
                 </div>
               </div>
-              <DecisionButtons integrationId={a.integration_id} itemId={a.item_id} name={a.candidate_name} onDone={load} />
+              {canDecide ? <DecisionButtons integrationId={a.integration_id} itemId={a.item_id} name={a.candidate_name} onDone={load} />
+                : <span className="text-xs text-muted-foreground">Waiting on an approver</span>}
             </Card>
           ) : (
             <Card key={`offer-${a.integration_id}`} className="flex-row flex-wrap items-center gap-4 p-4">

@@ -1,4 +1,15 @@
-export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// "" = same origin: requests go through the Next.js rewrite in next.config.ts.
+export const API = process.env.NEXT_PUBLIC_API_URL ?? "";
+
+export type Role = "admin" | "hr_ops" | "approver" | "manager" | "auditor";
+export interface User { id: number; email: string; name: string; role: Role; active?: boolean; created_at?: string; last_login?: string | null }
+
+/** Send the browser to sign-in, remembering where it was. */
+export function toLogin() {
+  if (typeof window === "undefined" || window.location.pathname.startsWith("/login")) return;
+  const next = window.location.pathname + window.location.search;
+  window.location.href = `/login?next=${encodeURIComponent(next)}`;
+}
 
 export async function api<T = unknown>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
   const { json, ...rest } = init ?? {};
@@ -8,6 +19,7 @@ export async function api<T = unknown>(path: string, init?: RequestInit & { json
     body: json !== undefined ? JSON.stringify(json) : rest.body,
     cache: "no-store",
   });
+  if (res.status === 401 && !path.startsWith("/api/auth/") && !path.startsWith("/api/portal/")) toLogin();
   if (!res.ok) {
     let msg = res.statusText;
     try {
@@ -15,6 +27,7 @@ export async function api<T = unknown>(path: string, init?: RequestInit & { json
     } catch {}
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
   }
+  if (res.status === 204) return undefined as T;
   return res.json();
 }
 

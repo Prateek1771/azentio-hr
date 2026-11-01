@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { AlertOctagon, AlertTriangle, ArrowLeft, Check, ClipboardCopy, ExternalLink, FileText, Pencil, Send } from "lucide-react";
+import { AlertOctagon, AlertTriangle, ArrowLeft, Check, ClipboardCopy, ExternalLink, FileText, Pencil, Send, UserX } from "lucide-react";
 import { API, api, daysUntil, fmtDate, timeAgo, type Doc, type EmployeeDetail, type Item, type Template } from "@/lib/api";
 import { Initials, ProgressRing, STATE_STYLE, StateBadge, StatusPill } from "@/components/status";
 import { GraphView } from "@/components/graph-view";
@@ -19,6 +19,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { can, useMe } from "@/components/auth";
 
 const KIND_LABEL = { document: "Documents", ack: "Policy acknowledgements", task: "Tasks & provisioning" } as const;
 
@@ -32,9 +33,12 @@ export default function EmployeePage() {
   const [reject, setReject] = useState<Item | null>(null);
   const [preview, setPreview] = useState<Doc | null>(null);
   const [links, setLinks] = useState<{ type: string; connector_id: string; connector: string; employee_number?: string }[]>([]);
+  const [loadError, setLoadError] = useState("");
+  const { me } = useMe();
+  const canWrite = can(me, "onboarding");
 
   const load = useCallback(() => {
-    api<EmployeeDetail>(`/api/employees/${id}`).then(setD).catch((e) => toast.error(e.message));
+    api<EmployeeDetail>(`/api/employees/${id}`).then(setD).catch((e) => setLoadError((e as Error).message || "Couldn't load this joiner"));
     api<{ nodes: never[]; edges: never[] }>(`/api/employees/${id}/graph`).then(setGraph).catch(() => {});
     api<typeof links>(`/api/employees/${id}/links`).then(setLinks).catch(() => {});
   }, [id]);
@@ -61,6 +65,14 @@ export default function EmployeePage() {
     window.open(`/portal/${token}`, "_blank");
   };
 
+  if (loadError) return (
+    <Card className="items-center gap-2 p-14 text-center">
+      <UserX className="size-8 text-muted-foreground" />
+      <div className="font-semibold">{/not found/i.test(loadError) ? "Joiner not found" : "Couldn't load this joiner"}</div>
+      <p className="text-sm text-muted-foreground">{/not found/i.test(loadError) ? "They may not exist, or they aren't one of your reports." : loadError}</p>
+      <Button variant="outline" size="sm" className="mt-2" nativeButton={false} render={<Link href="/dashboard" />}><ArrowLeft className="size-4" /> All joiners</Button>
+    </Card>
+  );
   if (!d) return <div className="space-y-4"><Skeleton className="h-28 rounded-xl" /><Skeleton className="h-96 rounded-xl" /></div>;
   const { employee: e, summary: s } = d;
   const daysToJoin = daysUntil(e.joining_date);
@@ -98,12 +110,14 @@ export default function EmployeePage() {
           </div>
           <ProgressRing value={s.progress} size={64} />
         </div>
-        <div className="flex w-full flex-wrap gap-2 border-t pt-4">
-          <Button onClick={() => setSendOpen(true)}><Send className="size-4" /> Send document request</Button>
-          <Button variant="outline" onClick={() => setEditOpen(true)}><Pencil className="size-4" /> Change date / role</Button>
-          <Button variant="outline" onClick={copyPortal}><ClipboardCopy className="size-4" /> Copy portal link</Button>
-          <Button variant="ghost" onClick={openPortal}><ExternalLink className="size-4" /> Open employee portal</Button>
-        </div>
+        {canWrite && (
+          <div className="flex w-full flex-wrap gap-2 border-t pt-4">
+            <Button onClick={() => setSendOpen(true)}><Send className="size-4" /> Send document request</Button>
+            <Button variant="outline" onClick={() => setEditOpen(true)}><Pencil className="size-4" /> Change date / role</Button>
+            <Button variant="outline" onClick={copyPortal}><ClipboardCopy className="size-4" /> Copy portal link</Button>
+            <Button variant="ghost" onClick={openPortal}><ExternalLink className="size-4" /> Open employee portal</Button>
+          </div>
+        )}
       </Card>
 
       {d.flags.filter((f) => f.level !== "info").length > 0 && (
@@ -136,7 +150,7 @@ export default function EmployeePage() {
                   <span className="text-xs text-muted-foreground">{items.filter((i) => i.state === "completed").length}/{items.length} done</span>
                 </div>
                 {items.map((it) => (
-                  <ChecklistRow key={it.id} it={it} onStatus={setStatus} onReject={() => setReject(it)} onPreview={setPreview} />
+                  <ChecklistRow key={it.id} it={it} canWrite={canWrite} onStatus={setStatus} onReject={() => setReject(it)} onPreview={setPreview} />
                 ))}
               </Card>
             );
@@ -204,8 +218,8 @@ export default function EmployeePage() {
   );
 }
 
-function ChecklistRow({ it, onStatus, onReject, onPreview }: {
-  it: Item; onStatus: (i: Item, s: string) => void; onReject: () => void; onPreview: (d: Doc) => void;
+function ChecklistRow({ it, canWrite, onStatus, onReject, onPreview }: {
+  it: Item; canWrite: boolean; onStatus: (i: Item, s: string) => void; onReject: () => void; onPreview: (d: Doc) => void;
 }) {
   const st = STATE_STYLE[it.state];
   const latest = it.documents[0];
@@ -235,7 +249,7 @@ function ChecklistRow({ it, onStatus, onReject, onPreview }: {
           <ul className="mt-1.5 space-y-0.5 text-xs text-amber-700 dark:text-amber-400">{latest.issues.map((x, i) => <li key={i}>• {x}</li>)}</ul>
         )}
       </div>
-      <div className="flex gap-1.5">
+      <div className={cn("flex gap-1.5", !canWrite && "hidden")}>
         {it.kind === "document" && it.status !== "Accepted" && it.documents.length > 0 && (
           <Button size="sm" variant="outline" onClick={() => onStatus(it, "Accepted")}><Check className="size-3.5" /> Accept</Button>
         )}

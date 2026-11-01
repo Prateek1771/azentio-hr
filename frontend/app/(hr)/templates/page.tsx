@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { can, useMe } from "@/components/auth";
 
 const SAMPLE: Record<string, string> = {
   name: "Aarav Sharma", first_name: "Aarav", role: "Software Engineer", location: "Bengaluru", joining_date: "2026-11-16",
@@ -23,6 +24,8 @@ const VARS = ["name", "first_name", "role", "location", "joining_date", "doc_lis
 const render = (s: string) => s.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, k) => SAMPLE[k] ?? `{{${k}}}`);
 
 export default function TemplatesPage() {
+  const { me } = useMe();
+  const canWrite = can(me, "onboarding");
   const [list, setList] = useState<Template[]>([]);
   const [cur, setCur] = useState<Template | null>(null);
   const [saving, setSaving] = useState(false);
@@ -56,7 +59,7 @@ export default function TemplatesPage() {
   return (
     <>
       <PageHeader title="Email templates" subtitle="Customise the document-request emails HR sends. Variables are filled per employee."
-        actions={<Button variant="outline" onClick={newTemplate}>New template</Button>} />
+        actions={canWrite && <Button variant="outline" onClick={newTemplate}>New template</Button>} />
       <div className="grid gap-4 lg:grid-cols-[220px_1fr_1fr]">
         <Card className="gap-1 p-2">
           {list.map((t) => (
@@ -78,7 +81,7 @@ export default function TemplatesPage() {
                   className="rounded-md border bg-muted/50 px-1.5 py-0.5 font-mono text-[11px] hover:bg-muted">{`{{${v}}}`}</button>
               ))}
             </div>
-            <Button onClick={save} disabled={saving} className="self-start"><Save className="size-4" /> {saving ? "Saving…" : "Save template"}</Button>
+            <Button onClick={save} disabled={saving || !canWrite} title={canWrite ? undefined : "Only HR Ops can edit templates"} className="self-start"><Save className="size-4" /> {saving ? "Saving…" : "Save template"}</Button>
           </Card>
         )}
         {preview && (

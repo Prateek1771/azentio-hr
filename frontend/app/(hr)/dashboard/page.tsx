@@ -15,6 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { can, useMe } from "@/components/auth";
 
 const OVERALL: Record<EmployeeRow["overall"], { label: string; cls: string }> = {
   ready: { label: "Ready for day one", cls: "text-emerald-700 bg-emerald-50 ring-emerald-600/20 dark:text-emerald-400 dark:bg-emerald-500/10" },
@@ -30,6 +31,7 @@ export default function Dashboard() {
   const [f, setF] = useState({ department: "", location: "", status: "", join_from: "", join_to: "", search: "" });
   const [busy, setBusy] = useState<string | null>(null);
   const [confirmEsc, setConfirmEsc] = useState(false);
+  const { me } = useMe();
 
   const load = useCallback(() => {
     const qs = new URLSearchParams(Object.entries(f).filter(([, v]) => v)).toString();
@@ -85,7 +87,7 @@ export default function Dashboard() {
       <PageHeader
         title="Onboarding overview"
         subtitle="Every new joiner, what's pending, and who is responsible."
-        actions={<>
+        actions={can(me, "onboarding") && <>
           <Button variant="outline" onClick={checkInbox} disabled={busy !== null || !stats?.gmail}>
             <Inbox className="size-4" /> {busy === "inbox" ? "Checking…" : "Check inbox now"}
           </Button>

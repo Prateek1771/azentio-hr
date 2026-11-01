@@ -1,6 +1,6 @@
 # Phase 0: Trust + foundation
 
-- **Status:** in progress
+- **Status:** done (2026-11-01). `test_phase0.py`: 34 checks; `scripts/smoke.py`: 39 checks across 5 roles
 - **Branch:** `phase-0-trust-foundation`
 - **Design:** [hardening design](2026-11-01-hardening-design.md)
 
@@ -178,6 +178,7 @@ CREATE INDEX ON work_queue (status, assignee_role);
 | `/api/auth/me`, `/logout`, `/password` | any signed-in user | any signed-in user |
 | `/api/portal/*` | public (per-employee token) | public |
 | `/api/users*` | admin | admin |
+| `/api/employees/*/portal-link` | hr_ops only (the link lets its holder act as the joiner) | n/a |
 | `/api/employees*`, `/api/stats`, `/api/events`, `/api/documents/*/file` | STAFF + M | hr_ops |
 | `/api/templates*`, `/api/rules*`, `/api/policies` | STAFF | hr_ops |
 | `/api/items/*`, `/api/escalate`, `/api/gmail/poll`, `/api/ingest`, `/api/onboard` | n/a | hr_ops |

@@ -1,4 +1,5 @@
 "use client";
+import { can, useMe } from "@/components/auth";
 
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -20,6 +21,8 @@ const matchText = (m: Record<string, unknown>) =>
   Object.keys(m).length ? Object.entries(m).map(([k, v]) => `${k.replace("_", " ")}: ${Array.isArray(v) ? v.join("/") : v}`).join(" · ") : "All employees";
 
 export default function RulesPage() {
+  const { me } = useMe();
+  const canWrite = can(me, "onboarding");
   const [data, setData] = useState<RulesResp | null>(null);
   const [edit, setEdit] = useState<Rule | null>(null);
   useEffect(() => { api<RulesResp>("/api/rules").then(setData); }, []);
@@ -44,7 +47,7 @@ export default function RulesPage() {
   return (
     <>
       <PageHeader title="Requirement rules" subtitle="Which documents, tasks and acknowledgements apply by role, department, grade and location — and why."
-        actions={<Button onClick={() => setEdit({ id: `R-${Date.now().toString(36).toUpperCase()}`, item: "", name: "", kind: "document", category: "HR", match: {}, offset_days: -7, depends_on: [], description: "", policy_ref: "", auto: "" })}>
+        actions={canWrite && <Button onClick={() => setEdit({ id: `R-${Date.now().toString(36).toUpperCase()}`, item: "", name: "", kind: "document", category: "HR", match: {}, offset_days: -7, depends_on: [], description: "", policy_ref: "", auto: "" })}>
           <Plus className="size-4" /> Add rule</Button>} />
       <Card className="gap-0 overflow-hidden p-0">
         <div className="overflow-x-auto">
@@ -68,8 +71,8 @@ export default function RulesPage() {
                     <td className="px-4 py-3 text-xs">{r.category}{r.auto && <div className="text-primary">auto-{r.auto}</div>}</td>
                     <td className="px-4 py-3 text-xs text-muted-foreground">{r.depends_on.join(", ") || "—"}</td>
                     <td className="px-2 py-2 whitespace-nowrap">
-                      <Button size="icon" variant="ghost" onClick={() => setEdit(r)} aria-label="Edit"><Pencil className="size-4" /></Button>
-                      <Button size="icon" variant="ghost" onClick={() => remove(r)} aria-label="Delete"><Trash2 className="size-4" /></Button>
+                      {canWrite && <Button size="icon" variant="ghost" onClick={() => setEdit(r)} aria-label="Edit"><Pencil className="size-4" /></Button>}
+                      {canWrite && <Button size="icon" variant="ghost" onClick={() => remove(r)} aria-label="Delete"><Trash2 className="size-4" /></Button>}
                     </td>
                   </tr>
                 );

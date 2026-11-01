@@ -8,11 +8,11 @@ Azentio Onboard is an HR onboarding agent. For each new joiner it works out whic
 We're hardening it from a demo into governed HR operations in 7 phases: see [docs/plans/2026-11-01-hardening-design.md](docs/plans/2026-11-01-hardening-design.md).
 
 ## Current phase
-**Phase 0: Trust + foundation**, on branch `phase-0-trust-foundation`. See [docs/plans/phase-0-trust-foundation.md](docs/plans/phase-0-trust-foundation.md).
+**Phase 0 (trust + foundation) is complete.** Next: **Phase 1: policy governance + Employee/Item migration** ([plan](docs/plans/phase-1-policy-governance.md)). Phase 0 reference: [docs/plans/phase-0-trust-foundation.md](docs/plans/phase-0-trust-foundation.md).
 
 | Phase | Status |
 |---|---|
-| 0 Trust + foundation (auth, 5 roles, audit chain, jobs/outbox, bootstrap) | backend done, frontend in progress |
+| 0 Trust + foundation (auth, 5 roles, audit chain, jobs/outbox, bootstrap) | **done** |
 | 1 Policy governance + Employee/Item migration | planned |
 | 2 AI control + Document migration | planned |
 | 3 Retire graph record storage | planned |
@@ -52,7 +52,8 @@ cd backend && uv run python test_phase0.py    # auth, permission matrix, audit c
 ```
 - Both use throwaway databases (`azentio_test*`, plus FalkorDB graph `test`) and never touch live data.
 - Each new phase adds `test_phaseN.py`.
-- `scripts/smoke.py` runs headless Chrome against the running stack. For every role it logs in, checks the navigation, and runs one workflow.
+- `backend/.venv/Scripts/python scripts/smoke.py --base http://localhost:3000` runs headless Chrome against the running stack. For every role it signs in through the real form, checks the navigation, checks that allowed pages render and forbidden ones are gated, runs one workflow, and refreshes `docs/screenshots/`.
+- Frontend: `cd frontend && npx tsc --noEmit && npx eslint app components`.
 
 ## Where things live
 | Path | Owns |
@@ -69,6 +70,10 @@ cd backend && uv run python test_phase0.py    # auth, permission matrix, audit c
 | `backend/checklist.py`, `validate.py`, `extract.py`, `pipeline.py`, `gmail.py`, `chat.py` | Rules engine, document checks, LLM extraction, intake, email, assistant (moving into modules in Phases 1 to 5) |
 | `backend/connectors/`, `backend/integrations/` | Connector catalog, integration engine and agent |
 | `frontend/app/(hr)/` | HR app pages; `frontend/app/portal/[token]` is the joiner portal (public, token-scoped) |
+| `frontend/app/login`, `frontend/app/(hr)/users` | Sign-in screen; user and role management (admin) |
+| `frontend/components/auth.tsx` | `MeProvider`/`useMe`, `can(user, action)`, `RoleGate`, role labels. Hide write buttons with `can()`; the backend still enforces every rule |
+| `frontend/components/app-shell.tsx` | `NAV`, with the roles that can see each page; user menu; page-level gate |
+| `frontend/next.config.ts` | Rewrites `/api/*` to `BACKEND_URL` (same-origin cookie) |
 | `docs/` | HLD, LLD, the hardening design, phase plans, ADRs |
 
 ## Rules for changes
@@ -85,6 +90,12 @@ cd backend && uv run python test_phase0.py    # auth, permission matrix, audit c
 - **Migrations are append-only.** Add the next numbered file and never edit one that has been applied. Each must be safe to run inside a transaction.
 - **Humans only at policy gates.** Routine work is automatic. Exceptions go to `work_queue` with a role, not into a dashboard that someone has to watch.
 - **Fail fast on bad config** with a clear message, never hang. Every external dependency shows up in `/ready`.
+
+## Gotchas
+- `frontend/AGENTS.md` is written by `next dev`: this Next.js version has breaking changes, so read `frontend/node_modules/next/dist/docs/` before using a Next API you haven't checked.
+- base-ui `DropdownMenuLabel` must sit inside a `DropdownMenuGroup`, otherwise the page crashes when the menu opens.
+- base-ui menus open on pointer events. In browser automation, use real mouse input (CDP `Input.dispatchMouseEvent`), not `element.click()`.
+- On Windows, stopping a background `npx next start` can leave the node process holding the port. Check the port's owner before starting another.
 
 ## Conventions
 - **Keep it simple:** stdlib or an already-installed dependency before a new one. No ORM, no test framework, no speculative abstractions. Mark deliberate shortcuts with a `ponytail:` comment that names the limit and the upgrade path.

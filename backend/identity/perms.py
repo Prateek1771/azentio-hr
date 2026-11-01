@@ -38,6 +38,8 @@ RULES: list[tuple[set, re.Pattern, object]] = [(m, re.compile(p), roles) for m, 
     (R, r"^/api/quality$", STAFF),
     (W, r"^/api/quality/eval$", {ADMIN}),
 
+    # A portal link lets the holder act as the joiner, so only the people who send it can fetch it.
+    (R, r"^/api/employees/[^/]+/portal-link$", {HR}),
     # Core onboarding. Managers read, scoped to their own reports by main.get_emp / list_employees.
     (R, r"^/api/(employees|stats$|events$|documents/[^/]+/file$)", STAFF | {MANAGER}),
     (R, r"^/api/(templates|rules|policies)(/|$)", STAFF),

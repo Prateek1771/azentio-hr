@@ -37,7 +37,7 @@ MATRIX = [  # method, path, roles allowed
     ("GET", "/api/employees", {A, H, P, M, U}), ("GET", "/api/employees/E1/graph", {A, H, P, M, U}),
     ("PATCH", "/api/employees/E1", {H}), ("POST", "/api/employees/E1/send-request", {H}),
     ("GET", "/api/stats", {A, H, P, M, U}), ("GET", "/api/events", {A, H, P, M, U}),
-    ("GET", "/api/documents/d1/file", {A, H, P, M, U}),
+    ("GET", "/api/documents/d1/file", {A, H, P, M, U}), ("GET", "/api/employees/E1/portal-link", {H}),
     ("GET", "/api/templates", {A, H, P, U}), ("PUT", "/api/templates/t1", {H}),
     ("GET", "/api/rules", {A, H, P, U}), ("PUT", "/api/rules/r1", {H}), ("DELETE", "/api/rules/r1", {H}),
     ("POST", "/api/items/i1/status", {H}), ("POST", "/api/escalate", {H}), ("POST", "/api/ingest", {H}),
