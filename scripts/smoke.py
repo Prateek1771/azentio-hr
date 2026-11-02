@@ -314,7 +314,7 @@ async def run(base: str, shots: Path) -> int:
             vs = await p.api("GET", "/api/policy/versions")
             rb = next((v for v in vs["versions"] if v["id"] == vs["open_id"]), None) if vs["open_id"] else None
             for _ in range(20):
-                if rb:
+                if rb and rb["state"] == "pending_approval":  # the version opens as a draft, then submits
                     break
                 await asyncio.sleep(0.5)
                 vs = await p.api("GET", "/api/policy/versions")
