@@ -219,6 +219,7 @@ Two stores. Postgres is the system of record for everything built in Phases 0 to
 | `documents` (Phase 2) | `id, employee_id, item_id (NULL = not on the checklist), filename, path, mime, size, sha256, source, status (Submitted, Under Review, Accepted, Correction Requested, Rejected), doc_type, tier, confidence, extracted, issues, checks (jsonb), model, prompt_version, policy_version_id, current_decision_id, received_at, decided_at, extra` | Documents. `status` is the result of the current decision, never set on its own |
 | `document_mismatches` (Phase 2) | `document_id, field (PK together), expected, found` | Replaces the graph's `MISMATCH` edges |
 | `owners` (Phase 3 A1) | `email (PK, lowercase), name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | Department owners and managers. `owners.py` is the only reader and writer; each write re-projects graph `Owner` nodes (`records.project_owners`) |
+| `policies` (Phase 3 A2) | `source (PK), title, text` | Uploaded policy and process documents. `policies.py` is the only reader and writer; `chat.index_chunks` builds the graph's `PolicyChunk` index from them, and `chat.reindex_policies` rebuilds it in full |
 | `email_templates` (Phase 3 A1) | `id (PK), name, subject, body` | HR-editable Jinja templates. `templates.py` is the only reader and writer; the graph no longer holds them |
 | `doc_decisions` (Phase 2) | `id, document_id, kind (auto_accept, auto_correction, routed_review, human_accept, human_reject, human_correction, human_override, spot_check_pass, spot_check_fail, backfill, demo_seed), decided_by (NULL = system), reason_code, reason_text, status_after, model, prompt_version, confidence, tier, threshold, policy_version_id, checks, extracted, corrected_fields, work_item_id, idempotency_key (unique), at` | Append-only decision history with provenance. Triggers refuse UPDATE/DELETE and any `auto_accept` of a `high` tier. Human and spot-check rows need a user and a reason (CHECK) |
 
@@ -258,7 +259,7 @@ Integration nodes link by id properties rather than edges, because each one is r
 | `Event` | `id, employee_id, kind, message, ts` | Audit and activity log, including AI model and token usage |
 | `Config` | `key (departments, locations, doc_types, roles), value (json)` | Reference data |
 | `EmailTemplate` | `id, name, subject, body` | **Retired** (Phase 3 A1): stale nodes stay until PR E's cleanup; the `email_templates` table is the record |
-| `Policy` / `PolicyChunk` | `source, title, text` / `source, section, text, embedding?` | Approved policy text, chunked by `##` section |
+| `Policy` / `PolicyChunk` | `source, title, text` / `source, section, text, embedding?` | `Policy` is **retired** (Phase 3 A2; the `policies` table is the record, stale nodes go in PR E's cleanup). `PolicyChunk` is the retrieval index, chunked by `##` section and rebuilt from `policies` |
 | `Connector` | `key, name, role (source, target), record_kind, demo, description` | Connector catalog |
 | `ConnectorInstance` | `id, key, name` | This workspace's use of a connector |
 | `Record` | `id, instance_id, kind, values (json), created, updated` | A candidate or HR Portal employee |

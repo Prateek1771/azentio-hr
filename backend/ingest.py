@@ -203,9 +203,12 @@ async def seed():
     if not q1("MATCH (c:Config {key:'roles'}) RETURN c"):  # top-up for graphs seeded before roles existed
         roles = json.loads((SEED / "requirements.json").read_text(encoding="utf-8"))["roles"]
         q("MERGE (c:Config {key:'roles'}) SET c.value=$v", v=json.dumps(roles))
-    if not q1("MATCH (c:PolicyChunk) RETURN c LIMIT 1"):
+    import policies
+    if not policies.all():
         for f in sorted((SEED / "policies").glob("*.md")):
             await chat.index_policy(f.name, f.read_text(encoding="utf-8"))
+    elif not q1("MATCH (c:PolicyChunk) RETURN c LIMIT 1"):  # the index was lost (e.g. a wiped graph): rebuild it
+        await chat.reindex_policies()
 
 
 DEMO_PROGRESS = {  # employee -> item keys already done, so the dashboard shows a realistic mix on first run

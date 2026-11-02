@@ -24,6 +24,7 @@ import gmail  # noqa: E402
 import ingest  # noqa: E402
 import owners  # noqa: E402
 import pipeline  # noqa: E402
+import policies as policies_store  # noqa: E402  (the route below is named policies)
 import records  # noqa: E402
 import templates as templates_store  # noqa: E402  (the route below is named templates)
 from graph import q, q1, event  # noqa: E402
@@ -441,7 +442,7 @@ def rules():
 
 @app.get("/api/policies")
 def policies():
-    return [r["p"] for r in q("MATCH (p:Policy) RETURN p ORDER BY p.source")]
+    return policies_store.all()
 
 
 # ---------- employee portal ----------
@@ -450,7 +451,7 @@ def policies():
 def portal(token: str):
     e = emp_by_token(token)
     items = items_with_state(e["id"])
-    pol = {r["s"]: r["t"] for r in q("MATCH (p:Policy) RETURN p.source AS s, p.text AS t")}
+    pol = policies_store.texts()
     for i in items:
         i["policy_text"] = pol.get(i.get("policy_ref", ""), "") if i["kind"] == "ack" else ""
         i.pop("owner_email", None)

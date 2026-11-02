@@ -57,7 +57,7 @@ class LabelSpec:
 
 
 SPECS: dict[str, LabelSpec] = {}
-SPEC_MODULES = ("owners", "templates")  # each registers its labels' specs on import (batch A1 onward)
+SPEC_MODULES = ("owners", "templates", "policies")  # each registers its labels' specs on import (batch A1 onward)
 _loaded = False
 
 
