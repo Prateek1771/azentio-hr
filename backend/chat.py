@@ -213,9 +213,9 @@ def hr_context(question: str, chunks: list[dict], focus_id: str | None) -> str:
     for o in owners.all():
         lines.append(f"- {o['name']} ({o['type']}, {o['department']}): {o['email']}")
     lines.append("\nRECENT ACTIVITY [activity]:")
-    for ev in q("""MATCH (v:Event) WHERE v.kind <> 'ai' OPTIONAL MATCH (e:Employee {id:v.employee_id})
-                   RETURN v.message AS m, e.name AS n ORDER BY v.ts DESC LIMIT 15"""):
-        lines.append(f"- {ev['n'] + ': ' if ev['n'] else ''}{ev['m']}")
+    import events
+    for ev in events.recent(15, exclude_kind="ai"):
+        lines.append(f"- {ev['employee_name'] + ': ' if ev['employee_name'] else ''}{ev['message']}")
     lines.append("\nPOLICIES:")
     for c in chunks:
         lines.append(f"[{c['source']} § {c['section']}]\n{c['text']}\n")

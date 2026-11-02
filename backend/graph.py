@@ -1,6 +1,5 @@
 """FalkorDB access. One graph ('hr') holds everything: people, rules, checklist items, documents, policies."""
 import os
-import time
 import uuid
 
 from falkordb import FalkorDB
@@ -38,13 +37,14 @@ def new_id(prefix: str) -> str:
 
 
 def event(employee_id: str | None, kind: str, message: str):
-    q("CREATE (:Event {id:$id, employee_id:$eid, kind:$k, message:$m, ts:$ts})",
-      id=new_id("ev"), eid=employee_id or "", k=kind, m=message, ts=time.time())
+    """The activity choke point its callers use. Events live in Postgres (Phase 3 batch B): `events.record`."""
+    import events
+    events.record(employee_id, kind, message)
 
 
 def ensure_indexes():
     for label, prop in [("Employee", "id"), ("Employee", "token"), ("Item", "id"), ("Document", "id"),
-                        ("Owner", "email"), ("Event", "employee_id")]:
+                        ("Owner", "email")]:
         try:
             G.query(f"CREATE INDEX FOR (n:{label}) ON (n.{prop})")
         except Exception:

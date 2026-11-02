@@ -375,6 +375,92 @@ check("a3_rollback_restores_legacy_nodes", all(r["ok"] for r in rb["labels"]) an
 res = gm.cutover("A3", watch=0)
 check("a3_cutover_again_after_rollback", all(r["ok"] for r in res["labels"]) and bridge.SOURCE[CONF] == "postgres")
 
+# ---------- batch B: activity, guardrail hits and eval runs move to Postgres ----------
+import evals  # noqa: E402
+import events  # noqa: E402
+import guardrails  # noqa: E402
+import quality_routes  # noqa: E402
+from graph import event  # noqa: E402
+
+EV, GR, RUN, RES = "Event", "GuardrailEvent", "EvalRun", "EvalResult"
+db.execute("DELETE FROM bridge_state WHERE record_type IN ('Event', 'GuardrailEvent', 'EvalRun', 'EvalResult')")
+db.execute("TRUNCATE events, guardrail_events, eval_results, eval_runs")
+q(f"MATCH (n) WHERE n:{EV} OR n:{GR} OR n:{RUN} OR n:{RES} DETACH DELETE n")
+now = time.time()
+q(f"CREATE (:{EV} {{id:'ev_old1', employee_id:'E9100', kind:'profile', message:'Onboarding record created', ts:$t}})", t=now - 60)
+q(f"CREATE (:{EV} {{id:'ev_old2', employee_id:'', kind:'ai', message:'Assistant answered', ts:$t}})", t=now - 30)
+q(f"CREATE (:{GR} {{id:'gr_old', ts:$t, surface:'portal', rule:'injection', action:'blocked'}})", t=now - 20)
+q(f"""CREATE (:{RUN} {{id:'eval_old', ts:$t, status:'succeeded', judge:'j', model:'m', summary:'{{"faithfulness": 0.9}}',
+       done:2, total:2, finished:$f}})""", t=now - 100, f=now - 90)
+q(f"CREATE (:{RUN} {{id:'eval_stale', ts:$t, status:'running', judge:'j', model:'m', summary:'{{}}', done:0, total:2}})",
+  t=now - 99999)  # no finished/error: the graph simply had no such keys
+q(f"""CREATE (:{RES} {{id:'er_old1', run_id:'eval_old', n:1, question:'q1', reference:'r', answer:'a', ms:120,
+       guardrail_ok:true, answered:true, faithfulness:0.9, context_precision:1.0, context_recall:0.5,
+       sources:'["x.md § A"]'}})""")
+q(f"""CREATE (:{RES} {{id:'er_old2', run_id:'eval_old', n:2, question:'q2', reference:'r', answer:'a', ms:80,
+       guardrail_ok:true, sources:'[]'}})""")  # an older result: no answered/metrics keys
+
+def old_overview():  # what the previous release's quality_routes.overview returned, read straight from the graph
+    runs = [dict(r["r"], summary=json.loads(r["r"].get("summary") or "{}"))
+            for r in q(f"MATCH (r:{RUN}) RETURN r ORDER BY r.ts DESC LIMIT 20")]
+    latest = next((r for r in runs if r["status"] == "succeeded"), None)
+    results = [dict(x["x"], sources=json.loads(x["x"].get("sources") or "[]"))
+               for x in q(f"MATCH (x:{RES} {{run_id:$id}}) RETURN x ORDER BY x.n", id=latest["id"])] if latest else []
+    return {"runs": runs, "latest": latest, "results": results}
+
+
+before_api = old_overview()
+check("b_has_no_graph_read_paths_left", all(gm.read_paths(lbl) == [] for lbl in (EV, GR, RUN, RES)))
+res = gm.cutover("B", watch=0)
+reps = {r["label"]: r for r in res["labels"]}
+check("b_cutover_clean", all(r["ok"] and not r["unmapped_keys"] for r in reps.values())
+      and [reps[lbl]["pg_count"] for lbl in (EV, GR, RUN, RES)] == [2, 1, 2, 2], reps)
+
+after_api = quality_routes.overview()
+check("b_quality_overview_same_as_before", {k: after_api[k] for k in before_api} == before_api
+      and after_api["latest"]["summary"] == {"faithfulness": 0.9} and [r["n"] for r in after_api["results"]] == [1, 2]
+      and "answered" not in after_api["results"][1] and "finished" not in after_api["runs"][1]
+      and after_api["results"][0]["sources"] == ["x.md § A"], (before_api, after_api))
+
+event("E9100", "profile", "Joining date moved")
+check("b_event_choke_point_writes_postgres_not_graph",
+      events.for_employee("E9100")[0]["message"] == "Joining date moved"
+      and q(f"MATCH (v:{EV}) RETURN count(v) AS n")[0]["n"] == 2
+      and [d for d in gm.drift_since_cutover() if d["label"] == EV][0]["ok"])
+rec = events.recent(10)
+check("b_recent_joins_names_and_filters_kind", rec[0]["employee_name"] == "Reports To Mixed"
+      and rec[0]["manager_email"] == "mixed.case@x.com" and any(r["kind"] == "ai" for r in rec)
+      and not any(r["kind"] == "ai" for r in events.recent(10, exclude_kind="ai")))
+guardrails.record("hr_copilot", "email_leak", "noted")
+check("b_guardrail_hit_recorded", {(r["rule"], r["n"]) for r in guardrails.by_rule(now - 3600)}
+      == {("injection", 1), ("email_leak", 1)} and guardrails.recent(1)[0]["rule"] == "email_leak")
+
+check("b_stale_running_run_is_not_running", evals.running() is None)
+rid = evals.start_run()
+check("b_start_run_is_running", evals.running() == {"id": rid})
+err = raises(lambda: asyncio.run(evals.run(rid)), Exception)  # the seed joiner isn't here yet: the run fails
+run = next(r for r in evals.runs() if r["id"] == rid)
+check("b_failed_run_recorded", err and run["status"] == "failed" and err in run.get("error", "") and run.get("finished")
+      and run["total"] > 0 and evals.running() is None, (err, run))
+evals._insert_result({"id": "er_new1", "run_id": rid, "n": 1, "question": "q", "reference": "r", "answer": "a", "ms": 42,
+                      "guardrail_ok": True, "answered": False, "faithfulness": None, "context_precision": None,
+                      "context_recall": None, "sources": ["x.md § A"]})
+nres = len(evals.results(rid))
+r1 = evals.results(rid)[0]
+check("b_result_row_keeps_graph_shape", r1["ms"] == 42 and isinstance(r1["ms"], int) and r1["sources"] == ["x.md § A"]
+      and "faithfulness" not in r1 and r1["answered"] is False, r1)
+
+q(f"MATCH (v:{EV} {{id:'ev_old1'}}) SET v.message = 'stray'")
+check("b_drift_catches_a_stray_event_write", not [d for d in gm.drift_since_cutover() if d["label"] == EV][0]["ok"])
+rb = gm.rollback("B", watch=0)
+g_ev = {r["i"] for r in q(f"MATCH (v:{EV}) RETURN v.id AS i")}
+g_res = q(f"MATCH (x:{RES} {{run_id:$r}}) RETURN count(x) AS n", r=rid)[0]["n"]
+check("b_rollback_writes_new_rows_back", all(r["ok"] for r in rb["labels"]) and len(g_ev) == 3 and g_res == nres
+      and q(f"MATCH (v:{EV} {{id:'ev_old1'}}) RETURN v.message AS m")[0]["m"] == "Onboarding record created"
+      and q(f"MATCH (r:{RUN} {{id:$r}}) RETURN r.status AS s", r=rid)[0]["s"] == "failed", rb)
+res = gm.cutover("B", watch=0)
+check("b_cutover_again_after_rollback", all(r["ok"] for r in res["labels"]) and bridge.SOURCE[EV] == "postgres")
+
 # ---------- a lost graph never re-seeds over Postgres; the projection and the index are rebuilt from it ----------
 
 records.save_employee({"id": "E9001", "name": "Kept Name", "email": "kept@x.com", "role": "Engineer", "grade": "L2",

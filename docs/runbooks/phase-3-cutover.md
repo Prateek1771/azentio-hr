@@ -60,7 +60,7 @@ restore path.**
 | A1 | Owner (stays as projection), EmailTemplate | 2026-11-02 03:08 UTC | Owner 8/0 → 8/8, EmailTemplate 4/0 → 4/4; sha equal | single writer, 15 s watch | pass | dev |
 | A2 | Policy (PolicyChunk stays as an index) | 2026-11-02 03:37 UTC | Policy 7/0 → 7/7; sha equal | single writer, 15 s watch | pass | dev |
 | A3 | Rule and Config (legacy, removed; Config moved here from A1) | | | | | |
-| B | Event, GuardrailEvent, EvalRun, EvalResult | | | | | |
+| B | Event, GuardrailEvent, EvalRun, EvalResult | 2026-11-02 09:46 UTC | Event 434/0 → 434/434, GuardrailEvent 1/1, EvalRun 2/2, EvalResult 25/25; sha equal | single writer | pass | dev |
 | C | Connector, ConnectorInstance, Record, links, CustomField, ImportRun, IntegrationRun (archived) | | | | | |
 | D | Integration, IntegrationCandidate, WorkflowRun, IntegrationLogRecord, OutboundMessage, AgentMessage | | | | | |
 | E | AuditLog (legacy, removed), read-model cleanup | | | | | |
@@ -165,3 +165,45 @@ Database `azentio_deep`, graph `deep`; the previous release ran from a `main` wo
    imports.
 8. The loser of a first-run import race reported rows imported and re-ran checklists: it now returns `imported: 0` and
    does nothing.
+
+### B: Event, GuardrailEvent, EvalRun, EvalResult (dev stack, 2026-11-02)
+
+**Before** (graph / Postgres): Event 434 / 0 (sha `d4a74973…`), GuardrailEvent 1 / 0, EvalRun 2 / 0, EvalResult 25 / 0.
+`BGSAVE` first.
+
+**Cutover** at startup, 09:46:39 UTC:
+
+| Label | source | graph | pg | parity | unmapped keys | read paths left | drift since cutover |
+|---|---|---|---|---|---|---|---|
+| Event | postgres | 434 | 434 | ok | none | none | ok |
+| GuardrailEvent | postgres | 1 | 1 | ok | none | none | ok |
+| EvalRun | postgres | 2 | 2 | ok | none | none | ok |
+| EvalResult | postgres | 25 | 25 | ok | none | none | ok |
+
+**Feature smoke:**
+- `scripts/smoke.py` passes for every role, including `/activity` and the AI quality page.
+- By API:
+  - HR Ops sees 50 activity rows with names. The dev manager sees only E1002 and E1006.
+  - E1001's timeline has 75 events, newest first.
+  - `/api/quality` lists the runs and the guardrail counts.
+- Writes through the app:
+  - A prompt-injection message to E1001's portal assistant was blocked and counted (`prompt_injection` 1 → 2).
+  - An NDA acknowledgement added an event. Postgres went to 435; the graph stayed at 434.
+
+**Rollback drill:**
+1. Stopped the backend and ran `graph_migration rollback B`: Event 435 / 435, GuardrailEvent 2 / 2, EvalRun 2 / 2,
+   EvalResult 25 / 25, all ok. The new event and guardrail hit are in the graph.
+2. Restarted: cut over again at 09:48:36 UTC, parity ok, drift ok.
+3. All nine Phase 3 labels so far are on `postgres` at parity. Freeze evidence: `single_writer: true`. The stopped
+   instance's heartbeat was already older than 60 s, so there was nothing to watch.
+
+**Throwaway deep run:**
+- `main` → B: A1, A2, A3 and B cut over in one start. The `main`-era events and guardrail hit carried over.
+- An eval run started through `/api/quality/eval` finished 20/20 on the new storage and became the latest run.
+  (The throwaway instance still reached a free-tier model with the API keys blanked. Eval runs belong on a throwaway
+  stack anyway, never on the dev data.)
+- A full rollback (B, A3, A2, A1) followed, then `main` on the same data. `main` showed the run with its 20 results, the
+  run's guardrail hits and all the activity.
+- Re-upgrade: four clean cutovers.
+
+**Sign-off:** dev ✓. CI on the PR covers `test_phase3` (B section and API contract).

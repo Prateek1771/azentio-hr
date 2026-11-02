@@ -1,6 +1,6 @@
 # Phase 3: Retire graph record storage
 
-- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies) and A3 (rules, config) are done; B → E follow, one PR each.
+- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config) and B (activity) are done; C → E follow, one PR each.
 - **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
 - **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
 - **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
@@ -96,6 +96,23 @@
   `Owner` projection. A projection label's cutover rebuilds the projection once. An emptied retired label isn't drift.
   `normalise_rule` parses a text `compliance` cell. `graph_migration.load()` is never silently partial. Details and the
   upgrade/rollback-to-`main`/two-instance results are in the runbook's "Deep test" section.
+
+## As built: batch B (activity, guardrail hits, eval runs)
+- Migration `014_activity.sql`: `events`, `guardrail_events`, `eval_runs`, `eval_results`. Columns are the old graph
+  properties. `ts`/`finished` stay epoch seconds (`double precision`) and `ms` stays an integer, so every API keeps its
+  types (ponytail: timestamptz is a later cleanup).
+- `events.py` (`record`, `for_employee`, `recent(limit, exclude_kind)`) is the only reader and writer. `graph.event()`
+  keeps its signature and calls `events.record`, so its 27 callers didn't change. `recent` LEFT JOINs `employees` for
+  the name and the manager; `/api/events` keeps its limit-then-`_visible` manager scoping in `main`.
+- `guardrails.record` inserts a row; `by_rule` / `recent` serve the quality page. `evals.py` writes runs and results in
+  SQL (`_set`, `_insert_result`); `runs()` / `results()` drop NULLs so the API shape matches the graph's (a metric the
+  judge couldn't score is an absent key).
+- `quality_routes.overview`, the employee timeline and the HR co-pilot's recent activity read the tables.
+- `test_phase3` B section: the old release's nodes (including a run without `finished` and a result without metrics),
+  a cutover, the quality overview equal to what the old graph reader returned, the event choke point, the joins and
+  filters, guardrail counts, a failed eval run, the result shape, drift, rollback and a second cutover.
+- On a throwaway stack, `main` was upgraded straight to B (four batches in one start). A full eval run (20/20) then
+  succeeded on the new storage, and a full rollback to `main` showed the run, the guardrail hits and the activity.
 
 ## The approved plan
 

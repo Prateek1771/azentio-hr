@@ -221,6 +221,9 @@ Two stores. Postgres is the system of record for everything built in Phases 0 to
 | `owners` (Phase 3 A1) | `email (PK, lowercase), name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | Department owners and managers. `owners.py` is the only reader and writer; each write re-projects graph `Owner` nodes (`records.project_owners`) |
 | `policies` (Phase 3 A2) | `source (PK), title, text` | Uploaded policy and process documents. `policies.py` is the only reader and writer; `chat.index_chunks` builds the graph's `PolicyChunk` index from them, and `chat.reindex_policies` rebuilds it in full |
 | `legacy_rules`, `legacy_config` (Phase 3 A3) | `id, props (jsonb)` / `key, value` | Archive of the retired graph `Rule`/`Config` nodes, only for `graph_migration rollback A3`; nothing reads them. Dropped in PR E |
+| `events` (Phase 3 B) | `id, employee_id ('' = system), kind, message, ts (epoch seconds)` | The activity timeline. Written only through `graph.event()` → `events.record`; read by the activity page, employee timelines and the HR co-pilot |
+| `guardrail_events` (Phase 3 B) | `id, ts, surface, rule, action` | Guardrail hits (`guardrails.record`), no message text |
+| `eval_runs`, `eval_results` (Phase 3 B) | run: `id, ts, status, judge, model, summary (jsonb), done, total, finished, error`; result: `id, run_id, n, question, reference, answer, ms, guardrail_ok, answered, faithfulness, context_precision, context_recall, sources (jsonb)` | Assistant evaluation runs (`evals.py`). Readers drop NULLs, so a missing metric is an absent key, as it was in the graph |
 | `email_templates` (Phase 3 A1) | `id (PK), name, subject, body` | HR-editable Jinja templates. `templates.py` is the only reader and writer; the graph no longer holds them |
 | `doc_decisions` (Phase 2) | `id, document_id, kind (auto_accept, auto_correction, routed_review, human_accept, human_reject, human_correction, human_override, spot_check_pass, spot_check_fail, backfill, demo_seed), decided_by (NULL = system), reason_code, reason_text, status_after, model, prompt_version, confidence, tier, threshold, policy_version_id, checks, extracted, corrected_fields, work_item_id, idempotency_key (unique), at` | Append-only decision history with provenance. Triggers refuse UPDATE/DELETE and any `auto_accept` of a `high` tier. Human and spot-check rows need a user and a reason (CHECK) |
 
@@ -257,7 +260,7 @@ Integration nodes link by id properties rather than edges, because each one is r
 | `Rule` | `id, item, name, kind, category, match (json), offset_days, depends_on[], description, policy_ref, auto, ord` | **Retired** (Phase 3 A3): rules live in rule-set versions. The last graph copy is archived in `legacy_rules` for rollback only |
 | `Document` | `id, employee_id, filename, path, mime, size, source (email, portal), status, extracted (json), issues (json), confidence, doc_type, ts` | One received file and its verification result |
 | `Owner` | `email, name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | **Projection** of the `owners` table (Phase 3 A1), refreshed by `records.project_owners`; the target of `OWNED_BY` and `REPORTS_TO` |
-| `Event` | `id, employee_id, kind, message, ts` | Audit and activity log, including AI model and token usage |
+| `Event` | `id, employee_id, kind, message, ts` | **Retired** (Phase 3 B): the `events` table is the record |
 | `Config` | `key (departments, locations, doc_types, roles), value (json)` | **Retired** (Phase 3 A3): the active version's `config` holds it. Archived in `legacy_config` for rollback only |
 | `EmailTemplate` | `id, name, subject, body` | **Retired** (Phase 3 A1): stale nodes stay until PR E's cleanup; the `email_templates` table is the record |
 | `Policy` / `PolicyChunk` | `source, title, text` / `source, section, text, embedding?` | `Policy` is **retired** (Phase 3 A2; the `policies` table is the record, stale nodes go in PR E's cleanup). `PolicyChunk` is the retrieval index, chunked by `##` section and rebuilt from `policies` |
@@ -273,8 +276,8 @@ Integration nodes link by id properties rather than edges, because each one is r
 | `AgentMessage` | `integration_id, role, content, ts` | The setup chat history |
 | `OutboundMessage` | `integration_id, item_id, kind, to, subject, content, attempt, delivered_by (gmail, simulated), provider_ref` | Every email an integration sent, exactly as sent |
 | `AuditLog` | `action, entity_type, entity_id, summary, actor, ts` | **Legacy.** No longer written. Bootstrap copies these rows once into the Postgres chain (§10.4) |
-| `GuardrailEvent` | `surface, rule, action (blocked, flagged), ts` | A guardrail hit. Rule and surface only, no message text |
-| `EvalRun` / `EvalResult` | run: `status, judge, model, done, total, summary (json)`; result: `question, reference, answer, sources, faithfulness, context_precision, context_recall, guardrail_ok` | Ragas evaluation history |
+| `GuardrailEvent` | `surface, rule, action (blocked, flagged), ts` | **Retired** (Phase 3 B): the `guardrail_events` table |
+| `EvalRun` / `EvalResult` | run: `status, judge, model, done, total, summary (json)`; result: `question, reference, answer, sources, faithfulness, context_precision, context_recall, guardrail_ok` | Ragas evaluation history **Retired** (Phase 3 B): `eval_runs` / `eval_results` are the record. |
 
 Relationship properties: `MISMATCH {field, expected, found}`.
 
@@ -420,7 +423,7 @@ sequenceDiagram
     BE->>LLM: system: answer only from context, cite [policy § section] or [checklist], else say "I don't know" + HR contact
     LLM-->>J: streamed answer
     BE->>BE: output guardrails (citations retrieved? emails known?) → note appended on a hit
-    BE->>G: Event (model, tokens), GuardrailEvent on a hit
+    BE->>PG: event (model, tokens), guardrail_events row on a hit
 ```
 
 ### 5.9 HR co-pilot (whole-organisation context)
@@ -616,7 +619,7 @@ Typical usage measured in testing: extraction about 2.3k tokens, an employee ans
 | Output | An email address that isn't in the context | Note appended |
 | Output | The system prompt echoed back | Note appended |
 
-Every hit is stored as a `GuardrailEvent` (surface and rule only, no text) and counted on the AI quality page. The checks are regex heuristics: they catch common phrasings, not a determined attacker. The real protection is that each assistant only sees its own user's context. A classifier model (for example Llama Guard on the same client) is the upgrade if the hit data shows it's needed.
+Every hit is stored as a `guardrail_events` row (surface and rule only, no text) and counted on the AI quality page. The checks are regex heuristics: they catch common phrasings, not a determined attacker. The real protection is that each assistant only sees its own user's context. A classifier model (for example Llama Guard on the same client) is the upgrade if the hit data shows it's needed.
 
 ### 7.2 Evaluation (`evals.py`)
 - **Question set:** `seed/eval_assistant.json` has 20 policy questions with reference answers, asked as a seeded engineer in Bengaluru, plus 3 attack prompts.
@@ -626,7 +629,7 @@ Every hit is stored as a `GuardrailEvent` (surface and rule only, no text) and c
   - Context precision: the retrieved sections are relevant.
   - Context recall: retrieval found everything the reference needs.
 - **No-model checks:** the share of attack prompts blocked, and the share of answers that pass the output guardrails.
-- **Storage and display:** results are stored as `EvalRun` and `EvalResult` and shown on `/quality` with trend lines and the change since the last run.
+- **Storage and display:** results are stored in `eval_runs` and `eval_results` (Postgres, Phase 3 B) and shown on `/quality` with trend lines and the change since the last run.
 - **Failures:** a judge that returns bad JSON costs that one score, not the run. Questions the assistant couldn't answer (outage or rate limit) aren't scored, and a run where it answered nothing is marked failed.
 - **Judge choice:** free models make noisy judges, and a full run makes about 80 model calls, more than OpenRouter's free daily limit of 50. Set a stronger paid judge for steady numbers.
 - **Not covered:** document extraction and the setup agent aren't scored with Ragas. A gold set with exact field matching, and scripted tool-call conversations, fit them better.

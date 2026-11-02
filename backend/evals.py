@@ -3,7 +3,8 @@
 Each question goes through the real retrieval, prompt and model (as the seeded employee), then a judge model
 scores it with Ragas: faithfulness (answer sticks to the retrieved policy text), context precision and context
 recall (the right sections were retrieved). Guardrails are scored without any model: the attack prompts must be
-blocked and answers must pass the output checks. Results land in the graph for the Quality dashboard.
+blocked and answers must pass the output checks. Results land in Postgres (`eval_runs`, `eval_results`) for the
+Quality dashboard.
 
 Judge: RAGAS_JUDGE_MODEL / RAGAS_JUDGE_BASE_URL / RAGAS_JUDGE_API_KEY, defaulting to the app's own LLM settings.
 Free models make noisy judges; a stronger paid judge gives steadier scores.
@@ -27,7 +28,9 @@ import checklist  # noqa: E402
 import guardrails  # noqa: E402
 import llm  # noqa: E402
 import logging_setup as ls  # noqa: E402
-from graph import q, q1, new_id  # noqa: E402
+import graph_migration as gm  # noqa: E402
+from graph import new_id  # noqa: E402
+from shared import db  # noqa: E402
 
 log = ls.get("evals")
 GOLDEN = Path(__file__).parent / "seed" / "eval_assistant.json"
@@ -63,20 +66,39 @@ def _mean(vals: list) -> float | None:
 
 
 def running() -> dict | None:
-    return q1("MATCH (r:EvalRun {status:'running'}) WHERE r.ts > $t RETURN r.id AS id", t=time.time() - STALE_AFTER)
+    return db.fetch1("SELECT id FROM eval_runs WHERE status='running' AND ts > %s", (time.time() - STALE_AFTER,))
 
 
 def start_run() -> str:
     rid = new_id("eval")
-    q("CREATE (r:EvalRun {id:$id, ts:$ts, status:'running', judge:$j, model:$m, summary:'{}', done:0, total:0})",
-      id=rid, ts=time.time(), j=judge_model(), m=llm.MODEL)
+    db.execute("INSERT INTO eval_runs (id, ts, status, judge, model) VALUES (%s, %s, 'running', %s, %s)",
+               (rid, time.time(), judge_model() or "", llm.MODEL or ""))
     return rid
+
+
+def _present(row: dict) -> dict:
+    """FalkorDB never stored NULL; readers keep the graph's shape (a missing metric is an absent key)."""
+    return {k: v for k, v in row.items() if v is not None}
+
+
+def runs(limit: int = 20) -> list[dict]:
+    return [_present(r) for r in db.fetch("SELECT * FROM eval_runs ORDER BY ts DESC LIMIT %s", (limit,))]
+
+
+def results(run_id: str) -> list[dict]:
+    return [_present(r) for r in db.fetch("SELECT * FROM eval_results WHERE run_id=%s ORDER BY n", (run_id,))]
+
+
+def _set(rid: str, **cols) -> None:
+    sets = ", ".join(f"{k}=%s" for k in cols)
+    db.execute(f"UPDATE eval_runs SET {sets} WHERE id=%s",
+               tuple(db.Json(v) if isinstance(v, dict) else v for v in cols.values()) + (rid,))
 
 
 async def run(rid: str) -> dict:
     golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
     questions, attacks = golden["questions"], golden["attacks"]
-    q("MATCH (r:EvalRun {id:$id}) SET r.total=$n", id=rid, n=len(questions))
+    _set(rid, total=len(questions))
     try:
         import records
         emp = records.employee_by(email=golden["employee_email"])
@@ -106,9 +128,8 @@ async def run(rid: str) -> dict:
                    "sources": [f"{c['source']} § {c['section']}" for c in chunks],
                    "faithfulness": f, "context_precision": p, "context_recall": r}
             rows.append(row)
-            q("CREATE (x:EvalResult) SET x = $p", p={"id": new_id("er"), "run_id": rid, "n": n, **{k: v for k, v in row.items() if k != "sources"},
-                                                    "sources": json.dumps(row["sources"])})
-            q("MATCH (r:EvalRun {id:$id}) SET r.done=$n", id=rid, n=n)
+            _insert_result({"id": new_id("er"), "run_id": rid, "n": n, **row})
+            _set(rid, done=n)
         answered = [r for r in rows if r["answered"]]
         if not answered:
             raise RuntimeError("The assistant model didn't answer any question (outage or rate limit)")
@@ -118,13 +139,56 @@ async def run(rid: str) -> dict:
         summary |= {"attacks_blocked": blocked, "attacks": len(attacks),
                     "output_guardrail_pass": round(sum(r["guardrail_ok"] for r in rows) / max(len(rows), 1), 3),
                     "avg_ms": _mean([r["ms"] for r in rows])}
-        q("MATCH (r:EvalRun {id:$id}) SET r.status='succeeded', r.summary=$s, r.finished=$t", id=rid, s=json.dumps(summary), t=time.time())
+        _set(rid, status="succeeded", summary=summary, finished=time.time())
         ls.log_event(log, "eval.finished", run=rid, **summary)
         return summary
     except Exception as e:
-        q("MATCH (r:EvalRun {id:$id}) SET r.status='failed', r.error=$e, r.finished=$t", id=rid, e=f"{type(e).__name__}: {e}"[:300], t=time.time())
+        _set(rid, status="failed", error=f"{type(e).__name__}: {e}"[:300], finished=time.time())
         ls.log_event(log, "eval.failed", run=rid, error=type(e).__name__)
         raise
+
+
+RESULT_COLS = ("id", "run_id", "n", "question", "reference", "answer", "ms", "guardrail_ok", "answered", "faithfulness",
+               "context_precision", "context_recall", "sources")
+RUN_COLS = ("id", "ts", "status", "judge", "model", "summary", "done", "total", "finished", "error")
+
+
+def _insert_result(r: dict, conn=None) -> None:
+    vals = [db.Json(r.get(c) or []) if c == "sources" else r.get(c) for c in RESULT_COLS]
+    db.execute(f"INSERT INTO eval_results ({', '.join(RESULT_COLS)}) VALUES ({', '.join(['%s'] * len(RESULT_COLS))})",
+               vals, conn=conn)
+
+
+def _num(v):
+    return None if v is None else float(v)
+
+
+def _canon_run(r: dict) -> dict:
+    return {"id": r["id"], "ts": gm.epoch(r.get("ts")), "status": r.get("status") or "", "judge": r.get("judge") or "",
+            "model": r.get("model") or "", "summary": gm.jsonv(r.get("summary"), {}), "done": int(r.get("done") or 0),
+            "total": int(r.get("total") or 0), "finished": gm.epoch(r.get("finished")), "error": r.get("error")}
+
+
+def _canon_result(r: dict) -> dict:
+    return {"id": r["id"], "run_id": r.get("run_id"), "n": int(r.get("n") or 0), "question": r.get("question") or "",
+            "reference": r.get("reference") or "", "answer": r.get("answer") or "", "ms": _num(r.get("ms")),
+            "guardrail_ok": r.get("guardrail_ok"), "answered": r.get("answered"),
+            **{m: _num(r.get(m)) for m in ("faithfulness", "context_precision", "context_recall")},
+            "sources": gm.jsonv(r.get("sources"), [])}
+
+
+gm.register(gm.LabelSpec(
+    label="EvalRun", batch="B", table="eval_runs",
+    to_row=lambda p: {**_canon_run(p), "ts": float(p.get("ts") or 0), "finished": _num(p.get("finished"))},
+    canonical=_canon_run,
+    from_row=lambda r: _present({**r, "summary": json.dumps(r["summary"] or {})}),
+    mapped_keys=frozenset(RUN_COLS)))
+
+gm.register(gm.LabelSpec(
+    label="EvalResult", batch="B", table="eval_results",
+    to_row=_canon_result, canonical=_canon_result,
+    from_row=lambda r: _present({**r, "sources": json.dumps(r["sources"] or [])}),
+    mapped_keys=frozenset(RESULT_COLS)))
 
 
 if __name__ == "__main__":

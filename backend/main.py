@@ -21,6 +21,7 @@ import chat  # noqa: E402
 import logging_setup as ls  # noqa: E402
 import checklist  # noqa: E402
 import gmail  # noqa: E402
+import events as events_store  # noqa: E402  (the route below is named events)
 import ingest  # noqa: E402
 import owners  # noqa: E402
 import pipeline  # noqa: E402
@@ -225,7 +226,6 @@ def employee_detail(eid: str):
     items = items_with_state(eid)
     from documents import store as docs
     unmatched = [_doc(d) for d in docs.unmatched(eid)]
-    events = q("MATCH (v:Event {employee_id:$e}) RETURN v ORDER BY v.ts DESC LIMIT 100", e=eid)
     manager = q1("MATCH (:Employee {id:$e})-[:REPORTS_TO]->(m) RETURN m", e=eid)
     accepted = {}
     for i in items:  # structured HR record populated from accepted document extractions
@@ -235,7 +235,7 @@ def employee_detail(eid: str):
                     if v and not k.startswith("_") and k not in ("confidence", "notes", "legible", "doc_type"):
                         accepted.setdefault(k, {"value": v, "source": i["name"]})
     return {"employee": e, "items": items, "summary": summarize(items), "flags": flags(eid, items),
-            "unmatched_documents": unmatched, "events": [r["v"] for r in events],
+            "unmatched_documents": unmatched, "events": events_store.for_employee(eid),
             "manager": manager["m"] if manager else None, "hr_record": accepted}
 
 
@@ -370,9 +370,8 @@ async def poll_now():
 
 @app.get("/api/events")
 def events(limit: int = 50):
-    rows = q("""MATCH (v:Event) OPTIONAL MATCH (e:Employee {id:v.employee_id})
-                RETURN v, e.name AS name, e.manager_email AS mgr ORDER BY v.ts DESC LIMIT $l""", l=limit)
-    return [{**r["v"], "employee_name": r["name"]} for r in rows if _visible({"manager_email": r["mgr"]})]
+    rows = events_store.recent(limit)
+    return [{k: v for k, v in r.items() if k != "manager_email"} for r in rows if _visible({"manager_email": r["manager_email"]})]
 
 
 @app.get("/api/documents/{doc_id}/file")

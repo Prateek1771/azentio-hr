@@ -8,14 +8,14 @@ Azentio Onboard is an HR onboarding agent. For each new joiner it works out whic
 We're hardening it from a demo into governed HR operations in 7 phases: see [docs/plans/2026-11-01-hardening-design.md](docs/plans/2026-11-01-hardening-design.md).
 
 ## Current phase
-**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract), A1 (owners, email templates), A2 (policies) and A3 (legacy rules/config retired) are done; B → E follow, one PR each. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
+**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract), A1 (owners, email templates), A2 (policies), A3 (legacy rules/config retired) and B (activity, guardrail hits, eval runs) are done; C → E follow, one PR each. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
 
 | Phase | Status |
 |---|---|
 | 0 Trust + foundation (auth, 5 roles, audit chain, jobs/outbox, bootstrap) | **done** |
 | 1 Policy governance + Employee/Item migration | **done** |
 | 2 AI control + Document migration | **done** |
-| 3 Retire graph record storage | **in progress** (PR 0, A1, A2, A3 done) |
+| 3 Retire graph record storage | **in progress** (PR 0, A1, A2, A3, B done) |
 | 4 Ops backbone + **Temporal** | planned |
 | 5 Lifecycle (transfer, offboarding, rechecks, contractor/rehire, leave) | planned |
 | 6 HR ops platform (manager view, SLAs, escalations, appeals, analytics) | planned |
@@ -23,7 +23,7 @@ We're hardening it from a demo into governed HR operations in 7 phases: see [doc
 ## Stack
 - **Backend:** FastAPI on Python 3.12, managed with `uv` (`backend/`).
 - **Postgres 17:** the system of record ([ADR 0005](docs/adr/0005-postgres-system-of-record.md)). Plain SQL through `psycopg`, no ORM.
-- **FalkorDB:** a read model only: the dependency graph, the relationship view, and the policy chunks the assistant retrieves ([ADR 0006](docs/adr/0006-graph-as-read-model.md)). Until Phase 3 finishes, it still holds connector records, events and integrations.
+- **FalkorDB:** a read model only: the dependency graph, the relationship view, and the policy chunks the assistant retrieves ([ADR 0006](docs/adr/0006-graph-as-read-model.md)). Until Phase 3 finishes, it still holds connector records and integrations.
 - **Next.js 16 / React 19 / Tailwind 4 / shadcn on base-ui** (`frontend/`). The browser calls the API through the Next.js rewrite of `/api/*` to `BACKEND_URL`, so the app and the API share one origin and the session cookie works.
 - **Temporal:** arrives in **Phase 4**, for durable workflows on top of Postgres ([ADR 0011](docs/adr/0011-temporal-orchestration.md)). It isn't used yet.
 
@@ -86,6 +86,7 @@ cd backend && uv run python test_phase3.py    # migration engine (freeze, cutove
 | `backend/graph_migration.py` | **Phase 3 engine:** a `LabelSpec` per graph label; freeze-checked `cutover(batch)`, report, `drift_since_cutover`, `rollback(batch)`, CLI |
 | `backend/documents/` | **Documents (Phase 2).** `store` is the only read/write path for documents, mismatches and decisions (append-only `doc_decisions`); `route` is the pure policy router (`decide`, `ALWAYS_HIGH`, `backtest`) |
 | `backend/records.py` | **The only way to read or write employees and checklist items.** Refreshes the graph projection in place after each write |
+| `backend/events.py`, `backend/guardrails.py`, `backend/evals.py` | **Activity events, guardrail hits and eval runs** (Postgres, Phase 3 B). `graph.event()` is the event choke point and calls `events.record` |
 | `backend/owners.py`, `backend/templates.py`, `backend/policies.py` | **The only way to read or write owners, email templates and policies** (Postgres, Phase 3 A1/A2; `chat.index_chunks` builds the `PolicyChunk` index from `policies`). Owner writes re-project graph `Owner` nodes (`records.project_owners`) |
 | `backend/policy/` | Rule-set versions: `store` (versions, drafts, diff), `replay` (pure `plan_diff` + `apply`), `service` (preview, approvals, publish/notify jobs), `routes` |
 | `backend/migrations/NNN_*.sql` | Schema, applied at startup |
