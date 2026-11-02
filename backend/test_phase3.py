@@ -202,6 +202,11 @@ q(f"MATCH (n:{TPL}) DETACH DELETE n")
 for e, n, d, t in [("Mgr.Eng@x.com", "Asha", "Engineering", "manager"), ("it@x.com", "IT desk", "IT", "owner:IT"),
                    ("fac@x.com", "Facilities", "Admin", "owner:Facilities")]:
     q(f"MERGE (o:{OWN} {{email:$e}}) SET o.name=$n, o.department=$d, o.type=$t", e=e.lower(), n=n, d=d, t=t)
+import records  # noqa: E402
+q(f"CREATE (o:{OWN} {{email:'Mixed.Case@x.com', name:'Mixed', department:'Sales', type:'manager'}})")  # older code
+records.save_employee({"id": "E9100", "name": "Reports To Mixed", "email": "rtm@x.com", "role": "Engineer", "grade": "L2",
+                       "department": "Sales", "location": "Bengaluru", "manager_email": "mixed.case@x.com",
+                       "joining_date": "2026-12-01", "token": "tok-e9100", "thread_id": ""})
 q(f"CREATE (t:{TPL} {{id:'standard', name:'Standard', subject:'Hi {{{{name}}}}', body:'<p>{{{{doc_list}}}}</p>'}})")
 q(f"CREATE (t:{TPL} {{id:'intern', name:'Intern', subject:'Hey', body:'b'}})")
 
@@ -210,7 +215,7 @@ check("a1_has_no_graph_read_paths_left", gm.read_paths(OWN, ("backend/records.py
 res = gm.cutover("A1", watch=0)
 reps = {r["label"]: r for r in res["labels"]}
 check("a1_cutover_clean", all(r["ok"] and not r["unmapped_keys"] for r in reps.values())
-      and reps[OWN]["pg_count"] == 3 and reps[TPL]["pg_count"] == 2 and bridge.SOURCE[OWN] == "postgres", reps)
+      and reps[OWN]["pg_count"] == 4 and reps[TPL]["pg_count"] == 2 and bridge.SOURCE[OWN] == "postgres", reps)
 check("a1_owners_read_from_postgres", owners.manager_for("Engineering") == "mgr.eng@x.com"
       and set(owners.by_category()) == {"IT", "Facilities"} and owners.get("MGR.ENG@x.com")["name"] == "Asha")
 check("a1_template_renders_from_postgres", gmail.render("standard", {"name": "Ravi", "doc_list": "<ul></ul>"})
@@ -219,7 +224,11 @@ check("a1_template_renders_from_postgres", gmail.render("standard", {"name": "Ra
 owners.upsert([{"email": "hr.ops@x.com", "name": "Neha", "department": "HR", "type": "manager"},
                {"email": "it@x.com", "name": "IT service desk", "department": "IT", "type": "owner:IT"}])
 templates.upsert({"id": "welcome", "name": "Welcome", "subject": "s", "body": "b"})
+check("a1_cutover_reprojects_legacy_owner_keys", q(f"MATCH (:Employee {{id:'E9100'}})-[:REPORTS_TO]->(o:{OWN}) "
+                                                   "RETURN o.email AS e") == [{"e": "mixed.case@x.com"}])
 g = {r["n"]["email"]: r["n"] for r in q(f"MATCH (n:{OWN}) RETURN n")}
+check("a1_owner_write_keeps_reports_to_edges", q(f"MATCH (:Employee {{id:'E9100'}})-[:REPORTS_TO]->(o:{OWN}) "
+                                                 "RETURN o.email AS e") == [{"e": "mixed.case@x.com"}])
 check("a1_owner_projection_follows_postgres", g.get("hr.ops@x.com", {}).get("name") == "Neha"
       and g["it@x.com"]["name"] == "IT service desk")
 dr = {d["label"]: d for d in gm.drift_since_cutover()}
@@ -229,7 +238,6 @@ check("a1_drift_catches_a_stray_template_write", not [d for d in gm.drift_since_
 q(f"MATCH (t:{TPL} {{id:'intern'}}) SET t.subject = 'Hey'")
 q(f"MATCH (o:{OWN} {{email:'it@x.com'}}) SET o.name = 'stray'")
 check("a1_drift_catches_projection_out_of_step", not [d for d in gm.drift_since_cutover() if d["label"] == OWN][0]["ok"])
-import records  # noqa: E402
 records.rebuild_graph()  # the repair path: re-project owners from Postgres
 check("a1_rebuild_repairs_owner_projection", [d for d in gm.drift_since_cutover() if d["label"] == OWN][0]["ok"])
 
@@ -239,7 +247,7 @@ check("a1_rollback_writes_new_rows_back", "welcome" in gt and all(r["ok"] for r 
       and bridge.SOURCE[TPL] == "graph", rb)
 res = gm.cutover("A1", watch=0)
 check("a1_cutover_again_after_rollback", all(r["ok"] for r in res["labels"]) and bridge.SOURCE[TPL] == "postgres"
-      and len(templates.all()) == 3 and len(owners.all()) == 4)
+      and len(templates.all()) == 3 and len(owners.all()) == 5)
 
 # ---------- batch A2: Policy (retired from the graph); PolicyChunk stays as an index rebuilt from Postgres ----------
 import asyncio  # noqa: E402
@@ -317,11 +325,27 @@ check("a3_cutover_archives_legacy_nodes", all(r["ok"] and not r["unmapped_keys"]
       and reps[RULE]["pg_count"] == len(SEEDREQ["rules"]) and reps[CONF]["pg_count"] == 4, reps)
 
 check("a3_no_active_version_yet", pstore.active_version() is None and checklist.config("roles") is None)
-out = ingest.import_requirements("requirements.json", REQ)
+db.execute("UPDATE legacy_rules SET props = jsonb_set(props, '{description}', to_jsonb(%s::text)) WHERE id='R-PAN'",
+           ("HR's own PAN rule",))
+outs = []
+ts = [threading.Thread(target=lambda: outs.append(ingest.seed_rules())) for _ in range(2)]
+[t.start() for t in ts]
+[t.join() for t in ts]
+out = max(outs, key=lambda o: o["imported"])
+check("a3_racing_starts_create_one_v1", sorted(o["imported"] for o in outs) == [0, len(SEEDREQ["rules"])]
+      and db.fetch1("SELECT count(*) AS n FROM rule_set_versions")["n"] == 1
+      and db.fetch1("SELECT count(*) AS n FROM audit_log WHERE action='policy.published' AND entity_id='v1'")["n"] == 1, outs)
 v1 = pstore.active_version()
+check("a3_upgrade_keeps_hr_rules_from_the_archive", "legacy-graph-rules" in v1["title"] and next(
+    r for r in pstore.rules_of(v1["id"]) if r["id"] == "R-PAN")["description"] == "HR's own PAN rule"
+    and [r["id"] for r in pstore.rules_of(v1["id"])] == [r["id"] for r in SEEDREQ["rules"]], v1["title"])
+check("a3_seed_rules_is_a_noop_once_active", ingest.seed_rules() is None)
 v1_rules = pstore.rules_of(v1["id"])
 check("a3_import_creates_v1_in_postgres", v1 and v1["number"] == 1 and len(v1_rules) == len(SEEDREQ["rules"])
       and out["imported"] == len(SEEDREQ["rules"]) and not out["errors"], out)
+check("a3_csv_compliance_text", [pstore.normalise_rule({**SEEDREQ["rules"][0], "compliance": c})["compliance"]
+                                  for c in ("false", "no", "0", " ", "TRUE", "yes", "1", True)]
+      == [False, False, False, False, True, True, True, True])
 check("a3_v1_compliance_flags", {r["id"] for r in v1_rules if r["compliance"]} == pstore.COMPLIANCE_DEFAULT)
 check("a3_config_comes_from_the_version", checklist.config("roles") == SEEDREQ["roles"]
       and checklist.config("departments") == SEEDREQ["departments"] and checklist.config("doc_policy") == {})
@@ -371,7 +395,17 @@ check("wiped_graph_rebuilds_the_projection",
       (q("MATCH (e:Employee) RETURN e.id AS i, e.manager_email AS m"), q(f"MATCH (o:{OWN}) RETURN o.email AS e"), counts))
 check("wiped_graph_rebuilds_the_policy_index",
       q(f"MATCH (c:{CHUNK}) RETURN count(DISTINCT c.source) AS n")[0]["n"] == counts["policies"])
-check("no_drift_after_the_rebuild", all(d["ok"] for d in gm.drift_since_cutover() if d["label"] == OWN))
+check("no_drift_after_the_rebuild", all(d["ok"] for d in gm.drift_since_cutover()), gm.drift_since_cutover())
+q(f"MATCH (o:{OWN}) DETACH DELETE o")  # only the owners are lost; employees are still in the graph
+asyncio.run(ingest.seed())
+check("a_start_restores_a_lost_owner_projection", q(f"MATCH (o:{OWN}) RETURN count(o) AS n")[0]["n"] == counts["owners"])
+
+# a spec module that fails to import fails every time, never a silently partial registry
+gm.SPEC_MODULES = gm.SPEC_MODULES + ("no_such_spec_module",)
+gm._loaded = False
+errs = [raises(gm.load, ImportError) for _ in range(2)]
+gm.SPEC_MODULES = gm.SPEC_MODULES[:-1]
+check("spec_import_failure_is_never_silent", all(errs) and gm.load() and gm._loaded, errs)
 
 # ---------- API contract ----------
 out = subprocess.run([sys.executable, str(ROOT / "scripts" / "api_contract.py"), "--check"], capture_output=True, text=True)

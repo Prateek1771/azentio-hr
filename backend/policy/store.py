@@ -38,7 +38,14 @@ def normalise_rule(r: dict) -> dict:
     return {"id": str(r["id"]).strip(), "item": str(r["item"]).strip(), "name": r.get("name") or "",
             "kind": r["kind"], "category": r["category"], "match": match, "offset_days": int(r.get("offset_days") or 0),
             "depends_on": list(deps), "description": r["description"], "policy_ref": r.get("policy_ref") or "",
-            "auto": r.get("auto") or "", "compliance": bool(r.get("compliance"))}
+            "auto": r.get("auto") or "", "compliance": _flag(r.get("compliance"))}
+
+
+def _flag(v) -> bool:
+    """A CSV cell is text: "false", "no", "0" and "" are False."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "yes", "y", "1")
+    return bool(v)
 
 
 # ---------- reads ----------

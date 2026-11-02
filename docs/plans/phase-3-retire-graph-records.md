@@ -91,6 +91,12 @@
   audited as system), no graph writes, a draft with a user, a refusal without one or with a draft open, drift on a stray
   write, then rollback (a deleted node comes back) and a second cutover.
 
+- **Deep test (A1–A3 together), fixes:** `ingest.seed_rules()` decides the first rule set: the archived graph rules on
+  an upgrade from before versions, otherwise the sample file; the loser of a race does nothing. Every start refreshes the
+  `Owner` projection. A projection label's cutover rebuilds the projection once. An emptied retired label isn't drift.
+  `normalise_rule` parses a text `compliance` cell. `graph_migration.load()` is never silently partial. Details and the
+  upgrade/rollback-to-`main`/two-instance results are in the runbook's "Deep test" section.
+
 ## The approved plan
 
 ### Context

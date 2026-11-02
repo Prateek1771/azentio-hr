@@ -71,10 +71,10 @@ def register(spec: LabelSpec) -> LabelSpec:
 def load() -> dict[str, LabelSpec]:
     global _loaded
     if not _loaded:
-        _loaded = True
         import importlib
-        for m in SPEC_MODULES:
+        for m in SPEC_MODULES:  # a failing import raises here, every time: never a silently partial registry
             importlib.import_module(m)
+        _loaded = True
     return SPECS
 
 
@@ -246,6 +246,9 @@ def _cutover(batch: str, todo: list[LabelSpec], freeze: dict) -> dict:
     for r in reports:
         _set_state(r["label"], "postgres", {**r, "batch": batch, "cutover_at": at, "before": before[r["label"]],
                                              "freeze": freeze, "graph_checksum_at_cutover": r["graph_sha"]})
+    if any(s.projection for s in todo):  # e.g. a legacy Owner node keyed `A.B@x` vs the row `a.b@x`: re-project
+        import records                  # everything once, so no edge points at a node the next refresh would drop
+        records.rebuild_graph()
     return {"batch": batch, "cutover_at": at, "freeze": freeze, "labels": reports, "before": before}
 
 
@@ -260,7 +263,8 @@ def drift_since_cutover() -> list[dict]:
         if s.projection:  # the projection follows Postgres: compare with Postgres now
             then = bridge.checksum(_canon_pg(s, pg_rows(s)), s.key)
         now = graph_checksum(s)
-        out.append({"label": s.label, "batch": s.batch, "ok": then == now, "at_cutover": then, "now": now,
+        emptied = not s.projection and now == bridge.checksum([], s.key)  # a wiped graph, not a stray write
+        out.append({"label": s.label, "batch": s.batch, "ok": then == now or emptied, "at_cutover": then, "now": now,
                     "cutover_at": (st["report"] or {}).get("cutover_at")})
     return out
 

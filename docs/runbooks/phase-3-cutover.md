@@ -59,7 +59,7 @@ restore path.**
 |---|---|---|---|---|---|---|
 | A1 | Owner (stays as projection), EmailTemplate | 2026-11-02 03:08 UTC | Owner 8/0 → 8/8, EmailTemplate 4/0 → 4/4; sha equal | single writer, 15 s watch | pass | dev |
 | A2 | Policy (PolicyChunk stays as an index) | 2026-11-02 03:37 UTC | Policy 7/0 → 7/7; sha equal | single writer, 15 s watch | pass | dev |
-| A3 | Rule and Config (legacy, removed; Config moved here from A1) | 2026-11-02 07:23 UTC | Rule 18/0 → 18/18, Config 4/0 → 4/4; sha equal | single writer, 15 s watch | pass | dev |
+| A3 | Rule and Config (legacy, removed; Config moved here from A1) | | | | | |
 | B | Event, GuardrailEvent, EvalRun, EvalResult | | | | | |
 | C | Connector, ConnectorInstance, Record, links, CustomField, ImportRun, IntegrationRun (archived) | | | | | |
 | D | Integration, IntegrationCandidate, WorkflowRun, IntegrationLogRecord, OutboundMessage, AgentMessage | | | | | |
@@ -137,34 +137,31 @@ Run on a separate database and graph (`azentio_fresh` / `fresh`, port 8001, Gmai
   `HAS_DOC`/`SUBMITTED` and `REPORTS_TO` edges), the index was rebuilt (31 chunks), drift was ok, and the same 22
   checks passed. Before the seed fix, this reset all three edits to the seed values.
 
-### A3: Rule, Config (dev stack, 2026-11-02)
+### Deep test of A1 + A2 + A3 together (throwaway stack, 2026-11-02)
+Database `azentio_deep`, graph `deep`; the previous release ran from a `main` worktree.
 
-**Before** (graph / Postgres): Rule 18 / 0, graph sha `ddc05d5b…`; Config 4 / 0, graph sha `1451685f…`. `BGSAVE` first.
-The dev rule set was already at v33 (rule-set versions have owned the rules since Phase 1), so the nodes are archived,
-not migrated into use.
+| Step | Result |
+|---|---|
+| Baseline: ruff, guard + selftest, `test_core`, `test_phase0..3`, `tsc`, `eslint` | pass |
+| Upgrade `main` → A3 with HR edits made on `main` (template, mixed-case owner email, policy) | A1, A2, A3 cut over in one start, before the worker; parity, schema and read paths clean; edits served; new joiner `REPORTS_TO` the `main`-era owner; retrieval finds the `main`-era policy |
+| Writes on the new release (template, owner, policy, a two-approver rule version published) | pass |
+| Full rollback (`rollback A3`, `A2`, `A1`), then start `main` on the same data | each rollback at parity; `main` serves every new-release edit and rule set v2 |
+| Re-upgrade after an edit on `main` | clean second cutover of all three; the edit carried over |
+| Two instances started at once | one cut over; the other refused ("another instance is cutting over… nothing was switched"); restarted, it found nothing pending |
+| Wiped graph after an upgrade | edits kept, projection rebuilt, no false drift |
+| Dev stack: `smoke.py`, drift, `/ready` | pass |
 
-**Cutover** at startup, 07:23:30 UTC, into the `legacy_rules` / `legacy_config` archive tables:
-
-| Label | source | graph | pg | parity | unmapped keys | read paths left | drift since cutover |
-|---|---|---|---|---|---|---|---|
-| Rule | postgres | 18 | 18 | ok | none | none | ok |
-| Config | postgres | 4 | 4 | ok | none | none | ok |
-
-**Freeze evidence** (after the drill's re-cutover): `single_writer: true`, `watched_seconds: 15`,
-`recent_stopped_heartbeats: ["DESKTOP-968RPED:21108"]`.
-
-**Feature smoke:** `scripts/smoke.py` passes (rules page, draft, preview, approval and rollback flows, every role).
-As HR Ops, uploaded a requirements file on `/api/ingest`: draft v34 opened, and its diff and impact preview rendered.
-The diff showed only real differences from the active v33 (`R-NDA` and `R-BGV` came from earlier smoke-published
-versions; `R-PAN` was the edit); there were no compliance-flag changes. The graph's `Rule` count stayed 18. The draft
-was discarded.
-
-**Rollback drill:** stopped the backend and ran `graph_migration rollback A3`: Rule ok 18 / 18, Config ok 4 / 4,
-checksums equal. Restarted: cut over again at 07:25:06 UTC, parity ok, drift ok. All five Phase 3 labels so far are on
-`postgres` at parity.
-
-**Fresh install / wiped graph** (throwaway stack): A1, A2 and A3 cut over on empty stores. The seed's import created v1
-(18 rules, compliance R-ID/R-I9/R-BGV) and wrote no `Rule`/`Config` nodes. After edits, a `GRAPH.DELETE` and a restart, the
-edits survived, no rule set was re-created, and the projection was rebuilt to match Postgres.
-
-**Sign-off:** dev ✓. CI on the PR covers `test_phase3` (A3 section and API contract).
+**Independent review:** 8 findings; 7 fixed with regression tests in `test_phase3`, 1 noted:
+1. An upgrade from before rule-set versions would have published the sample rules over HR's own: `seed_rules` now
+   builds v1 from the archived graph rules (`policy.legacy.archived_requirements`).
+2. A lost graph with no employees never re-projected owners: every start now refreshes the `Owner` projection.
+3. A legacy mixed-case `Owner` node passed parity (case-folded), and the next owner write would drop it and its
+   edges: a projection label's cutover now rebuilds the projection once.
+4. A wiped graph reported drift on retired labels forever: an emptied retired label isn't drift.
+5. A CSV `compliance` cell of "false", "no" or "0" counted as true: it's parsed as text now.
+6. Noted, not changed: an owner import commits, then refreshes the graph. With FalkorDB down it returns 500 after
+   saving. That's the same pattern as every employee write; the next start's owner refresh heals the projection.
+7. One failing spec module left a silently partial registry: `load()` now marks itself loaded only after every module
+   imports.
+8. The loser of a first-run import race reported rows imported and re-ran checklists: it now returns `imported: 0` and
+   does nothing.

@@ -140,7 +140,7 @@ def _parse_requirements(filename: str, data: bytes) -> tuple[dict, list[dict], l
         if miss:
             errors += [{"row": i, "field": f, "message": "Missing mandatory field", "name": r.get("id", "")} for f in miss]
             continue
-        if r.get("compliance") in (None, ""):
+        if str(r.get("compliance") or "").strip() == "":
             r = {**r, "compliance": str(r["id"]).strip() in store.COMPLIANCE_DEFAULT}
         rules.append(store.normalise_rule(r))
     return obj, rules, errors
@@ -158,15 +158,20 @@ def import_requirements(filename: str, data: bytes, user: dict | None = None) ->
         return import_requirements_draft(filename, data, user)
     obj, rules, errors = _parse_requirements(filename, data)
     config = {k: obj.get(k, {} if k in ("doc_types", "locations", "doc_policy") else []) for k in store.CONFIG_KEYS}
+    created = False
     with db.tx() as c:
         c.execute("SELECT pg_advisory_xact_lock(7243010)")  # one v1, even if two starts race
         if not store.active_version(conn=c):
+            created = True
             store.create_version("active", f"Initial rule set (imported from {filename})", config, rules,
                                  user["id"] if user else None, c, reason="First rule set on a new install")
             import audit
             audit.record_audit("policy.published", "rule_set_version", "v1",
                                f"Rule set v1 created from {len(rules)} imported rules",
                                actor="HR" if user else "system", conn=c)
+    if not created:  # another starter won the race: its v1 stands, nothing was imported here
+        return {"kind": "requirements", "total": len(obj.get("rules", [])), "imported": 0, "errors": errors,
+                "message": "A rule set became active meanwhile; nothing imported."}
     for eid in records.employee_ids():
         checklist.regenerate(eid, "requirements updated")
     return {"kind": "requirements", "total": len(obj.get("rules", [])), "imported": len(rules), "errors": errors}
@@ -190,17 +195,27 @@ def import_requirements_draft(filename: str, data: bytes, user: dict) -> dict:
             "message": f"Saved as draft v{num}. Preview its impact and submit it for approval under Requirement rules."}
 
 
+def seed_rules() -> dict | None:
+    """The first rule set, if there's none yet: HR's own archived graph rules on an upgrade from before rule-set
+    versions (what `ensure_active` used to build v1 from), otherwise the sample file. None if one is already active."""
+    from policy import legacy, store
+    if store.active_version():
+        return None
+    archived = legacy.archived_requirements()
+    if archived:
+        return import_requirements("legacy-graph-rules.json", json.dumps(archived).encode())
+    return import_requirements("requirements.json", (SEED / "requirements.json").read_bytes())
+
+
 async def seed():
     """Load sample data on first run. "First run" is decided per record type from Postgres, the record: an empty graph
     alone (lost or wiped) must never re-seed over HR's data. It rebuilds the projection instead."""
     import chat
     from graph import ensure_indexes
-    from policy import store
     ensure_indexes()
     # Decided before anything below writes: a replay would project single employees and hide the loss.
     graph_lost = bool(records.employee_ids()) and not q1("MATCH (e:Employee) RETURN e LIMIT 1")
-    if not store.active_version():
-        import_requirements("requirements.json", (SEED / "requirements.json").read_bytes())
+    seed_rules()
     if not owners.all():
         import_owners("owners.csv", (SEED / "owners.csv").read_bytes())
     if not templates.all():
@@ -209,8 +224,10 @@ async def seed():
     if not records.employee_ids():
         import_employees("employees.csv", (SEED / "employees.csv").read_bytes())
         demo_progress()
-    elif graph_lost:  # rebuild the projection (owners first, then every employee) from Postgres
+    if graph_lost:  # rebuild the projection (owners first, then every employee) from Postgres
         records.rebuild_graph()
+    else:  # the Owner projection follows Postgres on every start, also for a lost graph with no employees yet
+        records.project_owners()
     from connectors.seed import seed_connectors
     seed_connectors()
     import policies
