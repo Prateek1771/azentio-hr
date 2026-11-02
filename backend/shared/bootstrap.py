@@ -150,6 +150,8 @@ def run() -> dict:
     migrate_records()
     migrate_documents()
     migrate_graph_batches()
+    from connectors import secrets
+    secrets.check_at_startup()  # stored secrets must be readable with the configured key (ADR 0013)
     state = {"migrations": applied, "users_created": created, "audit_imported": imported, "graph": graph_ok()}
     ls.log_event(_log, "done", **{k: (len(v) if isinstance(v, list) else v) for k, v in state.items()})
     if created and not is_production():

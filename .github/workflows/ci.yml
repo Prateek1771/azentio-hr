@@ -18,6 +18,8 @@ env:
   LLM_KEYLESS_FALLBACK: "0"
   DATABASE_URL: postgresql://azentio:azentio@localhost:5432/azentio
   FALKORDB_URL: redis://localhost:6379
+  # A throwaway Fernet key: CI stores no real connector secrets (ADR 0013).
+  SECRETS_KEY: l8Q6Dj1zMdsZIR2BUvWeA_B95txjUivahGYa5Hw-wD0=
 
 jobs:
   backend:

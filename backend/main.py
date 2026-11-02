@@ -533,7 +533,8 @@ async def create_joiner(f: dict, template_id: str, send: bool, reason: str, cand
     eid = ingest.upsert_employee(valid[0], reason)
     audit.record_audit("employee.created", "employee", eid, f"Started onboarding for joiner {eid} ({reason})")
     if candidate_record:
-        q("MATCH (e:Employee {id:$e}), (r:Record {id:$r}) MERGE (e)-[:FROM_CANDIDATE]->(r)", e=eid, r=candidate_record)
+        from connectors import store as connectors
+        connectors.link(eid, candidate_record, "from_candidate")
     out = {"id": eid, "sent": False}
     if send:
         if not gmail.configured():

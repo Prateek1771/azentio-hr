@@ -61,7 +61,7 @@ restore path.**
 | A2 | Policy (PolicyChunk stays as an index) | 2026-11-02 03:37 UTC | Policy 7/0 → 7/7; sha equal | single writer, 15 s watch | pass | dev |
 | A3 | Rule and Config (legacy, removed; Config moved here from A1) | | | | | |
 | B | Event, GuardrailEvent, EvalRun, EvalResult | 2026-11-02 09:46 UTC | Event 434/0 → 434/434, GuardrailEvent 1/1, EvalRun 2/2, EvalResult 25/25; sha equal | single writer | pass | dev |
-| C | Connector, ConnectorInstance, Record, links, CustomField, ImportRun, IntegrationRun (archived) | | | | | |
+| C | Connector, ConnectorInstance, Record, links, CustomField, ImportRun, IntegrationRun (archived) | 2026-11-02 14:43 UTC | Connector 7/7, ConnectorInstance 7/7 (OF 7), Record 20/20 (IN 20, SYNCED_TO 3, FROM_CANDIDATE 3), CustomField 0/0, ImportRun 1/1, IntegrationRun 3/3; sha equal | single writer | pass | dev |
 | D | Integration, IntegrationCandidate, WorkflowRun, IntegrationLogRecord, OutboundMessage, AgentMessage | | | | | |
 | E | AuditLog (legacy, removed), read-model cleanup | | | | | |
 
@@ -207,3 +207,45 @@ Database `azentio_deep`, graph `deep`; the previous release ran from a `main` wo
 - Re-upgrade: four clean cutovers.
 
 **Sign-off:** dev ✓. CI on the PR covers `test_phase3` (B section and API contract).
+
+### C: connectors and secrets (dev stack, 2026-11-02)
+
+**Before:** Connector 7, ConnectorInstance 7 (2 with plaintext secrets: Slack `••••abcd`, Jira `••••ksdf`), Record 20,
+CustomField 0, ImportRun 1, IntegrationRun 3; edges OF 7, IN 20, SYNCED_TO 3, FROM_CANDIDATE 3. `BGSAVE` first.
+
+**Secrets first.** Production: set `SECRETS_KEY` before deploying C, because the cutover encrypts while it backfills and
+refuses without a key. Dev without a key uses the built-in dev key and logs a warning. Keep the key apart from database
+backups; `rollback C` needs it to write plaintext back for the previous release.
+
+**Cutover** at startup, 14:43:18 UTC: all six labels `postgres`, parity ok, no unmapped keys, no read paths left, edge
+counts equal. Both secrets became Fernet tokens (`secret_key_id d8f1b5e4`, the dev key) with the same hints.
+
+**Feature smoke:**
+- `scripts/smoke.py` passes for every role, including `/connectors`.
+- By API as admin:
+  - the connector list (record counts; Slack and Jira `connected`)
+  - records page and search
+  - Slack's connection shows `••••abcd` and never the secret; test-connection ok; saving with a blank token kept it
+  - a CSV import into Candidate Import (a second import run)
+  - starting onboarding from that record added `FROM_CANDIDATE` (E74957)
+  - the HR Portal sync (`push_employee`) added `SYNCED_TO`
+- Integration runs send mail on the dev stack, so the run was done on the throwaway stack.
+- Drift ok after the writes.
+
+**Rollback drill:**
+1. Stopped the backend and ran `graph_migration rollback C`: Record 22/22 (IN 22, SYNCED_TO 4, FROM_CANDIDATE 4),
+   ImportRun 2/2, everything ok. The secrets are plaintext again, and E74957's two links are edges.
+2. Restarted: cut over again at 14:45:34 UTC. All 15 Phase 3 labels so far are `postgres` at parity with no drift.
+
+**Throwaway deep run:**
+- `main` saved a Slack token (plaintext in the graph) and onboarded a candidate.
+- `main` → C with a real `SECRETS_KEY`: A1, A2, A3, B and C cut over in one start; the secret was encrypted with that
+  key, the hint and test-connection were unchanged; onboarding added a link; an integration run succeeded.
+- Rotation: `SECRETS_KEY=new`, `SECRETS_KEY_PREVIOUS=old`, `python -m connectors.rotate_key` ("re-encrypted 1"), then
+  the new key alone: test-connection ok.
+- Refusals: the old key alone → "connector secrets were encrypted with key 7cdb184f, but the configured keys are
+  40ee0d0b"; `ENV=production` with no key → "connector secrets are stored; set SECRETS_KEY".
+- Full rollback (C, B, A3, A2, A1) with the key, then `main`: connectors, the Slack connection (test passes) and both
+  onboarding links. Re-upgrade: five clean cutovers.
+
+**Sign-off:** dev ✓. CI on the PR covers `test_phase3` (C section and API contract) with a throwaway `SECRETS_KEY`.

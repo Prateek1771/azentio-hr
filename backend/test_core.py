@@ -91,7 +91,7 @@ assert vals is None and any("email" in p for p in probs)
 vals, probs = normalise({"candidate_id": "C1", "first_name": "A", "last_name": "B", "email": "A@B.COM", "status": "hired", "education": "BSc; MSc"})
 assert not probs and vals["email"] == "a@b.com" and vals["education"] == ["BSc", "MSc"]
 
-from graph import q as gq, q1 as gq1, ensure_indexes, G as _G  # noqa: E402
+from graph import q as gq, ensure_indexes, G as _G  # noqa: E402
 assert _G.name == "test", "test_core must run on the test graph"
 from connectors.seed import seed_connectors  # noqa: E402
 import checklist as _cl  # noqa: E402
@@ -101,10 +101,11 @@ from policy import store as _pstore  # noqa: E402
 if not _pstore.active_version():  # the rule set (and its config: departments, locations, doc types, roles) is v1
     _ingest.import_requirements("requirements.json", (Path(__file__).parent / "seed" / "requirements.json").read_bytes())
 seed_connectors()
-hr_id = gq1("MATCH (i:ConnectorInstance {key:'hr_portal'}) RETURN i.id AS id")["id"]
+from connectors import store as _cstore  # noqa: E402
+hr_id = _cstore.instance_id_for("hr_portal")
 hr = HrPortal()
 email = "idempotent.test@example.com"
-gq("MATCH (r:Record {instance_id:$i}) WHERE r.values CONTAINS $e DETACH DELETE r", i=hr_id, e=email)
+db.execute("DELETE FROM connector_records WHERE instance_id=%s AND data->>'work_email'=%s", (hr_id, email))
 before = hr.count_records(hr_id)
 rid1, o1 = hr.upsert_record(hr_id, {**good, "work_email": email})
 rid2, o2 = hr.upsert_record(hr_id, {**good, "work_email": email, "job_title": "Senior SE"})
@@ -112,7 +113,7 @@ rid3, o3 = hr.upsert_record(hr_id, {**good, "work_email": email, "job_title": "S
 rid4, o4 = hr.upsert_record(hr_id, {**good, "work_email": email, "job_title": "Senior SE"})
 assert (o1, o2, o3, o4) == ("created", "updated", "skipped", "skipped") and rid1 == rid2 == rid3 == rid4
 assert hr.count_records(hr_id) == before + 1  # four writes, one employee
-gq("MATCH (f:CustomField {instance_id:$i, key:'badge_number'}) DELETE f", i=hr_id)
+db.execute("DELETE FROM custom_fields WHERE instance_id=%s AND key='badge_number'", (hr_id,))
 hr.add_field(hr_id, "Badge number", "string", False)
 try:
     hr.add_field(hr_id, "badge  NUMBER", "string", False)
@@ -169,7 +170,8 @@ from integrations.store import SetupError  # noqa: E402
 
 # Postgres is recreated empty each run; clear the test graph's projection of employees/items to match it.
 gq("MATCH (n) WHERE n:Employee OR n:Item DETACH DELETE n")
-gq("MATCH (r:Record)-[:IN]->(:ConnectorInstance)-[:OF]->(:Connector {role:'app'}) DETACH DELETE r")
+db.execute("DELETE FROM connector_records WHERE instance_id IN (SELECT id FROM connector_instances WHERE key IN "
+           "(SELECT key FROM connectors WHERE role='app'))")
 gq("MATCH (n) WHERE n:Integration OR n:IntegrationCandidate OR n:WorkflowRun OR n:IntegrationLogRecord OR n:AgentMessage OR n:OutboundMessage DETACH DELETE n")
 import tempfile  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
@@ -180,7 +182,7 @@ _docsvc.UPLOADS = _Path(tempfile.mkdtemp(prefix="azentio-core-"))  # demo docume
 import owners as _owners  # noqa: E402
 if not _owners.emails("manager"):
     _ingest.import_owners("owners.csv", (Path(__file__).parent / "seed" / "owners.csv").read_bytes())
-cp_id = gq1("MATCH (i:ConnectorInstance {key:'candidate_portal'}) RETURN i.id AS id")["id"]
+cp_id = _cstore.instance_id_for("candidate_portal")
 
 
 async def _wf():

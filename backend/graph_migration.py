@@ -35,6 +35,8 @@ class EdgeSpec:
     graph_count: str       # Cypher returning {n}
     pg_count: str          # SQL returning {n}
     restore: Callable[[], None] | None = None  # rollback: rebuild these edges in the graph from Postgres
+    backfill: Callable[[object], None] | None = None  # cutover: copy edges with no node of their own (e.g. links) into
+    #                                                   their table, given the cutover transaction's connection
 
 
 @dataclass
@@ -57,7 +59,8 @@ class LabelSpec:
 
 
 SPECS: dict[str, LabelSpec] = {}
-SPEC_MODULES = ("owners", "templates", "policies", "policy.legacy", "events", "guardrails", "evals")  # each registers its labels' specs on import (batch A1 onward)
+SPEC_MODULES = ("owners", "templates", "policies", "policy.legacy", "events", "guardrails", "evals",
+                "connectors.store")  # each registers its labels' specs on import (batch A1 onward)
 _loaded = False
 
 
@@ -236,6 +239,10 @@ def _cutover(batch: str, todo: list[LabelSpec], freeze: dict) -> dict:
         c.execute("SET LOCAL azentio.backfill = '1'")
         for s in todo:
             backfill(s, c)
+        for s in todo:  # after every node, so a link's rows exist
+            for e in s.edges:
+                if e.backfill:
+                    e.backfill(c)
     reports = [label_report(s) for s in todo]
     bad = [r for r in reports if not r["ok"] or r["read_paths_remaining"]]
     if bad:
@@ -292,7 +299,7 @@ def _rollback(batch: str, freeze: dict) -> dict:
     reports = []
     for s in batch_labels(batch):
         rows = pg_rows(s)
-        q(f"MATCH (n:{s.label}) WHERE NOT n.{s.key} IN $keep DETACH DELETE n", keep=[r[s.key] for r in rows])
+        q(f"MATCH (n:{s.label}) WHERE n.{s.key} IS NULL OR NOT n.{s.key} IN $keep DETACH DELETE n", keep=[r[s.key] for r in rows])
         for r in rows:
             q(f"MERGE (n:{s.label} {{{s.key}: $k}}) SET n = $p", k=r[s.key], p=s.from_row(r))
         for e in s.edges:

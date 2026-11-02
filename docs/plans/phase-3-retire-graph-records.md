@@ -1,6 +1,6 @@
 # Phase 3: Retire graph record storage
 
-- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config) and B (activity) are done; C → E follow, one PR each.
+- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config), B (activity) and C (connectors) are done; D and E follow, one PR each.
 - **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
 - **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
 - **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
@@ -96,6 +96,29 @@
   `Owner` projection. A projection label's cutover rebuilds the projection once. An emptied retired label isn't drift.
   `normalise_rule` parses a text `compliance` cell. `graph_migration.load()` is never silently partial. Details and the
   upgrade/rollback-to-`main`/two-instance results are in the runbook's "Deep test" section.
+
+## As built: batch C (connectors, secrets at rest)
+- Migration `015_connectors.sql` (014 went to B): `connectors`, `connector_instances` (+ `secret_enc`, `secret_key_id`,
+  `secret_hint`), `connector_records`, `employee_record_links`, `custom_fields`, `import_runs`, `legacy_sync_runs`.
+  The record's field values are the column `data`, because `values` is an SQL keyword; the API still says `values`.
+- `connectors/store.py` is the only reader and writer. The `Connector` interface is unchanged; `list_records` pages and
+  searches in SQL (search matches field values, not key names). `registry`, `hr_portal`, `candidates`, `seed`,
+  `connector_routes`, `integrations/service` and `integrations/engine` call it; `main.create_joiner` adds the
+  `from_candidate` link. `connectors/sync.run`/`runs` are deleted; the pure mapping helpers stay.
+- **Engine:** `EdgeSpec.backfill` copies edges that have no node of their own (the employee links) inside the cutover
+  transaction. Rollback now also deletes graph nodes that lack the key property (`CustomField` had no `id`).
+- **Secrets (ADR 0013):** `connectors/secrets.py`, Fernet via `MultiFernet` (`SECRETS_KEY`, `SECRETS_KEY_PREVIOUS`).
+  The cutover encrypts the graph's plaintext; parity compares a sha256 of the plaintext, so no secret reaches the report.
+  `check_at_startup` runs after the cutover. `python -m connectors.rotate_key` rotates in one transaction. The
+  connection test returns 422 "secret can't be decrypted with the current key" when no key can read it. Saving a
+  connection and testing it now write their audit rows in the same transaction.
+- `test_phase3` C section (32 checks): the old graph with a plaintext secret, links, a custom field, an import run and an
+  integration run; a clean cutover with edge counts; the API views; encryption, the hint and keep-on-blank; rotation;
+  wrong-key, production-without-key and malformed-key refusals; an undecryptable secret; SQL paging and search; the HR
+  Portal sync replacing `synced_to`; custom fields; imports; drift; rollback (plaintext secret and every edge back);
+  a second cutover.
+- Throwaway stack: `main` → C (five batches in one start) with a real key; an integration run; rotation; refusals;
+  a full rollback to `main` (connection test still passes on decrypted plaintext); re-upgrade.
 
 ## As built: batch B (activity, guardrail hits, eval runs)
 - Migration `014_activity.sql`: `events`, `guardrail_events`, `eval_runs`, `eval_results`. Columns are the old graph

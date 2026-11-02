@@ -1,7 +1,6 @@
 """Seed the connector catalog, this workspace's instances and demo records (only when absent)."""
-import time
-
-from graph import q, q1, new_id
+from graph import new_id
+from . import store
 from .candidates import CandidatePortal
 from .hr_portal import HrPortal
 
@@ -39,24 +38,20 @@ HR_EMPLOYEES = [
 def seed_apps():
     """App connectors arrived after the first seed, so add any that are missing to existing workspaces too."""
     from .apps import CATALOG as APP_CATALOG
+    have = store.connector_keys()
     for c in APP_CATALOG:
-        if not q1("MATCH (c:Connector {key:$k}) RETURN c", k=c["key"]):
-            q("CREATE (c:Connector) SET c = $p", p=c)
-            q("MATCH (c:Connector {key:$k}) CREATE (i:ConnectorInstance {id:$id, key:$k, name:$n, created:$t})-[:OF]->(c)",
-              k=c["key"], id=new_id("ci"), n=c["name"], t=time.time())
+        if c["key"] not in have:
+            store.add_connector(c, new_id("ci"))
 
 
 def seed_connectors():
     seed_apps()
-    if q1("MATCH (c:Connector) WHERE c.role <> 'app' RETURN c LIMIT 1"):
+    if store.has_non_app_connectors():
         return
-    now = time.time()
     ids = {}
     for c in CATALOG:
-        q("CREATE (c:Connector) SET c = $p", p=c)
         ids[c["key"]] = new_id("ci")
-        q("MATCH (c:Connector {key:$k}) CREATE (i:ConnectorInstance {id:$id, key:$k, name:$n, created:$t})-[:OF]->(c)",
-          k=c["key"], id=ids[c["key"]], n=c["name"], t=now)
+        store.add_connector(c, ids[c["key"]])
     keys = [f.key for f in CandidatePortal.FIELDS]
     portal = CandidatePortal()
     for row in CANDIDATES:

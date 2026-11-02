@@ -150,7 +150,9 @@ flowchart LR
 | `connectors/hr_portal.py` | HR Portal target: write rules, custom fields, onboarding push | `validate`, `HrPortal.upsert_record`, `add_field`, `push_employee` |
 | `connectors/apps.py` | Demo app connectors (Slack, Jira, ServiceNow, Google Workspace); every action is recorded, no external call | `AppConnector.perform`, `ACTIONS` |
 | `connectors/registry.py` | Connector key → implementation | `_REGISTRY`, `get` |
-| `connectors/sync.py` | Field aliases and the original one-shot sync (kept for the self-checks; integrations now run through `integrations/engine.py`) | `suggest_mapping`, `apply_mapping` |
+| `connectors/store.py` | **The only reader and writer of connector tables** (Phase 3 C): catalog, instances, connection settings, records (SQL paging and search), employee links, custom fields, import runs; registers the batch C specs | `records`, `find`, `write`, `link`, `employee_links`, `connection`, `save_connection`, `secret`, `rotate` |
+| `connectors/secrets.py` | Connector secrets at rest (ADR 0013): Fernet with `SECRETS_KEY` / `SECRETS_KEY_PREVIOUS`, startup check | `encrypt`, `decrypt`, `check_at_startup`, `SecretUnavailable` |
+| `connectors/sync.py` | Field aliases (the old one-shot `run`/`runs` was removed in Phase 3 C; integrations run through `integrations/engine.py`) | `suggest_mapping`, `apply_mapping` |
 | `connectors/seed.py` | Catalog, instances and demo records | `seed_connectors` |
 | `seed/` | Sample joiners, owners, requirement rules, roles, email templates, policies, the eval question set | — |
 | `test_core.py`, `test_phase0.py` | Assert-based self-checks (throwaway Postgres databases and the `test` graph) | — |
@@ -221,6 +223,9 @@ Two stores. Postgres is the system of record for everything built in Phases 0 to
 | `owners` (Phase 3 A1) | `email (PK, lowercase), name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | Department owners and managers. `owners.py` is the only reader and writer; each write re-projects graph `Owner` nodes (`records.project_owners`) |
 | `policies` (Phase 3 A2) | `source (PK), title, text` | Uploaded policy and process documents. `policies.py` is the only reader and writer; `chat.index_chunks` builds the graph's `PolicyChunk` index from them, and `chat.reindex_policies` rebuilds it in full |
 | `legacy_rules`, `legacy_config` (Phase 3 A3) | `id, props (jsonb)` / `key, value` | Archive of the retired graph `Rule`/`Config` nodes, only for `graph_migration rollback A3`; nothing reads them. Dropped in PR E |
+| `connectors`, `connector_instances` (Phase 3 C) | catalog: `key, name, role, record_kind, demo, description`; instance: `id, key, name, created, connection (jsonb), secret_enc, secret_key_id, secret_hint` | The connector catalog and this workspace's instances. The secret is a Fernet token; the API sees only `secret_set` and the hint |
+| `connector_records`, `employee_record_links` (Phase 3 C) | record: `id, instance_id, kind, data (jsonb: the field values), created, updated`; link: `employee_id, record_id, type (synced_to, from_candidate)` | Candidates, HR Portal employees and app actions, and which joiner each belongs to |
+| `custom_fields`, `import_runs`, `legacy_sync_runs` (Phase 3 C) | `instance_id:key` id; import `filename, total, imported, errors (jsonb), ts`; archive `id, props` | HR Portal custom fields, Candidate Import history, and the dead one-shot sync runs (rollback only) |
 | `events` (Phase 3 B) | `id, employee_id ('' = system), kind, message, ts (epoch seconds)` | The activity timeline. Written only through `graph.event()` → `events.record`; read by the activity page, employee timelines and the HR co-pilot |
 | `guardrail_events` (Phase 3 B) | `id, ts, surface, rule, action` | Guardrail hits (`guardrails.record`), no message text |
 | `eval_runs`, `eval_results` (Phase 3 B) | run: `id, ts, status, judge, model, summary (jsonb), done, total, finished, error`; result: `id, run_id, n, question, reference, answer, ms, guardrail_ok, answered, faithfulness, context_precision, context_recall, sources (jsonb)` | Assistant evaluation runs (`evals.py`). Readers drop NULLs, so a missing metric is an absent key, as it was in the graph |
@@ -240,13 +245,9 @@ flowchart LR
     E -->|SUBMITTED| D((Document))
     I -->|HAS_DOC| D
     D -->|MISMATCH| E
-    E -->|FROM_CANDIDATE| R((Record))
-    E -->|SYNCED_TO| R
-    R -->|IN| CI((ConnectorInstance))
-    CI -->|OF| C((Connector))
     RU((Rule)) -.->|"creates (by rule_id)"| I
     PC((PolicyChunk)) -.->|source| P((Policy))
-    IN((Integration)) -.->|"source_id / target_id"| CI
+    IN((Integration)) -.->|"source_id / target_id"| CI[("connector_instances (Postgres)")]
     IC((IntegrationCandidate)) -.->|"integration_id · record_id · employee_id"| IN
     WR((WorkflowRun)) -.->|integration_id| IN
 ```
@@ -264,11 +265,11 @@ Integration nodes link by id properties rather than edges, because each one is r
 | `Config` | `key (departments, locations, doc_types, roles), value (json)` | **Retired** (Phase 3 A3): the active version's `config` holds it. Archived in `legacy_config` for rollback only |
 | `EmailTemplate` | `id, name, subject, body` | **Retired** (Phase 3 A1): stale nodes stay until PR E's cleanup; the `email_templates` table is the record |
 | `Policy` / `PolicyChunk` | `source, title, text` / `source, section, text, embedding?` | `Policy` is **retired** (Phase 3 A2; the `policies` table is the record, stale nodes go in PR E's cleanup). `PolicyChunk` is the retrieval index, chunked by `##` section and rebuilt from `policies` |
-| `Connector` | `key, name, role (source, target), record_kind, demo, description` | Connector catalog |
-| `ConnectorInstance` | `id, key, name` | This workspace's use of a connector |
-| `Record` | `id, instance_id, kind, values (json), created, updated` | A candidate or HR Portal employee |
-| `CustomField` | `instance_id, key, label, type, required` | HR Portal custom fields |
-| `ImportRun` / `IntegrationRun` | counts, errors or results, mapping, policy, `ts` | Import history and the original one-shot sync |
+| `Connector` | `key, name, role (source, target), record_kind, demo, description` | **Retired** (Phase 3 C): the `connectors` table |
+| `ConnectorInstance` | `id, key, name` | **Retired** (Phase 3 C): `connector_instances`, with the secret encrypted (ADR 0013) |
+| `Record` | `id, instance_id, kind, values (json), created, updated` | **Retired** (Phase 3 C): `connector_records`; the `SYNCED_TO` / `FROM_CANDIDATE` edges are `employee_record_links` |
+| `CustomField` | `instance_id, key, label, type, required` | **Retired** (Phase 3 C): `custom_fields` |
+| `ImportRun` / `IntegrationRun` | counts, errors or results, mapping, policy, `ts` | **Retired** (Phase 3 C): `import_runs`; the dead `IntegrationRun` nodes are archived in `legacy_sync_runs` |
 | `Integration` | `id, name, status (draft, active, paused), next_run_at, config (json)` | One integration. Settings sit in a single JSON `config` because a FalkorDB property can't hold null, and setup needs "not answered yet" |
 | `IntegrationCandidate` | `id, integration_id, record_id, employee_id, stage, last_error, access (json)` | One candidate's progress through an integration |
 | `WorkflowRun` | `id, integration_id, trigger (manual, scheduled), status, counts, started, finished` | One integration run |
@@ -388,7 +389,7 @@ sequenceDiagram
     R->>G: hr_record deps all done? yes, auto=complete
     R->>G: hr_record = Completed, Event
     R->>H: push_employee() (match on work email, policy=update)
-    H->>G: Record created or updated, SYNCED_TO, Event
+    H->>PG: connector record created or updated, synced_to link, event
     R->>G: laptop, email account, badge deps done? yes
     R->>G: status = Requested, Event "Request raised to IT Service Desk"
     Note over R: loops until nothing changes, so chains resolve in one pass
@@ -450,12 +451,12 @@ sequenceDiagram
     HR->>C: open candidate, "Start onboarding"
     C->>BE: name, email, designation→role, department, grade, location, joining date
     BE->>BE: validate_employees() (same rules as CSV)
-    BE->>G: Employee + checklist, FROM_CANDIDATE
+    BE->>G: Employee + checklist (from_candidate link in Postgres)
     opt send email
         BE->>BE: gmail.send_request()
     end
     Note over G: documents accepted → HR record auto-completes
-    G->>H: push_employee() → SYNCED_TO
+    G->>H: push_employee() → synced_to link
 ```
 
 ### 5.11 Integrations: agent-led setup
@@ -1006,7 +1007,7 @@ Every route needs a signed-in session, except `/api/auth/login` and `/api/portal
 | Personal data | Document files on local disk, extracted fields in the graph, sent to the LLM provider for extraction | Encryption at rest, retention policy, a provider with a DPA |
 | LLM safety | The LLM can't change state; outputs are schema-parsed and checked by rules. Chat inputs and outputs pass the guardrails (§7.1). The setup agent only calls validated tools and never sees candidate records | A classifier model if regex guardrails prove too weak |
 | HR-written expressions | Parsed with `ast` against an allow-list, never `eval`'d | — |
-| Connector secrets | Stored in the graph as is; never returned by the API | Encrypt with a KMS or env key |
+| Connector secrets | Encrypted at rest with Fernet (`SECRETS_KEY`, ADR 0013); never returned by the API; startup refuses a missing or wrong key; `python -m connectors.rotate_key` rotates | KMS envelope encryption |
 | Tracing | Langfuse is off by default. Document scans are redacted; prompt text (names, checklists, policy text) is sent | Self-host Langfuse, or mask names too |
 | Logs | Console lines hold ids and counts only; portal tokens masked. The integration log honours HR's exclusions, old runs included | Ship to a log store with retention |
 | Audit | Append-only at the database (trigger), hash-chained and verifiable, actor and role on every entry (§10) | Periodic `verify_chain` job and an exportable, signed audit trail |
@@ -1026,7 +1027,7 @@ Every route needs a signed-in session, except `/api/auth/login` and `/api/portal
 | No exception-queue screen yet | Dead jobs are visible through `GET /api/work-queue` only | The inbox UI ships with Phase 1's first human-facing producers |
 | Keyword retrieval when no embedding model is set | Fine for dozens of policy chunks | Set `LLM_EMBED_MODEL` (the vector index already exists) |
 | HR co-pilot loads every joiner's open items | About 40 joiners (then trims to named, soon-joining or focused) | Per-joiner digests retrieved by embedding |
-| Connector records matched by scanning JSON values | Demo-sized connectors | Promote `work_email` and `candidate_id` to indexed properties |
+| Connector records matched with `data->>field` in SQL (no index on the field) | Demo-sized connectors | An expression index on `work_email` and `candidate_id` |
 | Gmail polling every 60 s | Up to a minute of latency | Gmail push via Pub/Sub (needs a public URL) |
 | Only FalkorDB runs in Docker | Local development | Containerise backend and frontend |
 | Markdown subset renderer | No tables in policies | A real Markdown parser |

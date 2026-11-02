@@ -6,11 +6,11 @@ from typing import Literal
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
-from connectors import registry
+from connectors import registry, store
 from connectors.candidates import CandidateImport
 from connectors.hr_portal import HrPortal
 import audit
-from graph import q, q1
+from shared import db
 
 router = APIRouter(prefix="/api")
 
@@ -31,7 +31,7 @@ def _with_count(inst: dict, impl) -> dict:
 @router.get("/connectors")
 def list_connectors():
     # One connector this build doesn't know (e.g. added by a newer version) mustn't hide all the others.
-    found = [registry.get(r["id"]) for r in q("MATCH (i:ConnectorInstance) RETURN i.id AS id ORDER BY i.created")]
+    found = [registry.get(r["id"]) for r in store.instances()]
     return [_with_count(*f) for f in found if f]
 
 
@@ -50,8 +50,7 @@ def connector_schema(cid: str):
 def connector_records(cid: str, page: int = 1, page_size: int = 25, q_: str = Query("", alias="q")):
     _, impl = _conn(cid)
     data = impl.list_records(cid, page, min(max(page_size, 1), 200), q_)
-    links = {r["r"]: r["e"] for r in q("""MATCH (e:Employee)-[:FROM_CANDIDATE|SYNCED_TO]->(r:Record {instance_id:$i})
-                                         RETURN r.id AS r, e.id AS e""", i=cid)}
+    links = store.linked_employees(cid)
     for item in data["items"]:
         item["employee_id"] = links.get(item["id"])
     return data
@@ -63,8 +62,7 @@ def connector_record(cid: str, rid: str):
     rec = impl.get_record(cid, rid)
     if not rec:
         raise HTTPException(404, "Record not found in this connector")
-    link = q1("MATCH (e:Employee)-[:FROM_CANDIDATE|SYNCED_TO]->(:Record {id:$r}) RETURN e.id AS id, e.name AS name", r=rid)
-    return {**rec, "employee": link}
+    return {**rec, "employee": store.linked_employee(rid)}
 
 
 class AttributeBody(BaseModel):
@@ -97,13 +95,8 @@ TENANT_LABEL = {"slack": ("Workspace URL", "azentio.slack.com"), "jira": ("Site 
 
 
 def _connection(cid: str) -> dict:
-    """Saved settings, with the secret replaced by a flag. The secret itself never leaves the server."""
-    row = q1("MATCH (i:ConnectorInstance {id:$id}) RETURN i.connection AS c, i.secret AS s", id=cid)
-    c = json.loads((row or {}).get("c") or "{}")
-    secret = (row or {}).get("s") or ""
-    return {"tenant": c.get("tenant", ""), "auth_type": c.get("auth_type", "token"), "username": c.get("username", ""),
-            "secret_set": bool(secret), "secret_hint": f"••••{secret[-4:]}" if len(secret) >= 8 else ("••••" if secret else ""),
-            "configured_at": c.get("configured_at"), "last_test": c.get("last_test")}
+    """Saved settings, with the secret replaced by a flag and a hint. The secret itself never leaves the server."""
+    return store.connection(cid)
 
 
 @router.get("/connectors/{cid}/connection")
@@ -123,25 +116,22 @@ class ConnectionBody(BaseModel):
 
 @router.put("/connectors/{cid}/connection")
 def put_connection(cid: str, b: ConnectionBody):
-    """ponytail: the secret sits in the graph as-is (never returned by the API). Encrypt it with a KMS/env key
-    before real credentials go in."""
+    """The secret is stored encrypted (ADR 0013) and never returned; a blank one keeps the saved secret."""
     inst, _ = _conn(cid)
     if inst["key"] not in TENANT_LABEL:
         raise HTTPException(400, f"{inst['name']} has no connection to configure")
-    old = q1("MATCH (i:ConnectorInstance {id:$id}) RETURN i.connection AS c, i.secret AS s", id=cid) or {}
-    old_cfg = json.loads(old.get("c") or "{}")
-    same_type = old_cfg.get("auth_type") == b.auth_type
+    can_keep = store.saved_auth_type(cid) == b.auth_type  # a saved secret of the same kind may be kept
     new_secret = (b.password if b.auth_type == "basic" else b.token).strip()
-    secret = new_secret or (old.get("s") if same_type else "") or ""
     if b.auth_type == "basic" and not b.username.strip():
         raise HTTPException(422, "Basic authentication needs a username")
-    if not secret:
+    if not new_secret and not can_keep:
         raise HTTPException(422, "Enter the password" if b.auth_type == "basic" else "Enter the API token")
     cfg = {"tenant": b.tenant.strip(), "auth_type": b.auth_type, "username": b.username.strip() if b.auth_type == "basic" else "",
            "configured_at": time.time(), "last_test": None}
-    q("MATCH (i:ConnectorInstance {id:$id}) SET i.connection=$c, i.secret=$s", id=cid, c=json.dumps(cfg), s=secret)
-    audit.record_audit("connector.connection_saved", "connector", cid,
-                       f"Saved {b.auth_type} connection settings for {inst['name']} ({cfg['tenant']})")
+    with db.tx() as conn:
+        store.save_connection(cid, cfg, new_secret or store.KEEP, conn=conn)
+        audit.record_audit("connector.connection_saved", "connector", cid,
+                           f"Saved {b.auth_type} connection settings for {inst['name']} ({cfg['tenant']})", conn=conn)
     return get_connection(cid)
 
 
@@ -153,13 +143,17 @@ def test_connection(cid: str):
     cur = _connection(cid)
     if not cur["tenant"] or not cur["secret_set"]:
         raise HTTPException(422, "Save the tenant and credentials before testing")
+    try:
+        store.secret(cid)  # a real check would authenticate with it; the demo systems only need it to be readable
+    except store.SecretUnavailable as ex:
+        raise HTTPException(422, f"The saved credentials can't be used: {ex}. Re-enter them, or restore the key.")
     who = cur["username"] or "API token"
     result = {"ok": True, "at": time.time(), "ms": 120 + (sum(map(ord, cid)) % 180),
               "message": f"Connected to {cur['tenant']} as {who}"}
-    row = q1("MATCH (i:ConnectorInstance {id:$id}) RETURN i.connection AS c", id=cid)
-    cfg = {**json.loads(row["c"] or "{}"), "last_test": result}
-    q("MATCH (i:ConnectorInstance {id:$id}) SET i.connection=$c", id=cid, c=json.dumps(cfg))
-    audit.record_audit("connector.connection_tested", "connector", cid, f"Tested connection to {inst['name']}: {result['message']}")
+    with db.tx() as conn:
+        store.set_last_test(cid, result, conn=conn)
+        audit.record_audit("connector.connection_tested", "connector", cid,
+                           f"Tested connection to {inst['name']}: {result['message']}", conn=conn)
     return result
 
 
@@ -177,8 +171,7 @@ async def connector_import(cid: str, file: UploadFile = File(...)):
 @router.get("/connectors/{cid}/imports")
 def connector_imports(cid: str):
     _conn(cid)
-    rows = q("MATCH (r:ImportRun {instance_id:$i}) RETURN r ORDER BY r.ts DESC", i=cid)
-    return [{**r["r"], "errors": json.loads(r["r"]["errors"])} for r in rows]
+    return store.import_runs(cid)
 
 
 class StartOnboarding(BaseModel):
@@ -207,7 +200,4 @@ async def onboard_candidate(cid: str, rid: str, body: StartOnboarding):
 
 @router.get("/employees/{eid}/links")
 def employee_links(eid: str):
-    rows = q("""MATCH (e:Employee {id:$e})-[l:FROM_CANDIDATE|SYNCED_TO]->(r:Record)-[:IN]->(i:ConnectorInstance)
-                RETURN type(l) AS type, r.id AS record_id, r.values AS v, i.id AS connector_id, i.name AS connector""", e=eid)
-    return [{"type": r["type"], "record_id": r["record_id"], "connector_id": r["connector_id"], "connector": r["connector"],
-             "employee_number": json.loads(r["v"]).get("employee_number")} for r in rows]
+    return store.employee_links(eid)

@@ -4,8 +4,8 @@ Every read and write of an Employee or Item goes through here. Rows come back as
 return (ISO date strings, graph-only properties merged back from `extra`), so callers didn't have to change shape.
 
 After every write, `project(eid)` refreshes that employee's nodes in the graph *in place* (MERGE by id). Nodes are
-never deleted or recreated: connector records hang off them (SYNCED_TO, FROM_CANDIDATE), and documents are projected
-here too (documents.store.project).
+never deleted or recreated, so the edges documents hang off survive (documents.store.project projects them here too).
+Connector record links live in Postgres since Phase 3 batch C (`connectors/store.py`).
 """
 from datetime import date, datetime
 
