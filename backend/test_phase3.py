@@ -524,6 +524,10 @@ row = db.fetch1("SELECT * FROM connector_instances WHERE id='ci_hr'")
 check("c_secret_encrypted_at_rest", row["secret_enc"] and PLAIN not in row["secret_enc"]
       and row["secret_key_id"] == csecrets.key_id(csecrets.DEV_KEY) and row["secret_hint"] == "••••1234"
       and cstore.secret("ci_hr") == PLAIN, row)
+check("c_cutover_scrubs_plaintext_from_the_graph",
+      q(f"MATCH (i:{CI}) WHERE i.secret IS NOT NULL RETURN count(i) AS n")[0]["n"] == 0
+      and q(f"MATCH (i:{CI}) RETURN count(i) AS n")[0]["n"] == 3
+      and all(d["ok"] for d in gm.drift_since_cutover() if d["label"] in C_LABELS))
 view = api_view()
 lst = {c["id"]: c for c in view["list"]}
 check("c_connectors_list_from_postgres", list(lst) == ["ci_cp", "ci_hr", "ci_sl"]
@@ -571,11 +575,19 @@ check("c_undecryptable_secret_is_a_clear_error_records_still_list",
       and croutes.get_connection("ci_hr")["secret_hint"] == "••••9876", e)
 os.environ["ENV"], os.environ["SECRETS_KEY"] = "production", ""
 e = raises(csecrets.check_at_startup, SystemExit)
-e2 = raises(lambda: csecrets.encrypt("x"), SystemExit)
-check("c_production_without_key_refuses_start", e and "set SECRETS_KEY" in e and e2 and DEV not in csecrets.keys(), e)
-e = raises(lambda: (os.environ.__setitem__("SECRETS_KEY", "not-a-key"), csecrets.keys()), SystemExit)
-check("c_malformed_key_is_a_clear_error", e and "not a valid Fernet key" in e, e)
-os.environ["ENV"], os.environ["SECRETS_KEY"] = "development", K1
+check("c_production_without_key_refuses_start", e and "set SECRETS_KEY" in e and DEV not in csecrets.keys(), e)
+# inside a request a key problem is an HTTP error, never SystemExit (that stops the server)
+e = raises(lambda: croutes.put_connection("ci_hr", croutes.ConnectionBody(tenant="azentio-prod", auth_type="token",
+                                                                          token="tok-other-0000")), HTTPException)
+e2 = raises(lambda: croutes.test_connection("ci_hr"), HTTPException)
+check("c_key_problems_in_requests_are_http_errors", e and "SECRETS_KEY" in e and e2 and "can't be used" in e2
+      and not issubclass(csecrets.KeyConfigError, SystemExit), (e, e2))
+os.environ["ENV"], os.environ["SECRETS_KEY"] = "development", "not-a-key"
+e = raises(csecrets.keys, csecrets.KeyConfigError)
+e2 = raises(csecrets.check_at_startup, SystemExit)
+check("c_malformed_key_is_a_clear_error_at_startup", e and "not a valid Fernet key" in e and e2
+      and "not a valid Fernet key" in e2, (e, e2))
+os.environ["SECRETS_KEY"] = K1
 
 # records, links, custom fields and imports on the new storage
 portal = CandidatePortal()
@@ -587,7 +599,8 @@ check("c_records_page_in_sql", page["total"] == 4 and len(page["items"]) == 2 an
       and [r["values"]["first_name"] for r in cstore.records("ci_cp", 1, 10)["items"]][-1] == "Ananya")
 check("c_record_search_matches_values_not_keys", cstore.records("ci_cp", q="ravi")["total"] == 2
       and cstore.records("ci_cp", q="candidate_id")["total"] == 0 and cstore.records("ci_cp", q="_99")["total"] == 1
-      and cstore.records("ci_cp", q="b.tech")["total"] == 1)
+      and cstore.records("ci_cp", q="b.tech")["total"] == 1 and cstore.records("ci_cp", q="  Ananya   k ")["total"] == 1
+      and cstore.records("ci_cp", q="Ananya Zzz")["total"] == 0)
 portal.upsert_candidate("ci_cp", {"candidate_id": "c-10", "first_name": "Ravi", "last_name": "Updated", "email": "ravi@x.com",
                                   "status": "hired"})
 check("c_upsert_matches_case_insensitively", cstore.records("ci_cp")["total"] == 4
@@ -628,7 +641,39 @@ check("c_rollback_restores_the_plaintext_secret_for_the_old_release",
 res = gm.cutover("C", watch=0)
 check("c_cutover_again_after_rollback", all(r["ok"] for r in res["labels"]) and bridge.SOURCE[REC] == "postgres"
       and cstore.secret("ci_hr") == "tok-new-secret-9876"
-      and db.fetch1("SELECT secret_key_id FROM connector_instances WHERE id='ci_hr'")["secret_key_id"] == csecrets.key_id(K1))
+      and db.fetch1("SELECT secret_key_id FROM connector_instances WHERE id='ci_hr'")["secret_key_id"] == csecrets.key_id(K1)
+      and q(f"MATCH (i:{CI}) WHERE i.secret IS NOT NULL RETURN count(i) AS n")[0]["n"] == 0)
+
+# deep test: a rollback that can't decrypt changes nothing
+os.environ["SECRETS_KEY"] = Fernet.generate_key().decode()
+e = raises(lambda: gm.rollback("C", watch=0), bridge.ParityError)
+check("c_rollback_without_the_key_changes_nothing", e and "nothing was changed" in e
+      and all(gm._state(lbl)["source"] == "postgres" for lbl in C_LABELS)
+      and q(f"MATCH (i:{CI}) WHERE i.secret IS NOT NULL RETURN count(i) AS n")[0]["n"] == 0, e)
+os.environ["SECRETS_KEY"] = K1
+gm.rollback("C", watch=0)
+db.execute("DELETE FROM worker_heartbeat")  # bootstrap's freeze check: no other instance
+# graph data the mapping can't take stops startup with a clear message, and switches nothing
+good_values = q(f"MATCH (r:{REC} {{id:'rec_c1'}}) RETURN r.values AS v")[0]["v"]
+q(f"MATCH (r:{REC} {{id:'rec_c1'}}) SET r.values = '{{bad'")
+from shared import bootstrap  # noqa: E402
+e = raises(bootstrap.migrate_graph_batches, SystemExit)
+check("c_malformed_graph_json_refuses_cutover_clearly", e and "rec_c1" in e and "Nothing was switched" in e
+      and gm._state(REC)["source"] == "graph", e)
+q(f"MATCH (r:{REC} {{id:'rec_c1'}}) SET r.values = $v", v=good_values)
+# an edge mismatch now blocks the cutover (the report's ok used to be overwritten by node parity)
+cur = q(f"MATCH (:Employee {{id:'E9100'}})-[:SYNCED_TO]->(r:{REC}) RETURN r.id AS i")[0]["i"]
+q(f"MATCH (e:Employee {{id:'E9100'}}), (r:{REC} {{id:$r}}) CREATE (e)-[:SYNCED_TO]->(r)", r=cur)  # a duplicate edge
+e = raises(lambda: gm.cutover("C", watch=0), bridge.ParityError)
+check("c_edge_mismatch_blocks_cutover", e and "SYNCED_TO" in e and gm._state(REC)["source"] == "graph", e)
+# the previous release re-synced E9100 to another record: the re-cutover must not bring the old link back
+q("MATCH (:Employee {id:'E9100'})-[s:SYNCED_TO]->() DELETE s")
+q(f"MATCH (e:Employee {{id:'E9100'}}), (r:{REC} {{id:'rec_h1'}}) CREATE (e)-[:SYNCED_TO]->(r)")
+res = gm.cutover("C", watch=0)
+check("c_recutover_replaces_links_with_the_graphs", all(r["ok"] for r in res["labels"])
+      and [x["record_id"] for x in cstore.employee_links("E9100") if x["type"] == "SYNCED_TO"] == ["rec_h1"]
+      and q(f"MATCH (i:{CI}) WHERE i.secret IS NOT NULL RETURN count(i) AS n")[0]["n"] == 0
+      and all(d["ok"] for d in gm.drift_since_cutover() if d["label"] in C_LABELS))
 
 # ---------- a lost graph never re-seeds over Postgres; the projection and the index are rebuilt from it ----------
 

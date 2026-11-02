@@ -249,3 +249,8 @@ counts equal. Both secrets became Fernet tokens (`secret_key_id d8f1b5e4`, the d
   onboarding links. Re-upgrade: five clean cutovers.
 
 **Sign-off:** dev ✓. CI on the PR covers `test_phase3` (C section and API contract) with a throwaway `SECRETS_KEY`.
+
+**Deep test (2026-11-02):** the review found the graph still held the plaintext secrets after cutover. The fixed
+cutover removes them, so dev was rolled back (`rollback C`) and restarted: cut over at 15:58:20 UTC, no `secret`
+property left in the graph, the Slack and Jira hints unchanged, both connection tests 200, and all 15 labels at parity
+with no drift. Upgrading an install that ran the earlier C build means the same two steps: `rollback C`, then restart.

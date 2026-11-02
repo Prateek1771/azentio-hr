@@ -11,7 +11,7 @@ import time
 import graph_migration as gm
 from shared import db
 from . import secrets
-from .secrets import SecretUnavailable  # noqa: F401  (re-exported for callers)
+from .secrets import KeyConfigError, SecretUnavailable  # noqa: F401  (re-exported for callers)
 
 KEEP = object()  # save_connection: keep the stored secret
 
@@ -66,12 +66,13 @@ def _row(r: dict) -> dict:
 
 
 def records(instance_id: str, page: int = 1, page_size: int = 25, q: str = "") -> dict:
-    """Newest first, paged in SQL. `q` matches any non-object field value, case-insensitively."""
+    """Newest first, paged in SQL. Every word of `q` must appear in some field value (not a key name), any case, so
+    "Ananya K" finds Ananya Krishnan as the old joined-values search did."""
     where, params = "instance_id = %(i)s", {"i": instance_id}
-    if q:
-        where += """ AND EXISTS (SELECT 1 FROM jsonb_each(data) f WHERE jsonb_typeof(f.value) <> 'object'
-                                 AND (f.value #>> '{}') ILIKE %(q)s ESCAPE '\\')"""
-        params["q"] = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    for n, word in enumerate(q.split()):
+        where += f""" AND EXISTS (SELECT 1 FROM jsonb_each(data) f WHERE jsonb_typeof(f.value) <> 'object'
+                                  AND (f.value #>> '{{}}') ILIKE %(q{n})s ESCAPE '\\')"""
+        params[f"q{n}"] = "%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     total = db.fetch1(f"SELECT count(*) AS n FROM connector_records WHERE {where}", params)["n"]
     rows = db.fetch(f"SELECT * FROM connector_records WHERE {where} ORDER BY created DESC, id LIMIT %(l)s OFFSET %(o)s",
                     {**params, "l": page_size, "o": (max(page, 1) - 1) * page_size})
@@ -214,6 +215,17 @@ def _f(v) -> float:
     return float(v or 0)
 
 
+def _json(v, default, what: str):
+    """Graph JSON strings: empty -> default; malformed -> refuse the cutover (silently mapping it to {} would pass
+    parity on both sides and lose the data)."""
+    if isinstance(v, str) and v.strip():
+        try:
+            return json.loads(v)
+        except ValueError:
+            raise ValueError(f"{what} holds malformed JSON; fix it in the graph and restart") from None
+    return default if v in (None, "") else v
+
+
 def _sha_plain(token: str) -> str:
     if not token:
         return ""
@@ -227,7 +239,7 @@ def _instance_row(p: dict) -> dict:
     plain = p.get("secret") or ""
     enc, kid = secrets.encrypt(plain) if plain else ("", "")
     return {"id": p["id"], "key": p["key"], "name": p.get("name") or "", "created": _f(p.get("created")),
-            "connection": gm.jsonv(p.get("connection"), {}), "secret_enc": enc, "secret_key_id": kid,
+            "connection": _json(p.get("connection"), {}, f"{CI} {p['id']} connection"), "secret_enc": enc, "secret_key_id": kid,
             "secret_hint": secrets.hint(plain)}
 
 
@@ -243,7 +255,7 @@ def _instance_props(r: dict) -> dict:
 
 def _record_row(p: dict) -> dict:
     return {"id": p["id"], "instance_id": p["instance_id"], "kind": p.get("kind") or "",
-            "data": gm.jsonv(p.get("values"), {}), "created": _f(p.get("created")), "updated": _f(p.get("updated") or p.get("created"))}
+            "data": _json(p.get("values"), {}, f"{R} {p['id']} values"), "created": _f(p.get("created")), "updated": _f(p.get("updated") or p.get("created"))}
 
 
 def _record_canon(r: dict) -> dict:
@@ -251,11 +263,19 @@ def _record_canon(r: dict) -> dict:
 
 
 def _backfill_links(conn) -> None:
+    """The graph is the source while the batch is pending: replace the table, so links the previous release removed
+    (a re-sync after a rollback) don't come back."""
     from graph import q
+    db.execute("DELETE FROM employee_record_links", conn=conn)
     for t, rel in LINK_TYPES.items():
         for row in q(f"MATCH (e:{EMP})-[:{rel}]->(r:{R}) RETURN DISTINCT e.id AS e, r.id AS r"):
             db.execute("INSERT INTO employee_record_links VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
                        (row["e"], row["r"], t), conn=conn)
+
+
+def _scrub_graph_secrets() -> None:
+    from graph import q
+    q(f"MATCH (i:{CI}) WHERE i.secret IS NOT NULL REMOVE i.secret")
 
 
 def _restore_of() -> None:
@@ -288,7 +308,7 @@ gm.register(gm.LabelSpec(
 
 gm.register(gm.LabelSpec(
     label=CI, batch="C", table="connector_instances",
-    to_row=_instance_row, canonical=_instance_canon, from_row=_instance_props,
+    to_row=_instance_row, canonical=_instance_canon, from_row=_instance_props, after_cutover=_scrub_graph_secrets,
     mapped_keys=frozenset({"id", "key", "name", "created", "connection", "secret"}),
     edges=[gm.EdgeSpec("OF", f"MATCH (:{CI})-[l:OF]->(:{C}) RETURN count(l) AS n",
                  "SELECT count(*) AS n FROM connector_instances", restore=_restore_of)]))

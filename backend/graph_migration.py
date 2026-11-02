@@ -56,6 +56,8 @@ class LabelSpec:
     dropped_keys: frozenset = frozenset()    # graph properties deliberately not carried over (documented)
     edges: list[EdgeSpec] = field(default_factory=list)
     allowed_readers: tuple = ()              # files allowed to keep MATCHing the label (e.g. the rebuild)
+    after_cutover: Callable[[], None] | None = None  # runs once the batch is clean, before the switch (e.g. scrub
+    #                                                  plaintext secrets from the graph); drift is measured from after it
 
 
 SPECS: dict[str, LabelSpec] = {}
@@ -174,7 +176,7 @@ def label_report(spec: LabelSpec) -> dict:
         edges.append({"edge": e.name, "graph": g, "pg": p, "ok": g == p})
     paths = read_paths(spec.label, spec.allowed_readers)
     ok = par["ok"] and not unmapped and all(e["ok"] for e in edges)
-    return {"label": spec.label, "table": spec.table, "ok": ok, **par, "graph_keys": seen, "unmapped_keys": unmapped,
+    return {"label": spec.label, "table": spec.table, **par, "ok": ok, "graph_keys": seen, "unmapped_keys": unmapped,
             "dropped_keys": sorted(spec.dropped_keys), "edges": edges, "read_paths_remaining": paths}
 
 
@@ -250,9 +252,15 @@ def _cutover(batch: str, todo: list[LabelSpec], freeze: dict) -> dict:
                                  + json.dumps([{k: r[k] for k in ('label', 'ok', 'first_mismatch_id', 'unmapped_keys',
                                                                      'edges', 'read_paths_remaining')} for r in bad]))
     at = datetime.now(timezone.utc).isoformat()
+    baseline = {}
+    for s in todo:
+        if s.after_cutover:
+            s.after_cutover()
+        baseline[s.label] = graph_checksum(s) if s.after_cutover else None
     for r in reports:
         _set_state(r["label"], "postgres", {**r, "batch": batch, "cutover_at": at, "before": before[r["label"]],
-                                             "freeze": freeze, "graph_checksum_at_cutover": r["graph_sha"]})
+                                             "freeze": freeze,
+                                             "graph_checksum_at_cutover": baseline[r["label"]] or r["graph_sha"]})
     if any(s.projection for s in todo):  # e.g. a legacy Owner node keyed `A.B@x` vs the row `a.b@x`: re-project
         import records                  # everything once, so no edge points at a node the next refresh would drop
         records.rebuild_graph()
@@ -297,11 +305,15 @@ def rollback(batch: str, watch: float | None = None) -> dict:
 def _rollback(batch: str, freeze: dict) -> dict:
     from graph import q
     reports = []
-    for s in batch_labels(batch):
-        rows = pg_rows(s)
-        q(f"MATCH (n:{s.label}) WHERE n.{s.key} IS NULL OR NOT n.{s.key} IN $keep DETACH DELETE n", keep=[r[s.key] for r in rows])
-        for r in rows:
-            q(f"MERGE (n:{s.label} {{{s.key}: $k}}) SET n = $p", k=r[s.key], p=s.from_row(r))
+    try:  # every payload first: a row that can't be converted aborts before anything is written or switched
+        plan = [(s, [(r[s.key], s.from_row(r)) for r in pg_rows(s)]) for s in batch_labels(batch)]
+    except Exception as e:
+        raise bridge.ParityError(f"rollback {batch}: a row can't be written back ({type(e).__name__}: {e}); "
+                                 "nothing was changed") from None
+    for s, payload in plan:
+        q(f"MATCH (n:{s.label}) WHERE n.{s.key} IS NULL OR NOT n.{s.key} IN $keep DETACH DELETE n", keep=[k for k, _ in payload])
+        for k, p in payload:
+            q(f"MERGE (n:{s.label} {{{s.key}: $k}}) SET n = $p", k=k, p=p)
         for e in s.edges:
             if e.restore:
                 e.restore()

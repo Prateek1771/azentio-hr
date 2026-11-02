@@ -21,8 +21,9 @@ class SecretUnavailable(RuntimeError):
     """The secret is stored but none of the configured keys can decrypt it."""
 
 
-class KeyConfigError(SystemExit):
-    pass
+class KeyConfigError(RuntimeError):
+    """The key configuration can't encrypt or decrypt. A plain exception, never SystemExit: raised inside a request it
+    must become an HTTP error, not stop the server. `check_at_startup` turns it into SystemExit."""
 
 
 def _production() -> bool:
@@ -77,7 +78,15 @@ def hint(plain: str) -> str:
 def check_at_startup() -> None:
     """Refuse to start when stored secrets can't be read: production without a key, or no key matching the stored
     fingerprints. Runs after migrations and the batch C cutover."""
+    try:
+        _check_at_startup()
+    except KeyConfigError as e:
+        raise SystemExit(str(e)) from None
+
+
+def _check_at_startup() -> None:
     from shared import db
+    keys()  # a malformed key fails here, even before any secret is stored
     stored = sorted({r["secret_key_id"] for r in db.fetch(
         "SELECT DISTINCT secret_key_id FROM connector_instances WHERE secret_enc <> ''")})
     if not stored:

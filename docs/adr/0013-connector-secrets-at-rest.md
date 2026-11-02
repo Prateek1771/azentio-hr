@@ -22,7 +22,8 @@ Connectors (Slack, Jira, ServiceNow, Google Workspace and the HR Portal) keep a 
 3. **Fail fast at startup** (`secrets.check_at_startup`, run after the migrations and the batch C cutover):
    - If secrets are stored, `ENV=production` and `SECRETS_KEY` is unset, startup stops with "connector secrets are stored; set SECRETS_KEY".
    - If a stored `secret_key_id` matches none of the configured keys, startup stops and names both the stored and the configured fingerprints.
-   - A malformed key gives a clear message and the command that generates a valid one.
+   - A malformed key gives a clear message and the command that generates a valid one, at startup, even before any secret is stored.
+   - Inside a request, a key problem is an HTTP error (503 on save, 422 on test), never `SystemExit`: `KeyConfigError` is a `RuntimeError`, and only `check_at_startup` turns it into an exit.
    - Development without a key uses a fixed, public dev key and logs a warning. Production never uses it.
 4. **Rotation:**
    1. Deploy with `SECRETS_KEY=<new>` and `SECRETS_KEY_PREVIOUS=<old>`.
@@ -31,6 +32,7 @@ Connectors (Slack, Jira, ServiceNow, Google Workspace and the HR Portal) keep a 
 5. **The migration encrypts.**
    - The batch C cutover encrypts the graph's plaintext secrets as it backfills.
    - Parity compares a sha256 of the plaintext, so no secret appears in the migration report or in a checksum.
+   - Once the batch is clean, the cutover removes the plaintext `secret` property from the graph's `ConnectorInstance` nodes (`LabelSpec.after_cutover`), and drift is measured from that point. The graph then holds no credential.
    - `graph_migration rollback C` decrypts back to plaintext, because the previous release reads it that way. Rolling back therefore needs the key.
 
 ## Consequences

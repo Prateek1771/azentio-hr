@@ -128,10 +128,13 @@ def put_connection(cid: str, b: ConnectionBody):
         raise HTTPException(422, "Enter the password" if b.auth_type == "basic" else "Enter the API token")
     cfg = {"tenant": b.tenant.strip(), "auth_type": b.auth_type, "username": b.username.strip() if b.auth_type == "basic" else "",
            "configured_at": time.time(), "last_test": None}
-    with db.tx() as conn:
-        store.save_connection(cid, cfg, new_secret or store.KEEP, conn=conn)
-        audit.record_audit("connector.connection_saved", "connector", cid,
-                           f"Saved {b.auth_type} connection settings for {inst['name']} ({cfg['tenant']})", conn=conn)
+    try:
+        with db.tx() as conn:
+            store.save_connection(cid, cfg, new_secret or store.KEEP, conn=conn)
+            audit.record_audit("connector.connection_saved", "connector", cid,
+                               f"Saved {b.auth_type} connection settings for {inst['name']} ({cfg['tenant']})", conn=conn)
+    except store.KeyConfigError as ex:
+        raise HTTPException(503, f"Connection secrets can't be stored right now: {ex}. Ask an administrator.")
     return get_connection(cid)
 
 
@@ -145,7 +148,7 @@ def test_connection(cid: str):
         raise HTTPException(422, "Save the tenant and credentials before testing")
     try:
         store.secret(cid)  # a real check would authenticate with it; the demo systems only need it to be readable
-    except store.SecretUnavailable as ex:
+    except (store.SecretUnavailable, store.KeyConfigError) as ex:
         raise HTTPException(422, f"The saved credentials can't be used: {ex}. Re-enter them, or restore the key.")
     who = cur["username"] or "API token"
     result = {"ok": True, "at": time.time(), "ms": 120 + (sum(map(ord, cid)) % 180),

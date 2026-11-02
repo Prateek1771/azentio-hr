@@ -120,6 +120,24 @@
 - Throwaway stack: `main` → C (five batches in one start) with a real key; an integration run; rotation; refusals;
   a full rollback to `main` (connection test still passes on decrypted plaintext); re-upgrade.
 
+### Batch C deep test (an independent review plus my own probes; each finding reproduced, fixed and covered)
+- **Plaintext secrets stayed in the graph after cutover.** `LabelSpec.after_cutover` now scrubs them (`ConnectorInstance`
+  `secret` removed) once the batch is clean, and the drift baseline is taken after the scrub. Rollback writes them back.
+- **`KeyConfigError` was a `SystemExit`.** Raised inside a request (a save in production without a key, or a malformed
+  key), it could stop the server. It is now a `RuntimeError`: the routes answer 503 or 422, and `check_at_startup`,
+  which now also validates the key before any secret is stored, turns it into an exit.
+- **Engine, from PR 0:** `label_report` merged `**par` after `ok`, so edge-count and unmapped-key mismatches never
+  blocked a cutover or rollback. The computed `ok` now wins. Every batch's report re-checks clean.
+- **A re-cutover after a rollback kept stale links.** `_backfill_links` now replaces the table from the graph.
+- **Bad graph data** (malformed JSON, a missing id, a dangling reference) stopped startup with a raw traceback, and
+  malformed `values` silently became `{}`. Malformed JSON now refuses and names the node, and bootstrap reports any
+  mapping error as "nothing was switched".
+- **Search across fields** ("Ananya K") broke when search moved to SQL. Every word must now match some field value.
+- **Rollback without the key half-switched the batch.** Rollback now builds every payload before writing anything.
+- `rotate_key` refuses without `SECRETS_KEY`.
+- **Checks and dev:** 6 new checks (`test_phase3` now 124). On dev: `rollback C`, then a restart; the graph holds no
+  secret, and the hints and connection tests are unchanged.
+
 ## As built: batch B (activity, guardrail hits, eval runs)
 - Migration `014_activity.sql`: `events`, `guardrail_events`, `eval_runs`, `eval_results`. Columns are the old graph
   properties. `ts`/`finished` stay epoch seconds (`double precision`) and `ms` stays an integer, so every API keeps its

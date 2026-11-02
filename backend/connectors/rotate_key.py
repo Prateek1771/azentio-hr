@@ -8,6 +8,10 @@ from pathlib import Path
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+    import os
+    import sys
+    if not os.getenv("SECRETS_KEY", "").strip():
+        sys.exit("rotate_key: set SECRETS_KEY to the new key (and SECRETS_KEY_PREVIOUS to the old one)")
     from shared import db
     from connectors import secrets, store
     db.init()

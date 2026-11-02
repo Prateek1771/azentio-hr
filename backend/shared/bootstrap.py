@@ -126,6 +126,9 @@ def migrate_graph_batches() -> dict:
             out[b] = gm.cutover(b)
         except (gm.FreezeError, gm.bridge.ParityError) as e:
             raise SystemExit(f"bootstrap: graph migration batch {b}: {e}. Nothing was switched.") from None
+        except Exception as e:  # graph data the mapping can't take (a missing id, a dangling reference, bad JSON)
+            raise SystemExit(f"bootstrap: graph migration batch {b} stopped on graph data it can't migrate "
+                             f"({type(e).__name__}: {e}). Nothing was switched; fix that node and restart.") from None
         ls.log_event(_log, "graph_migration.cutover", batch=b, labels=len(out[b].get("labels", [])))
     return out
 
