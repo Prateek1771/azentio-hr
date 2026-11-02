@@ -187,17 +187,26 @@ def save_rule(r: dict, ord_: int | None = None):
 
 
 async def seed():
-    """Load sample data on first run (empty graph)."""
+    """Load sample data on first run. "First run" is decided per record type from Postgres, the record: an empty graph
+    alone (lost or wiped) must never re-seed over HR's data. It rebuilds the projection instead."""
     import chat
     from graph import ensure_indexes
+    from policy import store
     ensure_indexes()
-    if not q1("MATCH (c:Config {key:'doc_types'}) RETURN c"):
-        import_requirements("requirements.json", (SEED / "requirements.json").read_bytes())
+    # Decided before anything below writes: a replay would project single employees and hide the loss.
+    graph_lost = bool(records.employee_ids()) and not q1("MATCH (e:Employee) RETURN e LIMIT 1")
+    if not store.active_version() and not q1("MATCH (c:Config {key:'doc_types'}) RETURN c"):
+        import_requirements("requirements.json", (SEED / "requirements.json").read_bytes())  # ponytail: graph rules until A3
+    if not owners.all():
         import_owners("owners.csv", (SEED / "owners.csv").read_bytes())
+    if not templates.all():
         for t in json.loads((SEED / "email_templates.json").read_text(encoding="utf-8")):
             templates.upsert(t)
+    if not records.employee_ids():
         import_employees("employees.csv", (SEED / "employees.csv").read_bytes())
         demo_progress()
+    elif graph_lost:  # rebuild the projection (owners first, then every employee) from Postgres
+        records.rebuild_graph()
     from connectors.seed import seed_connectors
     seed_connectors()
     if not q1("MATCH (c:Config {key:'roles'}) RETURN c"):  # top-up for graphs seeded before roles existed

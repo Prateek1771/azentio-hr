@@ -1041,7 +1041,7 @@ Every route needs a signed-in session, except `/api/auth/login` and `/api/portal
 
 **Run** (see the README for full steps): `docker compose up -d` (Postgres and FalkorDB) → `cd backend && uv run uvicorn main:app --port 8000` → `cd frontend && npm run dev`, then sign in at `/login`.
 
-On start, the backend bootstraps itself (§12.1): migrations, the admin and dev accounts, and the legacy audit import. It then seeds joiners, owners, rules, roles, templates, policies and connectors into the graph. Seeding is additive and skips anything already present.
+On start, the backend bootstraps itself (§12.1): migrations, the admin and dev accounts, and the legacy audit import. It then seeds joiners, owners, rules, roles, templates, policies and connectors. Seeding decides "first run" per record type from Postgres (no employees, no owners, no templates, no policies, no active rule set), never from the graph: a lost or wiped graph never re-seeds over HR's data. Instead, if Postgres has employees but the graph has none, it rebuilds the projection (`records.rebuild_graph`), and if `policies` has rows but there are no chunks, it rebuilds the index (`chat.reindex_policies`).
 
 **Configuration** (`.env`):
 | Area | Variables |

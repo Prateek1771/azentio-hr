@@ -126,3 +126,13 @@ returns `a2-drill-policy.md § Drill section` first. The portal shows the policy
    stays ok.
 
 **Sign-off:** dev ✓. CI on the PR covers `test_phase3` (A2 section and API contract).
+
+### Fresh install and wiped graph (throwaway stack, 2026-11-02)
+Run on a separate database and graph (`azentio_fresh` / `fresh`, port 8001, Gmail off), after A2:
+- **Fresh install:** A1 and A2 cut over on empty stores (0 / 0). The seed then wrote 8 owners, 4 templates and 7 policies to
+  Postgres, projected 8 `Owner` nodes and built 31 `PolicyChunk` nodes, with no `EmailTemplate` or `Policy` nodes. 22 API and
+  state checks passed: role gates, the audited template save, and quick onboard picking the manager from `owners`.
+- **Wiped graph:** edited a template, an owner and a joiner's name, stopped, ran `GRAPH.DELETE fresh`, and restarted.
+  Every edit survived. The projection was rebuilt from Postgres (7 employees, 101 items, 20 documents, matching
+  `HAS_DOC`/`SUBMITTED` and `REPORTS_TO` edges), the index was rebuilt (31 chunks), drift was ok, and the same 22
+  checks passed. Before the seed fix, this reset all three edits to the seed values.

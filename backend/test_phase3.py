@@ -287,6 +287,29 @@ res = gm.cutover("A2", watch=0)
 check("a2_cutover_again_after_rollback", res["labels"][0]["ok"] and res["labels"][0]["pg_count"] == 3
       and bridge.SOURCE[POL] == "postgres")
 
+# ---------- a lost graph never re-seeds over Postgres; the projection and the index are rebuilt from it ----------
+import ingest  # noqa: E402
+
+records.save_employee({"id": "E9001", "name": "Kept Name", "email": "kept@x.com", "role": "Engineer", "grade": "L2",
+                       "department": "Engineering", "location": "Bengaluru", "manager_email": "mgr.eng@x.com",
+                       "joining_date": "2026-12-01", "token": "tok-e9001", "thread_id": ""})
+templates.upsert({**templates.get("intern"), "subject": "HR edit"})
+owners.upsert([{"email": "it@x.com", "name": "HR renamed desk", "department": "IT", "type": "owner:IT"}])
+counts = {t: db.fetch1(f"SELECT count(*) AS n FROM {t}")["n"] for t in ("owners", "email_templates", "policies", "employees")}
+q("MATCH (n) DETACH DELETE n")  # the graph is lost
+asyncio.run(ingest.seed())
+check("wiped_graph_keeps_hr_edits", templates.get("intern")["subject"] == "HR edit"
+      and owners.get("it@x.com")["name"] == "HR renamed desk" and records.employee("E9001")["name"] == "Kept Name")
+check("wiped_graph_seeds_nothing_over_postgres",
+      counts == {t: db.fetch1(f"SELECT count(*) AS n FROM {t}")["n"] for t in counts}, counts)
+check("wiped_graph_rebuilds_the_projection",
+      q(f"MATCH (:Employee {{id:'E9001'}})-[:REPORTS_TO]->(o:{OWN}) RETURN o.email AS e") == [{"e": "mgr.eng@x.com"}]
+      and q(f"MATCH (o:{OWN}) RETURN count(o) AS n")[0]["n"] == counts["owners"],
+      (q("MATCH (e:Employee) RETURN e.id AS i, e.manager_email AS m"), q(f"MATCH (o:{OWN}) RETURN o.email AS e"), counts))
+check("wiped_graph_rebuilds_the_policy_index",
+      q(f"MATCH (c:{CHUNK}) RETURN count(DISTINCT c.source) AS n")[0]["n"] == counts["policies"])
+check("no_drift_after_the_rebuild", all(d["ok"] for d in gm.drift_since_cutover() if d["label"] == OWN))
+
 # ---------- API contract ----------
 out = subprocess.run([sys.executable, str(ROOT / "scripts" / "api_contract.py"), "--check"], capture_output=True, text=True)
 check("api_contract_unchanged", out.returncode == 0, out.stdout[-3000:] + out.stderr[-3000:])

@@ -63,6 +63,14 @@
 - `/api/policies` and the portal's acknowledgement text read the table.
 - `test_phase3` A2 section: cutover, reads, an upload that writes the table and chunks but no `Policy` node, drift on a
   stray write, a wiped index rebuilt with the same retrieval results, then rollback and a second cutover.
+- **Found in depth testing: a wiped graph re-seeded over Postgres.** `ingest.seed` decided "first run" from a graph
+  `Config` node. Once the graph stopped being the record, losing the graph reset HR's edited templates and owners
+  (A1) and the seeded joiners' fields (since Phase 1) to the seed files. Now each record type is seeded only when its
+  Postgres table is empty, rules only when there's no active version. A lost graph is detected *before* anything
+  writes (a rule replay would project single employees and hide the loss), and the projection is rebuilt instead.
+  `test_phase3` "wiped graph" section: HR edits kept, nothing re-seeded, `REPORTS_TO`→`Owner` and the policy index
+  rebuilt, no drift. This was also run end to end on a throwaway instance: fresh install, then edits, a
+  `GRAPH.DELETE`, and a restart. All 7 employees, 101 items, 20 documents and their edges came back from Postgres.
 
 ## The approved plan
 
