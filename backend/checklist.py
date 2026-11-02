@@ -1,9 +1,8 @@
 """Rules engine: which checklist items apply to an employee, why, when they're due, and what's blocked."""
-import json
 from datetime import date, timedelta
 
 import records
-from graph import q1, event
+from graph import event
 
 DONE = {"Accepted", "Completed", "Acknowledged"}
 INITIAL = {"document": "Not Submitted", "task": "Pending", "ack": "Pending"}
@@ -84,20 +83,16 @@ def view_state(item: dict, by_key: dict, today: date | None = None) -> str:
 # ---------- graph-backed ----------
 
 def config(key: str):
-    """Engine config comes from the active rule-set version; anything a version doesn't hold stays in the graph."""
+    """Engine config (doc types, locations, departments, roles, doc policy) comes from the active rule-set version."""
     from policy import store
-    if key in store.CONFIG_KEYS:
-        act = store.ensure_active()
-        if act:
-            return (act["config"] or {}).get(key)
-    row = q1("MATCH (c:Config {key:$k}) RETURN c.value AS v", k=key)
-    return json.loads(row["v"]) if row else None
+    act = store.active_version()
+    return (act["config"] or {}).get(key) if act else None
 
 
 def load_rules() -> list[dict]:
     """The active rule-set version's rules (ADR 0009). Rules only reach joiners by publishing a version."""
     from policy import store
-    act = store.ensure_active()
+    act = store.active_version()
     return store.rules_of(act["id"]) if act else []
 
 

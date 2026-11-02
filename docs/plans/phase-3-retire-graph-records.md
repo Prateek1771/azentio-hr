@@ -1,6 +1,6 @@
 # Phase 3: Retire graph record storage
 
-- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates) and A2 (policies) are done; A3 → E follow, one PR each.
+- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies) and A3 (rules, config) are done; B → E follow, one PR each.
 - **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
 - **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
 - **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
@@ -71,6 +71,25 @@
   `test_phase3` "wiped graph" section: HR edits kept, nothing re-seeded, `REPORTS_TO`→`Owner` and the policy index
   rebuilt, no drift. This was also run end to end on a throwaway instance: fresh install, then edits, a
   `GRAPH.DELETE`, and a restart. All 7 employees, 101 items, 20 documents and their edges came back from Postgres.
+
+## As built: batch A3 (legacy rules and config)
+- `ingest.import_requirements(filename, data, user=None)` is the one way in. With no active version (a fresh install), it
+  creates v1 directly under the existing `pg_advisory_xact_lock(7243010)`, audited `policy.published` (actor `system`
+  without a user). With an active version, it opens a governed draft (`import_requirements_draft`, unchanged), and it
+  refuses without a user. Both share `_parse_requirements`.
+- **Changed from before:** rows without a `compliance` value take `store.COMPLIANCE_DEFAULT` in both paths. Before, an
+  imported draft cleared the flags, so re-importing the same file showed R-ID/R-I9/R-BGV as changed and needed two
+  approvals.
+- `policy.store.ensure_active` (v1 from graph `Rule` + `Config`) is deleted; its callers use `active_version()`.
+  `checklist.config` reads only the active version. `seed` gates on `active_version()`, and the `Config roles` top-up is
+  gone. `graph.ensure_indexes` no longer indexes `Rule`.
+- Graph `Rule`/`Config` are **removed**, but archived first: migration 013 adds `legacy_rules (id, props jsonb)` and
+  `legacy_config (key, value)`. The specs live in `policy/legacy.py`. The cutover copies the nodes there, and
+  `rollback A3` writes them back for the previous release. Nothing reads the tables; PR E drops them.
+- `test_core` creates v1 through the import instead of MERGEing `Config` nodes. `test_phase1`'s v1 check is now
+  `v1_created_by_import`. `test_phase3` A3 section: cutover, v1 from the import (rules, compliance, config,
+  audited as system), no graph writes, a draft with a user, a refusal without one or with a draft open, drift on a stray
+  write, then rollback (a deleted node comes back) and a second cutover.
 
 ## The approved plan
 

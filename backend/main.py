@@ -431,7 +431,7 @@ def save_template(tid: str, t: Template):
 def rules():
     """The active rule-set version. Rules change only through /api/policy (draft -> approve -> publish)."""
     from policy import store
-    act = store.ensure_active()
+    act = store.active_version()
     return {"rules": checklist.load_rules(), "doc_types": checklist.config("doc_types"),
             "departments": checklist.config("departments"), "locations": checklist.config("locations"),
             "roles": checklist.config("roles") or [],

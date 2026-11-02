@@ -8,14 +8,14 @@ Azentio Onboard is an HR onboarding agent. For each new joiner it works out whic
 We're hardening it from a demo into governed HR operations in 7 phases: see [docs/plans/2026-11-01-hardening-design.md](docs/plans/2026-11-01-hardening-design.md).
 
 ## Current phase
-**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract), A1 (owners, email templates) and A2 (policies) are done; A3 → E follow, one PR each. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
+**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract), A1 (owners, email templates), A2 (policies) and A3 (legacy rules/config retired) are done; B → E follow, one PR each. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
 
 | Phase | Status |
 |---|---|
 | 0 Trust + foundation (auth, 5 roles, audit chain, jobs/outbox, bootstrap) | **done** |
 | 1 Policy governance + Employee/Item migration | **done** |
 | 2 AI control + Document migration | **done** |
-| 3 Retire graph record storage | **in progress** (PR 0, A1, A2 done) |
+| 3 Retire graph record storage | **in progress** (PR 0, A1, A2, A3 done) |
 | 4 Ops backbone + **Temporal** | planned |
 | 5 Lifecycle (transfer, offboarding, rechecks, contractor/rehire, leave) | planned |
 | 6 HR ops platform (manager view, SLAs, escalations, appeals, analytics) | planned |
@@ -23,7 +23,7 @@ We're hardening it from a demo into governed HR operations in 7 phases: see [doc
 ## Stack
 - **Backend:** FastAPI on Python 3.12, managed with `uv` (`backend/`).
 - **Postgres 17:** the system of record ([ADR 0005](docs/adr/0005-postgres-system-of-record.md)). Plain SQL through `psycopg`, no ORM.
-- **FalkorDB:** a read model only: the dependency graph, the relationship view, and the policy chunks the assistant retrieves ([ADR 0006](docs/adr/0006-graph-as-read-model.md)). Until Phase 3 finishes, it still holds connector records, events and legacy rules/config.
+- **FalkorDB:** a read model only: the dependency graph, the relationship view, and the policy chunks the assistant retrieves ([ADR 0006](docs/adr/0006-graph-as-read-model.md)). Until Phase 3 finishes, it still holds connector records, events and integrations.
 - **Next.js 16 / React 19 / Tailwind 4 / shadcn on base-ui** (`frontend/`). The browser calls the API through the Next.js rewrite of `/api/*` to `BACKEND_URL`, so the app and the API share one origin and the session cookie works.
 - **Temporal:** arrives in **Phase 4**, for durable workflows on top of Postgres ([ADR 0011](docs/adr/0011-temporal-orchestration.md)). It isn't used yet.
 
@@ -115,7 +115,7 @@ cd backend && uv run python test_phase3.py    # migration engine (freeze, cutove
   - Always enqueue inside the transaction of the change that caused it.
 - **Employees and items only through `records.py`; documents only through `documents/store.py`.** Never write `Employee`/`Item`/`Document` or document edges with Cypher; the graph is a projection refreshed by `records.project`.
 - **AI perceives; policy decides** ([ADR 0012](docs/adr/0012-document-decisions-as-built.md)). Document outcomes come only from `documents.route.decide` and recorded `doc_decisions` rows; item status for a document item is derived (`item_status_for`), never set, and the database enforces it (trigger `items_status_from_document`). Demo/test data uses `documents.seed.accept_for_demo`. `ALWAYS_HIGH` types are never auto-accepted (code + DB trigger).
-- **Rules change only by publishing a version** (`policy/`). Replay never deletes an item: not-started items are cancelled, done items or items with documents are kept as evidence.
+- **Rules change only by publishing a version** (`policy/`). A requirements file enters only through `ingest.import_requirements`: v1 on a fresh install, a governed draft after that. Replay never deletes an item: not-started items are cancelled, done items or items with documents are kept as evidence.
 - **One open draft at a time is a deliberate limit**, not a bug: two drafts of the same rule set would need merging. Revisit only if HR asks for parallel drafts.
 - **Every `work_queue` kind is a contract** in `work_queue.KINDS`: an SLA, an escalation role and resolution steps. Register a kind before opening items of it.
 - **Graph labels move through `graph_migration.py` only** (Phase 3): register a `LabelSpec` in the owning module (listed in `graph_migration.SPEC_MODULES`; `projection=True` if the graph keeps it as a projection), then the cutover runs at startup before any worker, refuses unless parity, schema diff, edges and the read-path scan are clean, and records before/after evidence. Follow `docs/runbooks/phase-3-cutover.md` per batch.

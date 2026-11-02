@@ -287,8 +287,71 @@ res = gm.cutover("A2", watch=0)
 check("a2_cutover_again_after_rollback", res["labels"][0]["ok"] and res["labels"][0]["pg_count"] == 3
       and bridge.SOURCE[POL] == "postgres")
 
-# ---------- a lost graph never re-seeds over Postgres; the projection and the index are rebuilt from it ----------
+# ---------- batch A3: legacy Rule/Config retire; the requirements import writes rule-set versions ----------
+import json  # noqa: E402
+import checklist  # noqa: E402
 import ingest  # noqa: E402
+from identity import service as idsvc  # noqa: E402
+from policy import store as pstore  # noqa: E402
+
+RULE, CONF = "Rule", "Config"
+REQ = (ROOT / "backend" / "seed" / "requirements.json").read_bytes()
+SEEDREQ = json.loads(REQ)
+db.execute("DELETE FROM bridge_state WHERE record_type IN ('Rule', 'Config')")
+db.execute("TRUNCATE legacy_rules, legacy_config")
+q(f"MATCH (n) WHERE n:{RULE} OR n:{CONF} DETACH DELETE n")
+for i, r in enumerate(SEEDREQ["rules"], start=1):  # exactly what the previous release's import wrote
+    q(f"MERGE (r:{RULE} {{id:$id}}) SET r += $p", id=r["id"],
+      p={"id": r["id"], "item": r["item"], "name": r.get("name", ""), "kind": r["kind"], "category": r["category"],
+         "match": json.dumps(r.get("match") or {}), "offset_days": int(r.get("offset_days") or 0),
+         "depends_on": list(r.get("depends_on") or []), "description": r["description"],
+         "policy_ref": r.get("policy_ref", ""), "auto": r.get("auto", ""), "ord": i})
+for k in ("departments", "locations", "doc_types", "roles"):
+    q(f"MERGE (c:{CONF} {{key:$k}}) SET c.value=$v", k=k, v=json.dumps(SEEDREQ[k]))
+
+check("a3_has_no_graph_read_paths_left", gm.read_paths(RULE) == [] and gm.read_paths(CONF) == [],
+      (gm.read_paths(RULE), gm.read_paths(CONF)))
+res = gm.cutover("A3", watch=0)
+reps = {r["label"]: r for r in res["labels"]}
+check("a3_cutover_archives_legacy_nodes", all(r["ok"] and not r["unmapped_keys"] for r in reps.values())
+      and reps[RULE]["pg_count"] == len(SEEDREQ["rules"]) and reps[CONF]["pg_count"] == 4, reps)
+
+check("a3_no_active_version_yet", pstore.active_version() is None and checklist.config("roles") is None)
+out = ingest.import_requirements("requirements.json", REQ)
+v1 = pstore.active_version()
+v1_rules = pstore.rules_of(v1["id"])
+check("a3_import_creates_v1_in_postgres", v1 and v1["number"] == 1 and len(v1_rules) == len(SEEDREQ["rules"])
+      and out["imported"] == len(SEEDREQ["rules"]) and not out["errors"], out)
+check("a3_v1_compliance_flags", {r["id"] for r in v1_rules if r["compliance"]} == pstore.COMPLIANCE_DEFAULT)
+check("a3_config_comes_from_the_version", checklist.config("roles") == SEEDREQ["roles"]
+      and checklist.config("departments") == SEEDREQ["departments"] and checklist.config("doc_policy") == {})
+check("a3_v1_audited_as_system", db.fetch1("SELECT actor FROM audit_log WHERE action='policy.published' AND entity_id='v1' "
+                                           "ORDER BY seq DESC LIMIT 1")["actor"] == "system")
+check("a3_import_writes_no_graph_rules", q(f"MATCH (r:{RULE}) RETURN count(r) AS n")[0]["n"] == len(SEEDREQ["rules"])
+      and all(d["ok"] for d in gm.drift_since_cutover() if d["label"] in (RULE, CONF)))
+e = raises(lambda: ingest.import_requirements("requirements.json", REQ), ValueError)
+check("a3_import_without_user_refused_once_active", e and "import page" in e, e)
+hr3 = idsvc.create_user("hr3@t.io", "HR Three", "hr_ops", "hr3-pass-12345", actor="test")
+d = ingest.import_requirements("requirements.json", REQ, hr3)
+check("a3_import_with_active_version_opens_a_draft", d.get("draft_version") == 2
+      and pstore.active_version()["number"] == 1 and pstore.open_version()["number"] == 2, d)
+check("a3_reimport_keeps_compliance_flags", {r["id"] for r in pstore.rules_of(d["draft_id"]) if r["compliance"]}
+      == pstore.COMPLIANCE_DEFAULT)
+e = raises(lambda: ingest.import_requirements("requirements.json", REQ, hr3), ValueError)
+check("a3_second_draft_refused", e and "already open" in e, e)
+pstore.discard_draft(d["draft_id"], hr3)
+
+q(f"MATCH (r:{RULE} {{id:'R-ID'}}) SET r.description = 'stray'")
+check("a3_drift_catches_a_stray_rule_write", not [x for x in gm.drift_since_cutover() if x["label"] == RULE][0]["ok"])
+q(f"MATCH (r:{RULE} {{id:'R-ID'}}) DETACH DELETE r")  # the stray write and the node are gone: rollback must restore
+rb = gm.rollback("A3", watch=0)
+check("a3_rollback_restores_legacy_nodes", all(r["ok"] for r in rb["labels"]) and bridge.SOURCE[RULE] == "graph"
+      and q(f"MATCH (r:{RULE} {{id:'R-ID'}}) RETURN r.match AS m")[0]["m"] == json.dumps(
+          next(r for r in SEEDREQ["rules"] if r["id"] == "R-ID").get("match") or {}), rb)
+res = gm.cutover("A3", watch=0)
+check("a3_cutover_again_after_rollback", all(r["ok"] for r in res["labels"]) and bridge.SOURCE[CONF] == "postgres")
+
+# ---------- a lost graph never re-seeds over Postgres; the projection and the index are rebuilt from it ----------
 
 records.save_employee({"id": "E9001", "name": "Kept Name", "email": "kept@x.com", "role": "Engineer", "grade": "L2",
                        "department": "Engineering", "location": "Bengaluru", "manager_email": "mgr.eng@x.com",

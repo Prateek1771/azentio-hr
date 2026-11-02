@@ -44,7 +44,7 @@ def event(employee_id: str | None, kind: str, message: str):
 
 def ensure_indexes():
     for label, prop in [("Employee", "id"), ("Employee", "token"), ("Item", "id"), ("Document", "id"),
-                        ("Rule", "id"), ("Owner", "email"), ("Event", "employee_id")]:
+                        ("Owner", "email"), ("Event", "employee_id")]:
         try:
             G.query(f"CREATE INDEX FOR (n:{label}) ON (n.{prop})")
         except Exception:
