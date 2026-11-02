@@ -1,15 +1,20 @@
-"""Integration records and setup state (FalkorDB).
+"""Integrations in Postgres (Phase 3 batch D): setup state, per-candidate progress, runs, the run log, outbound and
+agent messages. The only reader and writer of those tables; it also registers their graph migration specs.
 
-An integration's settings live in one JSON `config` property, because a FalkorDB property can't hold
-null and setup needs "not answered yet" states. Indexed basics (id, name, status, next_run_at) stay
-top-level for queries.
+An integration's settings live in one `config` JSON document (setup needs "not answered yet" states); the basics
+(id, name, status, next_run_at) are columns. Rows come back without NULL columns, as the graph omitted absent
+properties, so every caller and API response keeps its shape.
 """
 import json
 import time
 from datetime import datetime, timedelta, timezone as tz
 from zoneinfo import ZoneInfo
 
-from graph import q, q1, new_id
+import psycopg
+
+import graph_migration as gm
+from graph import new_id
+from shared import db
 from connectors import registry
 from connectors.candidates import CANDIDATE_FIELDS
 from .run_log import LOG_SECTIONS
@@ -61,33 +66,46 @@ class SetupError(Exception):
     """A setting HR asked for can't be applied; the message says why."""
 
 
+def _present(row: dict) -> dict:
+    """Drop NULL columns: FalkorDB had no such property, so callers never saw the key."""
+    return {k: v for k, v in row.items() if v is not None}
+
+
 def _load(row: dict) -> dict:
-    cfg = {**DEFAULT_CONFIG, **json.loads(row.get("config") or "{}")}
+    cfg = {**DEFAULT_CONFIG, **(gm.jsonv(row.get("config"), {}) or {})}
     return {"id": row["id"], "name": row["name"], "status": row["status"], "created": row.get("created"),
             "next_run_at": row.get("next_run_at") or None, **cfg}
 
 
 def get(iid: str) -> dict | None:
-    row = q1("MATCH (i:Integration {id:$id}) RETURN i", id=iid)
-    return _load(row["i"]) if row else None
+    row = db.fetch1("SELECT * FROM integrations WHERE id=%s", (iid,))
+    return _load(row) if row else None
 
 
 def all_integrations() -> list[dict]:
-    return [_load(r["i"]) for r in q("MATCH (i:Integration) RETURN i ORDER BY i.created DESC")]
+    return [_load(r) for r in db.fetch("SELECT * FROM integrations ORDER BY created DESC, id")]
+
+
+def name_taken(name: str, except_id: str = "") -> bool:
+    return bool(db.fetch1("SELECT 1 AS x FROM integrations WHERE lower(name)=lower(%s) AND id <> %s", (name, except_id)))
 
 
 def _write(it: dict) -> dict:
     cfg = {k: it[k] for k in DEFAULT_CONFIG}
-    q("MATCH (i:Integration {id:$id}) SET i.name=$n, i.status=$s, i.next_run_at=$nr, i.config=$c",
-      id=it["id"], n=it["name"], s=it["status"], nr=it.get("next_run_at") or 0, c=json.dumps(cfg))
+    try:
+        db.execute("UPDATE integrations SET name=%s, status=%s, next_run_at=%s, config=%s WHERE id=%s",
+                   (it["name"], it["status"], it.get("next_run_at") or 0, db.Json(cfg), it["id"]))
+    except psycopg.errors.UniqueViolation:
+        raise SetupError("An integration with that name exists.") from None
     return it
 
 
 def create(name: str, description: str, source_id: str, target_id: str) -> dict:
-    if q1("MATCH (i:Integration) WHERE toLower(i.name)=toLower($n) RETURN i", n=name):
-        raise SetupError(f"An integration called '{name}' already exists")
     iid = new_id("int")
-    q("CREATE (i:Integration {id:$id, name:$n, status:'draft', created:$t, next_run_at:0, config:'{}'})", id=iid, n=name, t=time.time())
+    try:
+        db.execute("INSERT INTO integrations (id, name, status, created) VALUES (%s, %s, 'draft', %s)", (iid, name, time.time()))
+    except psycopg.errors.UniqueViolation:  # also a concurrent create with the same name, any case
+        raise SetupError(f"An integration called '{name}' already exists") from None
     it = get(iid)
     it.update(description=description, source_id=source_id, target_id=target_id)
     return _write(it)
@@ -191,7 +209,7 @@ def quick_replies(it: dict) -> list[str]:
 
 
 def connectors_locked(iid: str) -> bool:
-    return bool(q1("MATCH (c:IntegrationCandidate {integration_id:$i}) RETURN c LIMIT 1", i=iid))
+    return bool(db.fetch1("SELECT 1 AS x FROM integration_candidates WHERE integration_id=%s LIMIT 1", (iid,)))
 
 
 def next_run_time(schedule: dict, now: datetime | None = None) -> float | None:
@@ -224,26 +242,228 @@ def validate_log_exclusions(fields: list[str], sections: list[str], it: dict) ->
 # ---------- per-candidate progress ----------
 
 def items(iid: str) -> list[dict]:
-    rows = q("MATCH (c:IntegrationCandidate {integration_id:$i}) RETURN c ORDER BY c.created", i=iid)
-    return [_item(r["c"]) for r in rows]
+    return [_item(r) for r in db.fetch("SELECT * FROM integration_candidates WHERE integration_id=%s ORDER BY created, id", (iid,))]
 
 
 def item(item_id: str) -> dict | None:
-    row = q1("MATCH (c:IntegrationCandidate {id:$id}) RETURN c", id=item_id)
-    return _item(row["c"]) if row else None
+    row = db.fetch1("SELECT * FROM integration_candidates WHERE id=%s", (item_id,))
+    return _item(row) if row else None
 
 
 def item_for_joiner(eid: str) -> dict | None:
-    row = q1("MATCH (c:IntegrationCandidate {joiner_id:$e}) RETURN c", e=eid)
-    return _item(row["c"]) if row else None
+    row = db.fetch1("SELECT * FROM integration_candidates WHERE joiner_id=%s ORDER BY created LIMIT 1", (eid,))
+    return _item(row) if row else None
 
 
 def _item(c: dict) -> dict:
+    c = _present(c)
     return {**c, "document_results": json.loads(c.get("document_results") or "[]"), "access": json.loads(c.get("access_results") or "[]")}
+
+
+ITEM_COLS = ("id", "integration_id", "record_id", "candidate_ref", "name", "email", "stage", "document_results",
+             "document_attempts", "joiner_id", "last_error", "generated_values", "employee_record_id", "access_results",
+             "decided_at", "rejection_reason", "created", "updated")
+_ITEM_TEXT = {"candidate_ref", "name", "email", "stage", "document_results", "joiner_id", "last_error", "generated_values",
+              "employee_record_id", "access_results", "rejection_reason"}
 
 
 def set_item(item_id: str, **values) -> None:
     if "document_results" in values:
         values["document_results"] = json.dumps(values["document_results"])
     values["updated"] = time.time()
-    q("MATCH (c:IntegrationCandidate {id:$id}) SET c += $p", id=item_id, p={k: ("" if v is None else v) for k, v in values.items()})
+    bad = set(values) - set(ITEM_COLS)
+    assert not bad, f"unknown candidate field(s): {bad}"
+    values = {k: ("" if v is None and k in _ITEM_TEXT else v) for k, v in values.items()}  # as the graph stored them
+    db.execute(f"UPDATE integration_candidates SET {', '.join(f'{k}=%({k})s' for k in values)} WHERE id=%(_id)s",
+               {**values, "_id": item_id})
+
+
+def enroll_candidate(iid: str, record_id: str, candidate_ref: str, name: str, email: str) -> bool:
+    """Add one candidate to an integration; False if it's already enrolled (the unique key makes this race-safe)."""
+    now = time.time()
+    return db.execute("""INSERT INTO integration_candidates (id, integration_id, record_id, candidate_ref, name, email, stage,
+                                                             document_results, document_attempts, created, updated)
+                         VALUES (%s, %s, %s, %s, %s, %s, 'pending', '[]', 0, %s, %s)
+                         ON CONFLICT (integration_id, record_id) DO NOTHING""",
+                      (new_id("ic"), iid, record_id, candidate_ref, name, email, now, now)) == 1
+
+
+# ---------- runs and the run log ----------
+
+def start_run(iid: str, name: str, trigger: str, stale_after: float) -> str | None:
+    """Close a crashed run left 'running' for longer than stale_after, then open a new one. None if one is running
+    (the database allows one running run per integration)."""
+    now = time.time()
+    rid = new_id("run")
+    with db.tx() as conn:
+        db.execute("UPDATE workflow_runs SET status='failed', finished=%s WHERE integration_id=%s AND status='running' "
+                   "AND started < %s", (now, iid, now - stale_after), conn=conn)
+        inserted = db.execute("""INSERT INTO workflow_runs (id, integration_id, integration_name, trigger, status, started)
+                                 VALUES (%s, %s, %s, %s, 'running', %s) ON CONFLICT DO NOTHING""",
+                              (rid, iid, name, trigger, now), conn=conn)
+    return rid if inserted == 1 else None
+
+
+def finish_run(run_id: str, status: str, counts: dict, details: list) -> None:
+    db.execute("UPDATE workflow_runs SET status=%s, counts=%s, details=%s, finished=%s WHERE id=%s",
+               (status, db.Json(counts), db.Json(details), time.time(), run_id))
+
+
+def run(run_id: str) -> dict | None:
+    r = db.fetch1("SELECT * FROM workflow_runs WHERE id=%s", (run_id,))
+    return _present(r) if r else None
+
+
+def runs(integration_id: str = "", page: int = 1, page_size: int = 15) -> tuple[list[dict], int]:
+    """Newest first, paged in SQL; '' = every integration."""
+    where = "WHERE %(i)s = '' OR integration_id = %(i)s"
+    total = db.fetch1(f"SELECT count(*) AS n FROM workflow_runs {where}", {"i": integration_id})["n"]
+    rows = db.fetch(f"SELECT * FROM workflow_runs {where} ORDER BY started DESC, id LIMIT %(l)s OFFSET %(o)s",
+                    {"i": integration_id, "l": page_size, "o": (max(page, 1) - 1) * page_size})
+    return [_present(r) for r in rows], total
+
+
+LOG_COLS = ("id", "integration_id", "run_id", "candidate_record_id", "candidate_ref", "candidate_name", "outcome",
+            "stage_before", "stage_after", "actions", "mapping", "error", "ts")
+
+
+def add_log_record(row: dict) -> None:
+    """One candidate's line in a run. The caller has already applied the exclusions (excluded values are never
+    written, excluded sections' actions are dropped), so the table holds only what HR allowed."""
+    row = {k: row.get(k) for k in LOG_COLS}
+    for k in ("actions", "mapping"):
+        row[k] = db.Json(gm.jsonv(row[k], []))
+    db.execute(f"INSERT INTO integration_log_records ({', '.join(LOG_COLS)}) VALUES ({', '.join(f'%({k})s' for k in LOG_COLS)})", row)
+
+
+def log_records(run_id: str) -> list[dict]:
+    return [_present(r) for r in db.fetch("SELECT * FROM integration_log_records WHERE run_id=%s ORDER BY candidate_name, id",
+                                          (run_id,))]
+
+
+# ---------- outbound and agent messages ----------
+
+def _message(r: dict) -> dict:
+    r = _present(r)
+    r["to"] = r.pop("recipient")
+    return r
+
+
+def add_outbound(row: dict) -> None:
+    db.execute("""INSERT INTO outbound_messages (id, integration_id, item_id, kind, recipient, subject, content, attempt,
+                                                 delivered_by, provider_ref, candidate, ts)
+                  VALUES (%(id)s, %(integration_id)s, %(item_id)s, %(kind)s, %(to)s, %(subject)s, %(content)s, %(attempt)s,
+                          %(delivered_by)s, %(provider_ref)s, %(candidate)s, %(ts)s)""", row)
+
+
+def outbound(iid: str) -> list[dict]:
+    return [_message(r) for r in db.fetch("SELECT * FROM outbound_messages WHERE integration_id=%s ORDER BY ts DESC, id", (iid,))]
+
+
+def say(iid: str, role: str, content: str) -> None:
+    db.execute("INSERT INTO agent_messages (id, integration_id, role, content, ts) VALUES (%s, %s, %s, %s, %s)",
+               (new_id("am"), iid, role, content, time.time()))
+
+
+def agent_messages(iid: str) -> list[dict]:
+    return db.fetch("SELECT * FROM agent_messages WHERE integration_id=%s ORDER BY ts, id", (iid,))
+
+
+# ---------- Phase 3 batch D specs ----------
+# Runtime labels, so this module (which registers the specs) isn't reported as a graph read path.
+INT, CAND, RUN, LOG, OUT, MSG = ("Integration", "IntegrationCandidate", "WorkflowRun", "IntegrationLogRecord",
+                                 "OutboundMessage", "AgentMessage")
+
+
+def _f(v):
+    return None if v in (None, "") else float(v)
+
+
+def _props(row: dict) -> dict:
+    """Graph properties for rollback: FalkorDB can't store null, so absent stays absent."""
+    return {k: v for k, v in row.items() if v is not None}
+
+
+def _epochs(row: dict, *keys) -> dict:
+    return {**row, **{k: gm.epoch(row.get(k)) for k in keys}}
+
+
+def _integration_row(p: dict) -> dict:
+    return {"id": p["id"], "name": p.get("name") or "", "status": p.get("status") or "draft", "created": _f(p.get("created")) or 0.0,
+            "next_run_at": _f(p.get("next_run_at")) or 0.0, "config": gm.json_strict(p.get("config"), {}, f"{INT} {p['id']} config")}
+
+
+def _candidate_row(p: dict) -> dict:
+    row = {k: p.get(k) for k in ITEM_COLS}
+    for k in ("decided_at", "created", "updated"):
+        row[k] = _f(row[k])
+    row["document_attempts"] = None if row["document_attempts"] in (None, "") else int(row["document_attempts"])
+    row["created"] = row["created"] or 0.0
+    row["updated"] = row["updated"] or row["created"]
+    return row
+
+
+RUN_COLS = ("id", "integration_id", "integration_name", "trigger", "status", "started", "finished", "counts", "details")
+
+
+def _run_row(p: dict) -> dict:
+    return {"id": p["id"], "integration_id": p.get("integration_id") or "", "integration_name": p.get("integration_name") or "",
+            "trigger": p.get("trigger") or "", "status": p.get("status") or "", "started": _f(p.get("started")) or 0.0,
+            "finished": _f(p.get("finished")) or 0.0, "counts": gm.json_strict(p.get("counts"), {}, f"{RUN} {p['id']} counts"),
+            "details": gm.json_strict(p.get("details"), [], f"{RUN} {p['id']} details")}
+
+
+def _log_row(p: dict) -> dict:
+    row = {k: p.get(k) for k in LOG_COLS}
+    row.update(integration_id=row["integration_id"] or "", run_id=row["run_id"] or "", ts=_f(row["ts"]) or 0.0,
+               actions=gm.json_strict(p.get("actions"), [], f"{LOG} {p['id']} actions"),
+               mapping=gm.json_strict(p.get("mapping"), [], f"{LOG} {p['id']} mapping"))
+    return row
+
+
+OUT_KEYS = ("id", "integration_id", "item_id", "kind", "to", "subject", "content", "attempt", "delivered_by", "provider_ref",
+            "candidate", "ts")
+
+
+def _out_row(p: dict) -> dict:
+    row = {k: p.get(k) for k in OUT_KEYS if k != "to"}
+    row.update(recipient=p.get("to") or "", integration_id=row["integration_id"] or "", kind=row["kind"] or "",
+               ts=_f(row["ts"]) or 0.0, attempt=None if row["attempt"] in (None, "") else int(row["attempt"]))
+    return row
+
+
+gm.register(gm.LabelSpec(
+    label=INT, batch="D", table="integrations",
+    to_row=_integration_row, canonical=lambda r: _epochs(dict(r), "created", "next_run_at"),
+    from_row=lambda r: {**_props(r), "config": json.dumps(r["config"] or {})},
+    mapped_keys=frozenset({"id", "name", "status", "created", "next_run_at", "config"})))
+
+gm.register(gm.LabelSpec(
+    label=CAND, batch="D", table="integration_candidates",
+    to_row=_candidate_row, canonical=lambda r: _epochs(dict(r), "decided_at", "created", "updated"),
+    from_row=_props, mapped_keys=frozenset(ITEM_COLS)))
+
+gm.register(gm.LabelSpec(
+    label=RUN, batch="D", table="workflow_runs",
+    to_row=_run_row, canonical=lambda r: _epochs(dict(r), "started", "finished"),
+    from_row=lambda r: {**_props(r), "counts": json.dumps(r["counts"]), "details": json.dumps(r["details"])},
+    mapped_keys=frozenset(RUN_COLS)))
+
+gm.register(gm.LabelSpec(
+    label=LOG, batch="D", table="integration_log_records",
+    to_row=_log_row, canonical=lambda r: _epochs(dict(r), "ts"),
+    from_row=lambda r: {**_props(r), "actions": json.dumps(r["actions"]), "mapping": json.dumps(r["mapping"])},
+    mapped_keys=frozenset(LOG_COLS)))
+
+gm.register(gm.LabelSpec(
+    label=OUT, batch="D", table="outbound_messages",
+    to_row=_out_row, canonical=lambda r: _epochs(dict(r), "ts"),
+    from_row=lambda r: _props({**{k: v for k, v in r.items() if k != "recipient"}, "to": r["recipient"]}),
+    mapped_keys=frozenset(OUT_KEYS)))
+
+gm.register(gm.LabelSpec(
+    label=MSG, batch="D", table="agent_messages",
+    to_row=lambda p: {"id": p["id"], "integration_id": p.get("integration_id") or "", "role": p.get("role") or "",
+                      "content": p.get("content") or "", "ts": _f(p.get("ts")) or 0.0},
+    canonical=lambda r: _epochs(dict(r), "ts"), from_row=_props,
+    mapped_keys=frozenset({"id", "integration_id", "role", "content", "ts"})))

@@ -29,9 +29,24 @@ async def embed(texts: list[str]) -> list[list[float]]:
 
 
 async def index_policy(source: str, text: str):
+    """Store an uploaded policy (Postgres is the record), then rebuild its retrieval chunks."""
+    import policies
+    policies.upsert(source, text)
+    await index_chunks(source, text)
+
+
+async def reindex_policies() -> int:
+    """Rebuild the whole PolicyChunk index from the policies table (the graph is a recoverable index)."""
+    import policies
+    rows = policies.all()
+    q("MATCH (c:PolicyChunk) DELETE c")
+    for p in rows:
+        await index_chunks(p["source"], p["text"])
+    return len(rows)
+
+
+async def index_chunks(source: str, text: str):
     q("MATCH (c:PolicyChunk {source:$s}) DELETE c", s=source)
-    q("MERGE (p:Policy {source:$s}) SET p.text=$t, p.title=$title", s=source, t=text,
-      title=next((l[2:].strip() for l in text.splitlines() if l.startswith("# ")), source))
     chunks = chunk_markdown(source, text)
     try:
         vecs = await embed([c["text"] for c in chunks])
@@ -194,12 +209,13 @@ def hr_context(question: str, chunks: list[dict], focus_id: str | None) -> str:
                 ex = {k: v for k, v in (d.get("extracted") or {}).items() if v and not k.startswith("_")}
                 lines.append(f"  - {d['filename']} via {d['source']}: {d['status']}; extracted {ex}; issues {d.get('issues')}")
     lines.append("\nOWNERS:")
-    for o in q("MATCH (o:Owner) RETURN o.name AS n, o.email AS e, o.type AS t, o.department AS d ORDER BY o.type"):
-        lines.append(f"- {o['n']} ({o['t']}, {o['d']}): {o['e']}")
+    import owners
+    for o in owners.all():
+        lines.append(f"- {o['name']} ({o['type']}, {o['department']}): {o['email']}")
     lines.append("\nRECENT ACTIVITY [activity]:")
-    for ev in q("""MATCH (v:Event) WHERE v.kind <> 'ai' OPTIONAL MATCH (e:Employee {id:v.employee_id})
-                   RETURN v.message AS m, e.name AS n ORDER BY v.ts DESC LIMIT 15"""):
-        lines.append(f"- {ev['n'] + ': ' if ev['n'] else ''}{ev['m']}")
+    import events
+    for ev in events.recent(15, exclude_kind="ai"):
+        lines.append(f"- {ev['employee_name'] + ': ' if ev['employee_name'] else ''}{ev['message']}")
     lines.append("\nPOLICIES:")
     for c in chunks:
         lines.append(f"[{c['source']} § {c['section']}]\n{c['text']}\n")

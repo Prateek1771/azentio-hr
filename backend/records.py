@@ -4,8 +4,8 @@ Every read and write of an Employee or Item goes through here. Rows come back as
 return (ISO date strings, graph-only properties merged back from `extra`), so callers didn't have to change shape.
 
 After every write, `project(eid)` refreshes that employee's nodes in the graph *in place* (MERGE by id). Nodes are
-never deleted or recreated: connector records hang off them (SYNCED_TO, FROM_CANDIDATE), and documents are projected
-here too (documents.store.project).
+never deleted or recreated, so the edges documents hang off survive (documents.store.project projects them here too).
+Connector record links live in Postgres since Phase 3 batch C (`connectors/store.py`).
 """
 from datetime import date, datetime
 
@@ -229,8 +229,20 @@ def project(eid: str) -> None:
         docs.project(eid)
 
 
+def project_owners() -> None:
+    """Refresh the graph `Owner` projection from Postgres (owners.py is the record). A handful of rows: all at once."""
+    from graph import q
+    rows = db.fetch("SELECT * FROM owners")
+    if not rows:  # an empty table is a release before the A1 cutover (or a fresh install): never wipe the graph's owners
+        return
+    q("MATCH (o:Owner) WHERE NOT o.email IN $keep DETACH DELETE o", keep=[r["email"] for r in rows])
+    q("UNWIND $rows AS r MERGE (o:Owner {email:r.email}) SET o = r", rows=[_props(r) for r in rows])
+
+
 def rebuild_graph(eid: str | None = None) -> int:
     """Repair the projection from Postgres: one employee, or everyone."""
+    if not eid:
+        project_owners()  # before employees, so REPORTS_TO / OWNED_BY find their owners
     ids = [eid] if eid else employee_ids()
     for i in ids:
         project(i)

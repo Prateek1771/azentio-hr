@@ -263,7 +263,7 @@ def selftest() -> None:
         "MATCH (e:Employee {id:$e}), (d:Document {id:$id}) CREATE (e)-[:SUBMITTED]->(d)",
         "MATCH (e:Employee {id:$e})-[s:SYNCED_TO]->() DELETE s",
         "MATCH (i:Item {id:$id})-[:HAS_DOC]->(d:Document) WITH d ORDER BY d.ts DESC LIMIT 1 SET d.status=$s",
-        "MATCH (e:Employee {id:$e}), (r:Record {id:$r}) MERGE (e)-[:FROM_CANDIDATE]->(r)",
+        "MATCH (e:Employee {id:$e}), (c:Contact {id:$r}) MERGE (e)-[:KNOWS]->(c)",
     ]
     for c in bad_cypher:
         assert cypher_violations(c), f"rule 1 missed: {c}"

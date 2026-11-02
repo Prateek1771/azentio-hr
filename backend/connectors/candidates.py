@@ -1,9 +1,9 @@
 """Candidate sources: the built-in demo Candidate Portal and file-based Candidate Import."""
-import json
 import time
 
 import ingest
-from graph import q, new_id, event
+from graph import new_id, event
+from . import store
 from .base import Connector, FieldSpec
 
 CANDIDATE_FIELDS = [
@@ -72,7 +72,7 @@ class CandidateImport(CandidatePortal):
             self.upsert_candidate(instance_id, values)
             imported += 1
         run = {"id": new_id("imp"), "instance_id": instance_id, "filename": filename, "total": len(rows),
-               "imported": imported, "errors": json.dumps(errors), "ts": time.time()}
-        q("CREATE (r:ImportRun) SET r = $p", p=run)
+               "imported": imported, "errors": errors, "ts": time.time()}
+        store.add_import_run(run)
         event(None, "connector", f"Candidate Import: {imported}/{len(rows)} candidates imported from {filename}")
-        return {**run, "errors": errors}
+        return run

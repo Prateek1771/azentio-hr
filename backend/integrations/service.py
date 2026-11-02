@@ -8,7 +8,7 @@ import audit
 import checklist
 import logging_setup as ls
 from connectors import registry
-from graph import q, q1, new_id
+from graph import new_id
 from . import delivery, store
 from .agent import get_agent
 from .engine import unknown_placeholders
@@ -25,12 +25,11 @@ _DOMAIN = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$")
 
 def say(iid: str, role: str, content: str) -> None:
     if content:
-        q("CREATE (m:AgentMessage {id:$id, integration_id:$i, role:$r, content:$c, ts:$t})",
-          id=new_id("am"), i=iid, r=role, c=content, t=time.time())
+        store.say(iid, role, content)
 
 
 def messages(iid: str) -> list[dict]:
-    return [r["m"] for r in q("MATCH (m:AgentMessage {integration_id:$i}) RETURN m ORDER BY m.ts", i=iid)]
+    return store.agent_messages(iid)
 
 
 def _answered(iid: str, before_step: str, answer: str, speak: bool) -> None:
@@ -58,12 +57,13 @@ def _audit(action: str, it: dict, summary: str, actor: str = "HR", **meta):
 
 def owners() -> dict[str, str]:
     """Workspace members who can be notified: owner name -> email."""
-    return {r["n"]: r["e"] for r in q("MATCH (o:Owner) RETURN o.name AS n, o.email AS e ORDER BY o.name")}
+    import owners
+    return {o["name"]: o["email"] for o in sorted(owners.all(), key=lambda o: o["name"])}
 
 
 def connectors_by_name() -> dict[str, dict]:
-    rows = q("MATCH (i:ConnectorInstance)-[:OF]->(c:Connector) RETURN i.id AS id, i.name AS name, c.role AS role")
-    return {r["name"].lower(): r for r in rows}
+    from connectors import store as connectors
+    return {r["name"].lower(): {"id": r["id"], "name": r["name"], "role": r["role"]} for r in connectors.instances()}
 
 
 def departments() -> list[str]:
@@ -99,8 +99,7 @@ def save_basics(iid: str, name: str | None = None, description: str | None = Non
     it = store.get(iid)
     changes: dict = {}
     if name:
-        clash = q1("MATCH (i:Integration) WHERE toLower(i.name)=toLower($n) AND i.id <> $id RETURN i", n=name.strip(), id=iid)
-        if clash:
+        if store.name_taken(name.strip(), iid):
             raise SetupError("An integration with that name exists.")
         changes["name"] = name.strip()[:120]
     if description is not None:
@@ -400,8 +399,9 @@ def documents_for(it: dict, role: str) -> list[str] | None:
 def apps() -> list[dict]:
     """App connectors (Slack, Jira, …) and the actions each can take."""
     from connectors.apps import ACTIONS
-    rows = q("""MATCH (i:ConnectorInstance)-[:OF]->(c:Connector {role:'app'}) RETURN i.id AS id, i.name AS name, c.key AS key
-                ORDER BY i.name""")
+    from connectors import store as connectors
+    rows = sorted(({"id": r["id"], "name": r["name"], "key": r["key"]} for r in connectors.instances("app")),
+                  key=lambda r: r["name"])
     return [{**r, "actions": [{"key": k, "label": lbl, "needs_resource": need} for k, (lbl, need) in ACTIONS[r["key"]].items()]}
             for r in rows]
 

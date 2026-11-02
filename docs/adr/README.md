@@ -16,3 +16,4 @@ One decision per file, numbered in order. Copy [0000-template.md](0000-template.
 | [0010](0010-risk-tiered-ai-autonomy.md) | Let AI auto-accept only low-risk documents under versioned thresholds | Accepted |
 | [0011](0011-temporal-orchestration.md) | Orchestrate durable workflows with Temporal from Phase 4, on top of Postgres | Accepted |
 | [0012](0012-document-decisions-as-built.md) | Keep document thresholds in rule-set versions, behind a legal floor, with append-only decisions | Accepted |
+| [0013](0013-connector-secrets-at-rest.md) | Encrypt connector secrets at rest with an env key, fail fast without it | Accepted |
