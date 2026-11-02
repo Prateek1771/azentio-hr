@@ -1,6 +1,6 @@
 # Phase 3: Retire graph record storage
 
-- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config), B (activity) and C (connectors) are done; D and E follow, one PR each.
+- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config), B (activity) and C (connectors) are done; D (integrations) is in progress; E follows.
 - **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
 - **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
 - **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
@@ -96,6 +96,86 @@
   `Owner` projection. A projection label's cutover rebuilds the projection once. An emptied retired label isn't drift.
   `normalise_rule` parses a text `compliance` cell. `graph_migration.load()` is never silently partial. Details and the
   upgrade/rollback-to-`main`/two-instance results are in the runbook's "Deep test" section.
+
+## Plan: batch D (integrations), written before coding
+Status: **in progress** on branch `phase-3-d`, stacked on `phase-3-c`. The migration file is `016_integrations.sql`,
+because B and C took 014 and 015.
+
+**Dev graph at planning time** (2026-11-02):
+
+| Label | Rows |
+|---|---|
+| `Integration` | 3 |
+| `AgentMessage` | 34 |
+| `IntegrationCandidate`, `WorkflowRun`, `IntegrationLogRecord`, `OutboundMessage` | 0 each |
+
+There are no edges. `AuditLog` (34) stays for E.
+
+**Graph users to move:**
+- `integrations/store.py`: integrations and candidates
+- `integrations/engine.py`: enrolment, run start and finish, log records
+- `integrations/delivery.py`: outbound messages
+- `integrations/service.py`: agent messages, the name clash
+- `integration_routes.py`: the run log
+- `test_core.py` setup
+
+**Tables.** Columns are the old graph properties; times stay epoch doubles (the B and C pattern).
+
+| Table | Notes |
+|---|---|
+| `integrations` | `id, name, status, created, next_run_at, config jsonb`; UNIQUE on `lower(name)` (case-insensitive duplicates refused by the DB) |
+| `integration_candidates` | `id, integration_id, record_id, candidate_ref, name, email, stage, document_results, document_attempts, joiner_id, last_error, generated_values, employee_record_id, access_results, decided_at, rejection_reason, created, updated`; UNIQUE `(integration_id, record_id)`, so enrolment is idempotent under concurrency; index on `joiner_id` |
+| `workflow_runs` | `id, integration_id, integration_name, trigger, status, started, finished, counts jsonb, details jsonb`; a partial unique index on `(integration_id) WHERE status = 'running'`, so the DB allows one running run per integration |
+| `integration_log_records` | `id, integration_id, run_id, candidate_record_id, candidate_ref, candidate_name, outcome, stage_before, stage_after, actions jsonb, mapping jsonb, error, ts`; **masked before the insert** with the integration's current exclusions |
+| `outbound_messages` | the graph's `to` becomes `recipient`, because `to` is an SQL keyword. The API keeps `to` |
+| `agent_messages` | `id, integration_id, role, content, ts` |
+
+`document_results`, `generated_values` and `access_results` stay text holding JSON, exactly as the graph stored them, so
+every caller keeps its shapes.
+
+**The store.** `integrations/store.py` becomes the only reader and writer of all six tables and registers their specs.
+- **Reads:** rows drop `NULL`s on read, as FalkorDB omitted absent properties, so key sets and the API contract don't
+  change.
+- **Writes:**
+  - `set_item` checks a column whitelist and keeps `None` → `""` for text.
+  - `enroll_candidate` is `INSERT … ON CONFLICT DO NOTHING`.
+  - `start_run` turns the unique violation into `AlreadyRunning`.
+  - `create` and renames turn the `lower(name)` violation into `SetupError`.
+- **Specs:** `from_row` never emits `None`, because FalkorDB can't store null.
+- **Callers:** they keep their signatures (`engine`, `delivery`, `service`, `integration_routes`). The run log pages in
+  SQL.
+
+**Tests (`test_phase3` D section):**
+- Old graph nodes are seeded at runtime:
+  - a candidate without `joiner_id` and one with `generated_values`/`access_results`
+  - a run, log records (one with excluded data), outbound and agent messages
+- The cutover is clean.
+- The store and run-log endpoints equal what the old graph reader returned, key sets included.
+- **Constraints:**
+  - two threads enrolling the same candidate → one row
+  - a second running run → `AlreadyRunning`
+  - a case-insensitive duplicate name → `SetupError`
+- **Behaviour:**
+  - exclusions are masked at rest
+  - a simulated outbound message is recorded
+  - `say` records an agent message
+- **Drift and rollback:**
+  - a stray graph write → drift
+  - rollback: new rows come back as nodes without null properties
+  - a second cutover is clean
+- The API contract is unchanged.
+
+**Gate:**
+- ruff, the guard, every suite, smoke.
+- **Dev drill:**
+  - `BGSAVE`, cutover, feature smoke by API (list and open integrations, the setup chat, the run log)
+  - **no integration run on dev**: it can send real Gmail
+  - `rollback D`, restart: 21 labels at parity, no drift
+- **Throwaway stack:**
+  - `main` → D, six batches in one start
+  - the setup chat, a run, an approval, masked logs and messages (simulated delivery)
+  - a full rollback to `main`, then re-upgrade
+- CI green on the PR stacked on #10.
 
 ## As built: batch C (connectors, secrets at rest)
 - Migration `015_connectors.sql` (014 went to B): `connectors`, `connector_instances` (+ `secret_enc`, `secret_key_id`,
@@ -279,7 +359,7 @@ The known bypasses are closed in their batch:
     - the connection form shows the hint only; test-connection works
     - onboarding a candidate creates the `from_candidate` link
     - the HR Portal sync creates `synced_to`
-- **D, integrations (migration 015):**
+- **D, integrations (migration 016; see "Plan: batch D" above):**
   - Tables: `integrations` (unique on lower(name)), `integration_candidates` (UNIQUE (integration_id, record_id)), `workflow_runs`, `integration_log_records` (masked before the insert), `outbound_messages`, `agent_messages`.
   - Store signatures and return dicts are unchanged: epoch floats; `None`/`""` exactly as before, checked by the contract.
   - **Feature smoke:**
