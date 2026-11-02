@@ -25,7 +25,8 @@ import gmail
 import logging_setup as ls
 from connectors import registry
 from connectors.base import RecordRejected
-from graph import q, q1, new_id, event
+from graph import event, new_id
+from graph_migration import jsonv as gm_json
 from . import delivery, store
 from .mapping import apply_mapping, check_required
 from .run_log import display_name, exclusions_of, snapshot_mapping, visible_actions
@@ -311,17 +312,13 @@ def _enroll(it: dict) -> int:
         return 0
     statuses = set(it["source_filter"].get("statuses") or [])
     depts = {d.lower() for d in it["source_filter"].get("departments") or []}
-    existing = {r["r"] for r in q("MATCH (c:IntegrationCandidate {integration_id:$i}) RETURN c.record_id AS r", i=it["id"])}
     added = 0
     for rec in found[1].list_records(it["source_id"], 1, 100000)["items"]:
         v = rec["values"]
-        if rec["id"] in existing or v.get("status") not in statuses or (depts and str(v.get("department_name", "")).lower() not in depts):
+        if v.get("status") not in statuses or (depts and str(v.get("department_name", "")).lower() not in depts):
             continue
-        q("CREATE (c:IntegrationCandidate) SET c = $p", p={
-            "id": new_id("ic"), "integration_id": it["id"], "record_id": rec["id"], "candidate_ref": v.get("candidate_id", ""),
-            "name": f"{v.get('first_name', '')} {v.get('last_name', '')}".strip(), "email": v.get("email", ""),
-            "stage": "pending", "document_results": "[]", "document_attempts": 0, "created": time.time(), "updated": time.time()})
-        added += 1
+        added += store.enroll_candidate(it["id"], rec["id"], v.get("candidate_id", ""),
+                                        f"{v.get('first_name', '')} {v.get('last_name', '')}".strip(), v.get("email", ""))
     return added
 
 
@@ -336,14 +333,9 @@ def _count_matching(it: dict) -> int:
 
 
 def _start_run(it: dict, trigger: str) -> str:
-    now = time.time()
-    q("MATCH (r:WorkflowRun {integration_id:$i, status:'running'}) WHERE r.started < $t SET r.status='failed', r.finished=$n",
-      i=it["id"], t=now - STALE_RUN_AFTER, n=now)
-    if q1("MATCH (r:WorkflowRun {integration_id:$i, status:'running'}) RETURN r", i=it["id"]):
+    rid = store.start_run(it["id"], it["name"], trigger, STALE_RUN_AFTER)
+    if not rid:
         raise AlreadyRunning("This integration is already running.")
-    rid = new_id("run")
-    q("CREATE (r:WorkflowRun) SET r = $p", p={"id": rid, "integration_id": it["id"], "integration_name": it["name"], "trigger": trigger,
-                                              "status": "running", "started": now, "finished": 0, "details": "[]", "counts": "{}"})
     return rid
 
 
@@ -388,7 +380,7 @@ async def run_integration(iid: str, trigger: str = "manual", actor: str = "HR") 
             if outcome == "waiting" and stage in _WAITING_ON:
                 section, message = _WAITING_ON[stage]
                 logged.append({"section": section, "kind": "waiting", "message": message})
-            q("CREATE (l:IntegrationLogRecord) SET l = $p", p={
+            store.add_log_record({
                 "id": new_id("log"), "integration_id": iid, "run_id": run_id, "candidate_record_id": item["record_id"],
                 "candidate_ref": item.get("candidate_ref", ""), "candidate_name": name, "outcome": outcome,
                 "stage_before": item["stage"], "stage_after": stage, "actions": json.dumps(visible_actions(logged, ex_sections)),
@@ -414,20 +406,18 @@ async def _finish(it: dict, run_id: str, status: str, counts: Counter, details: 
     c = {k: counts[k] for k in ("enrolled", "advanced", "waiting", "failed", "fetched", "documents_requested", "documents_verified",
                                  "documents_rejected", "approvals_pending", "approval_used", "offer_sent", "employee_created",
                                  "employee_updated", "employee_skipped", "access_granted", "access_requested")}
-    now = time.time()
-    q("MATCH (r:WorkflowRun {id:$id}) SET r.status=$s, r.counts=$c, r.details=$d, r.finished=$f",
-      id=run_id, s=status, c=json.dumps(c), d=json.dumps(details), f=now)
-    store.update(it["id"], last_run_at=now)
+    store.finish_run(run_id, status, c, details)
+    store.update(it["id"], last_run_at=time.time())
     summary = f"{c['advanced']} advanced, {c['waiting']} waiting, {c['failed']} failed"
     if status == "succeeded":
         await notify(it, "run_succeeded", f"{it['name']} succeeded: {summary}")
     else:
         await notify(it, "run_failed", f"{it['name']} had failures: {summary}")
-    return run_row(q1("MATCH (r:WorkflowRun {id:$id}) RETURN r", id=run_id)["r"])
+    return run_row(store.run(run_id))
 
 
 def run_row(r: dict) -> dict:
-    return {**r, "counts": json.loads(r.get("counts") or "{}"), "details": json.loads(r.get("details") or "[]")}
+    return {**r, "counts": gm_json(r.get("counts"), {}), "details": gm_json(r.get("details"), [])}
 
 
 async def run_due() -> int:

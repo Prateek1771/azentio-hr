@@ -66,7 +66,7 @@ restore path.**
 | A3 | Rule and Config (legacy, removed; Config moved here from A1) | | | | | |
 | B | Event, GuardrailEvent, EvalRun, EvalResult | 2026-11-02 09:46 UTC | Event 434/0 → 434/434, GuardrailEvent 1/1, EvalRun 2/2, EvalResult 25/25; sha equal | single writer | pass | dev |
 | C | Connector, ConnectorInstance, Record, links, CustomField, ImportRun, IntegrationRun (archived) | 2026-11-02 14:43 UTC | Connector 7/7, ConnectorInstance 7/7 (OF 7), Record 20/20 (IN 20, SYNCED_TO 3, FROM_CANDIDATE 3), CustomField 0/0, ImportRun 1/1, IntegrationRun 3/3; sha equal | single writer | pass | dev |
-| D | Integration, IntegrationCandidate, WorkflowRun, IntegrationLogRecord, OutboundMessage, AgentMessage | | | | | |
+| D | Integration, IntegrationCandidate, WorkflowRun, IntegrationLogRecord, OutboundMessage, AgentMessage | 2026-11-02 16:41 UTC | Integration 3/3, AgentMessage 34/34, the other four 0/0; sha equal | single writer | pass | dev |
 | E | AuditLog (legacy, removed), read-model cleanup | | | | | |
 
 Each batch adds a `### <batch>` section here with the pasted report extract.
@@ -253,3 +253,34 @@ counts equal. Both secrets became Fernet tokens (`secret_key_id d8f1b5e4`, the d
   onboarding links. Re-upgrade: five clean cutovers.
 
 **Sign-off:** dev ✓. CI on the PR covers `test_phase3` (C section and API contract) with a throwaway `SECRETS_KEY`.
+
+### D: integrations (dev stack, 2026-11-02)
+
+**Before:** Integration 3, AgentMessage 34, and IntegrationCandidate, WorkflowRun, IntegrationLogRecord and
+OutboundMessage 0 each. There are no edges. `BGSAVE` first.
+
+**Cutover** at startup, 16:41:29 UTC: all six labels `postgres`, parity ok, no unmapped keys, no read paths left.
+21 Phase 3 labels on Postgres at parity, no drift.
+
+**Feature smoke:**
+- `scripts/smoke.py` passes for every role.
+- By API: the integration list (3) and an integration's detail (setup state, 11 chat messages), and the run log.
+- **No integration was run on dev:** a run can send real Gmail. The run was exercised on the throwaway stack.
+
+**Rollback drill:**
+1. A setup-chat message was written after cutover (`service.say`).
+2. Stopped the backend and ran `graph_migration rollback D`: AgentMessage 35/35, with the new message in the graph;
+   everything ok.
+3. Restarted: cut over again at 16:43:17 UTC; 21 labels at parity, no drift.
+
+**Throwaway deep run** (keys blanked, so delivery is simulated):
+- On `main`, an integration with document verification, an offer letter, app access and the `email` log exclusion
+  ran: 3 enrolled, documents requested, one candidate's documents accepted → awaiting HR approval.
+- `main` → D: six batches in one start. On D:
+  - HR approved the candidate.
+  - The run sent the offer, created the employee and granted access (7 granted, 1 requested).
+  - Six log records, none holding an email value.
+- A full rollback (D, C, B, A3, A2, A1), then `main`: the completed candidate, both runs, the offer letter and the
+  masked log. Re-upgrade: six clean cutovers.
+
+**Sign-off:** dev ✓. CI on the PR covers `test_phase3` (D section and API contract).

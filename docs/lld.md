@@ -137,7 +137,7 @@ flowchart LR
 | `ingest.py` | CSV, Excel and JSON parsing and validation, employee upsert, seeding | `read_table`, `validate_employees`, `upsert_employee`, `import_requirements`, `seed` |
 | `connector_routes.py` | Connector API: records, schema, custom fields, connection settings, imports, start onboarding | router mounted under `/api` |
 | `integration_routes.py` | Integration workflow, Approval Center, integration log and audit log API | router mounted under `/api` |
-| `integrations/store.py` | Integration records and setup state; setup steps, questions, stages, activation blockers | `get`, `update`, `current_step`, `problems`, `settle`, `items` |
+| `integrations/store.py` | **The only reader and writer of integration tables** (Phase 3 D): integrations and setup state, candidates, runs, the run log, outbound and agent messages; setup steps, questions, stages, activation blockers; registers the batch D specs | `get`, `update`, `current_step`, `problems`, `settle`, `items`, `enroll_candidate`, `start_run`, `runs`, `log_records`, `outbound`, `say` |
 | `integrations/service.py` | Every change to an integration (shared by UI buttons and agent tools) | `save_*`, `suggest_mapping`, `approve_mapping`, `activate`, `pause`, `decide_candidate`, `grant_access` |
 | `integrations/chat.py` | The setup chat: tool definitions and the turn loop | `TOOLS`, `Tools.execute`, `run_chat_turn`, `start_from_chat` |
 | `integrations/agent.py` | `LlmAgent` (tool calling) and the rule-based `SimulatedAgent` fallback | `get_agent` |
@@ -223,6 +223,9 @@ Two stores. Postgres is the system of record for everything built in Phases 0 to
 | `owners` (Phase 3 A1) | `email (PK, lowercase), name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | Department owners and managers. `owners.py` is the only reader and writer; each write re-projects graph `Owner` nodes (`records.project_owners`) |
 | `policies` (Phase 3 A2) | `source (PK), title, text` | Uploaded policy and process documents. `policies.py` is the only reader and writer; `chat.index_chunks` builds the graph's `PolicyChunk` index from them, and `chat.reindex_policies` rebuilds it in full |
 | `legacy_rules`, `legacy_config` (Phase 3 A3) | `id, props (jsonb)` / `key, value` | Archive of the retired graph `Rule`/`Config` nodes, only for `graph_migration rollback A3`; nothing reads them. Dropped in PR E |
+| `integrations`, `integration_candidates` (Phase 3 D) | integration: `id, name, status, created, next_run_at, config (jsonb)`, unique on `lower(name)`; candidate: `id, integration_id, record_id, candidate_ref, name, email, stage, document_results, document_attempts, joiner_id, last_error, generated_values, employee_record_id, access_results, decided_at, rejection_reason, created, updated`, unique `(integration_id, record_id)` | Integrations and each candidate's progress. The JSON fields stay text as the graph stored them; reads drop NULL columns so shapes are unchanged |
+| `workflow_runs`, `integration_log_records` (Phase 3 D) | run: `id, integration_id, integration_name, trigger, status, started, finished, counts, details`, at most one `running` per integration (partial unique index); log: `run_id, candidate_*, outcome, stage_before/after, actions, mapping, error, ts` | Integration runs and the per-candidate run log, written with HR's exclusions already applied |
+| `outbound_messages`, `agent_messages` (Phase 3 D) | message: `integration_id, item_id, kind, recipient (API: to), subject, content, attempt, delivered_by, provider_ref, candidate, ts`; chat: `integration_id, role, content, ts` | Every email an integration sent (or simulated) and the setup chat |
 | `connectors`, `connector_instances` (Phase 3 C) | catalog: `key, name, role, record_kind, demo, description`; instance: `id, key, name, created, connection (jsonb), secret_enc, secret_key_id, secret_hint` | The connector catalog and this workspace's instances. The secret is a Fernet token; the API sees only `secret_set` and the hint |
 | `connector_records`, `employee_record_links` (Phase 3 C) | record: `id, instance_id, kind, data (jsonb: the field values), created, updated`; link: `employee_id, record_id, type (synced_to, from_candidate)` | Candidates, HR Portal employees and app actions, and which joiner each belongs to |
 | `custom_fields`, `import_runs`, `legacy_sync_runs` (Phase 3 C) | `instance_id:key` id; import `filename, total, imported, errors (jsonb), ts`; archive `id, props` | HR Portal custom fields, Candidate Import history, and the dead one-shot sync runs (rollback only) |
@@ -247,12 +250,9 @@ flowchart LR
     D -->|MISMATCH| E
     RU((Rule)) -.->|"creates (by rule_id)"| I
     PC((PolicyChunk)) -.->|source| P((Policy))
-    IN((Integration)) -.->|"source_id / target_id"| CI[("connector_instances (Postgres)")]
-    IC((IntegrationCandidate)) -.->|"integration_id · record_id · employee_id"| IN
-    WR((WorkflowRun)) -.->|integration_id| IN
 ```
 
-Integration nodes link by id properties rather than edges, because each one is read by id and never walked.
+Integrations, their candidates, runs, run log and messages live in Postgres since Phase 3 D (§4.1).
 
 | Label | Key properties | Purpose |
 |---|---|---|
@@ -270,12 +270,12 @@ Integration nodes link by id properties rather than edges, because each one is r
 | `Record` | `id, instance_id, kind, values (json), created, updated` | **Retired** (Phase 3 C): `connector_records`; the `SYNCED_TO` / `FROM_CANDIDATE` edges are `employee_record_links` |
 | `CustomField` | `instance_id, key, label, type, required` | **Retired** (Phase 3 C): `custom_fields` |
 | `ImportRun` / `IntegrationRun` | counts, errors or results, mapping, policy, `ts` | **Retired** (Phase 3 C): `import_runs`; the dead `IntegrationRun` nodes are archived in `legacy_sync_runs` |
-| `Integration` | `id, name, status (draft, active, paused), next_run_at, config (json)` | One integration. Settings sit in a single JSON `config` because a FalkorDB property can't hold null, and setup needs "not answered yet" |
-| `IntegrationCandidate` | `id, integration_id, record_id, employee_id, stage, last_error, access (json)` | One candidate's progress through an integration |
-| `WorkflowRun` | `id, integration_id, trigger (manual, scheduled), status, counts, started, finished` | One integration run |
-| `IntegrationLogRecord` | `run_id, item_id, actions, mapping snapshot` | What happened to one candidate in one run, minus HR's exclusions |
-| `AgentMessage` | `integration_id, role, content, ts` | The setup chat history |
-| `OutboundMessage` | `integration_id, item_id, kind, to, subject, content, attempt, delivered_by (gmail, simulated), provider_ref` | Every email an integration sent, exactly as sent |
+| `Integration` | **Retired** (Phase 3 D): the `integrations` table. Was `id, name, status (draft, active, paused), next_run_at, config (json)` | One integration. Settings sit in a single JSON `config` because a FalkorDB property can't hold null, and setup needs "not answered yet" |
+| `IntegrationCandidate` | `id, integration_id, record_id, employee_id, stage, last_error, access (json)` | **Retired** (Phase 3 D): `integration_candidates` |
+| `WorkflowRun` | `id, integration_id, trigger (manual, scheduled), status, counts, started, finished` | **Retired** (Phase 3 D): `workflow_runs` |
+| `IntegrationLogRecord` | `run_id, item_id, actions, mapping snapshot` | **Retired** (Phase 3 D): `integration_log_records` |
+| `AgentMessage` | `integration_id, role, content, ts` | **Retired** (Phase 3 D): `agent_messages` |
+| `OutboundMessage` | `integration_id, item_id, kind, to, subject, content, attempt, delivered_by (gmail, simulated), provider_ref` | **Retired** (Phase 3 D): `outbound_messages` |
 | `AuditLog` | `action, entity_type, entity_id, summary, actor, ts` | **Legacy.** No longer written. Bootstrap copies these rows once into the Postgres chain (§10.4) |
 | `GuardrailEvent` | `surface, rule, action (blocked, flagged), ts` | **Retired** (Phase 3 B): the `guardrail_events` table |
 | `EvalRun` / `EvalResult` | run: `status, judge, model, done, total, summary (json)`; result: `question, reference, answer, sources, faithfulness, context_precision, context_recall, guardrail_ok` | Ragas evaluation history **Retired** (Phase 3 B): `eval_runs` / `eval_results` are the record. |

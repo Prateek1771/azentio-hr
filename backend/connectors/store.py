@@ -215,17 +215,6 @@ def _f(v) -> float:
     return float(v or 0)
 
 
-def _json(v, default, what: str):
-    """Graph JSON strings: empty -> default; malformed -> refuse the cutover (silently mapping it to {} would pass
-    parity on both sides and lose the data)."""
-    if isinstance(v, str) and v.strip():
-        try:
-            return json.loads(v)
-        except ValueError:
-            raise ValueError(f"{what} holds malformed JSON; fix it in the graph and restart") from None
-    return default if v in (None, "") else v
-
-
 def _sha_plain(token: str) -> str:
     if not token:
         return ""
@@ -239,7 +228,7 @@ def _instance_row(p: dict) -> dict:
     plain = p.get("secret") or ""
     enc, kid = secrets.encrypt(plain) if plain else ("", "")
     return {"id": p["id"], "key": p["key"], "name": p.get("name") or "", "created": _f(p.get("created")),
-            "connection": _json(p.get("connection"), {}, f"{CI} {p['id']} connection"), "secret_enc": enc, "secret_key_id": kid,
+            "connection": gm.json_strict(p.get("connection"), {}, f"{CI} {p['id']} connection"), "secret_enc": enc, "secret_key_id": kid,
             "secret_hint": secrets.hint(plain)}
 
 
@@ -255,7 +244,7 @@ def _instance_props(r: dict) -> dict:
 
 def _record_row(p: dict) -> dict:
     return {"id": p["id"], "instance_id": p["instance_id"], "kind": p.get("kind") or "",
-            "data": _json(p.get("values"), {}, f"{R} {p['id']} values"), "created": _f(p.get("created")), "updated": _f(p.get("updated") or p.get("created"))}
+            "data": gm.json_strict(p.get("values"), {}, f"{R} {p['id']} values"), "created": _f(p.get("created")), "updated": _f(p.get("updated") or p.get("created"))}
 
 
 def _record_canon(r: dict) -> dict:

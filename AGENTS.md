@@ -8,14 +8,14 @@ Azentio Onboard is an HR onboarding agent. For each new joiner it works out whic
 We're hardening it from a demo into governed HR operations in 7 phases: see [docs/plans/2026-11-01-hardening-design.md](docs/plans/2026-11-01-hardening-design.md).
 
 ## Current phase
-**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract), A1 (owners, email templates), A2 (policies), A3 (legacy rules/config retired), B (activity, guardrail hits, eval runs) and C (connectors, secrets encrypted at rest) are done; D and E follow, one PR each. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
+**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract), A1 (owners, email templates), A2 (policies), A3 (legacy rules/config retired), B (activity, guardrail hits, eval runs), C (connectors, secrets encrypted at rest) and D (integrations) are done; E (read model enforcement, rebuild, cleanup) follows. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
 
 | Phase | Status |
 |---|---|
 | 0 Trust + foundation (auth, 5 roles, audit chain, jobs/outbox, bootstrap) | **done** |
 | 1 Policy governance + Employee/Item migration | **done** |
 | 2 AI control + Document migration | **done** |
-| 3 Retire graph record storage | **in progress** (PR 0, A1, A2, A3, B, C done) |
+| 3 Retire graph record storage | **in progress** (PR 0, A1, A2, A3, B, C, D done) |
 | 4 Ops backbone + **Temporal** | planned |
 | 5 Lifecycle (transfer, offboarding, rechecks, contractor/rehire, leave) | planned |
 | 6 HR ops platform (manager view, SLAs, escalations, appeals, analytics) | planned |
@@ -23,7 +23,7 @@ We're hardening it from a demo into governed HR operations in 7 phases: see [doc
 ## Stack
 - **Backend:** FastAPI on Python 3.12, managed with `uv` (`backend/`).
 - **Postgres 17:** the system of record ([ADR 0005](docs/adr/0005-postgres-system-of-record.md)). Plain SQL through `psycopg`, no ORM.
-- **FalkorDB:** a read model only: the dependency graph, the relationship view, and the policy chunks the assistant retrieves ([ADR 0006](docs/adr/0006-graph-as-read-model.md)). Until Phase 3 finishes, it still holds integrations.
+- **FalkorDB:** a read model only: the dependency graph, the relationship view, and the policy chunks the assistant retrieves ([ADR 0006](docs/adr/0006-graph-as-read-model.md)). Every record label is in Postgres since Phase 3 D; batch E removes the retired nodes and enforces the read model.
 - **Next.js 16 / React 19 / Tailwind 4 / shadcn on base-ui** (`frontend/`). The browser calls the API through the Next.js rewrite of `/api/*` to `BACKEND_URL`, so the app and the API share one origin and the session cookie works.
 - **Temporal:** arrives in **Phase 4**, for durable workflows on top of Postgres ([ADR 0011](docs/adr/0011-temporal-orchestration.md)). It isn't used yet.
 
@@ -96,7 +96,7 @@ cd backend && uv run python test_phase3.py    # migration engine (freeze, cutove
 | `backend/work_queue.py` | The one exceptions inbox: anything that needs a human |
 | `backend/checklist.py`, `validate.py`, `extract.py`, `pipeline.py`, `gmail.py`, `chat.py` | Rules engine, document checks, LLM extraction, intake, email, assistant (moving into modules in Phases 1 to 5) |
 | `backend/connectors/` | Connector catalog and implementations. **`store.py` is the only reader and writer of connectors, records, employee links, custom fields and import runs** (Postgres, Phase 3 C); `secrets.py` encrypts connection secrets (ADR 0013) |
-| `backend/integrations/` | Integration engine and agent (graph until Phase 3 D) |
+| `backend/integrations/` | Integration engine and agent. **`store.py` is the only reader and writer of integrations, candidates, runs, the run log and messages** (Postgres, Phase 3 D) |
 | `frontend/app/(hr)/` | HR app pages; `frontend/app/portal/[token]` is the joiner portal (public, token-scoped) |
 | `frontend/app/login`, `frontend/app/(hr)/users` | Sign-in screen; user and role management (admin) |
 | `frontend/app/(hr)/system` | System page: the Phase 3 storage migration report (admin, auditor) |

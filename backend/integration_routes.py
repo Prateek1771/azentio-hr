@@ -1,12 +1,10 @@
 """HTTP API: integrations workflow, Approval Center, integration log and audit log (mounted under /api)."""
-import json
 from functools import wraps
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 import audit
-from graph import q, q1
 from integrations import chat, delivery, engine, service, store
 from integrations.run_log import exclusions_of, mask_record
 from connectors.base import RecordRejected
@@ -390,24 +388,20 @@ def _run(r: dict, it: dict | None) -> dict:
 
 @router.get("/logs/integration")
 def integration_log(integration_id: str = "", page: int = 1, page_size: int = 15):
-    rows = q("MATCH (r:WorkflowRun) WHERE $i = '' OR r.integration_id = $i RETURN r ORDER BY r.started DESC", i=integration_id)
-    its = {it["id"]: it for it in store.all_integrations()}
     page_size = min(max(page_size, 1), 100)
-    start = (max(page, 1) - 1) * page_size
-    return {"items": [_run(r["r"], its.get(r["r"]["integration_id"])) for r in rows[start:start + page_size]],
-            "total": len(rows), "page": page, "page_size": page_size}
+    rows, total = store.runs(integration_id, page, page_size)
+    its = {it["id"]: it for it in store.all_integrations()}
+    return {"items": [_run(r, its.get(r["integration_id"])) for r in rows], "total": total, "page": page, "page_size": page_size}
 
 
 @router.get("/logs/integration/{run_id}/records")
 def run_records(run_id: str):
-    run = q1("MATCH (r:WorkflowRun {id:$id}) RETURN r", id=run_id)
+    run = store.run(run_id)
     if not run:
         raise HTTPException(404, "Run not found")
-    it = store.get(run["r"]["integration_id"]) or {}
+    it = store.get(run["integration_id"]) or {}
     fields, sections = exclusions_of(it)
-    rows = q("MATCH (l:IntegrationLogRecord {run_id:$id}) RETURN l ORDER BY l.candidate_name", id=run_id)
-    return [mask_record({**r["l"], "actions": json.loads(r["l"]["actions"]), "mapping": json.loads(r["l"]["mapping"])}, fields, sections)
-            for r in rows]
+    return [mask_record(r, fields, sections) for r in store.log_records(run_id)]
 
 
 @router.get("/logs/audit")

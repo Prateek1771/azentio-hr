@@ -62,7 +62,7 @@ class LabelSpec:
 
 SPECS: dict[str, LabelSpec] = {}
 SPEC_MODULES = ("owners", "templates", "policies", "policy.legacy", "events", "guardrails", "evals",
-                "connectors.store")  # each registers its labels' specs on import (batch A1 onward)
+                "connectors.store", "integrations.store")  # each registers its labels' specs on import (batch A1 onward)
 _loaded = False
 
 
@@ -151,15 +151,29 @@ def read_paths(label: str, allowed: tuple = ()) -> list[str]:
     ponytail: a label built at runtime (f"(n:{label})") can't be seen statically; graph.q()'s runtime check covers it."""
     rx = label_rx(label)
     hits = []
-    for base in (ROOT, ROOT.parent / "scripts"):
-        for p in base.rglob("*.py"):
-            rel = p.relative_to(ROOT.parent).as_posix()
-            if ".venv" in rel or rel.endswith("graph_migration.py") or rel in allowed or "/migrations/" in rel:
-                continue
-            for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-                if rx.search(line):
-                    hits.append(f"{rel}:{i}")
+    for p in source_files():
+        rel = p.relative_to(ROOT.parent).as_posix()
+        if rel.endswith("graph_migration.py") or rel in allowed:
+            continue
+        for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if rx.search(line):
+                hits.append(f"{rel}:{i}")
     return hits
+
+
+_SKIP_DIRS = {".venv", "venv", "node_modules", "__pycache__", ".ruff_cache", ".git", "migrations", "uploads"}
+
+
+def source_files() -> list[Path]:
+    """The app's own Python files (backend/ and scripts/). Prunes .venv and friends while walking: an rglob that
+    filtered them afterwards walked ~22k dependency files per call, seconds per label on every report."""
+    import os
+    out = []
+    for base in (ROOT, ROOT.parent / "scripts"):
+        for d, dirs, files in os.walk(base):
+            dirs[:] = [x for x in dirs if x not in _SKIP_DIRS]
+            out += [Path(d) / f for f in files if f.endswith(".py")]
+    return out
 
 
 def label_report(spec: LabelSpec) -> dict:
@@ -367,6 +381,17 @@ def jsonv(v, default):
         except ValueError:
             return default
     return default if v is None else v
+
+
+def json_strict(v, default, what: str):
+    """A graph JSON string for a cutover: empty -> default; malformed -> refuse, naming the node (mapping it to the
+    default would pass parity on both sides and silently lose the data)."""
+    if isinstance(v, str) and v.strip():
+        try:
+            return json.loads(v)
+        except ValueError:
+            raise ValueError(f"{what} holds malformed JSON; fix it in the graph and restart") from None
+    return default if v in (None, "") else v
 
 
 def sha(obj) -> str:

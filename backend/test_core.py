@@ -172,7 +172,6 @@ from integrations.store import SetupError  # noqa: E402
 gq("MATCH (n) WHERE n:Employee OR n:Item DETACH DELETE n")
 db.execute("DELETE FROM connector_records WHERE instance_id IN (SELECT id FROM connector_instances WHERE key IN "
            "(SELECT key FROM connectors WHERE role='app'))")
-gq("MATCH (n) WHERE n:Integration OR n:IntegrationCandidate OR n:WorkflowRun OR n:IntegrationLogRecord OR n:AgentMessage OR n:OutboundMessage DETACH DELETE n")
 import tempfile  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
 from documents import service as _docsvc  # noqa: E402
@@ -211,8 +210,8 @@ async def _wf():
     assert run["counts"]["enrolled"] == 1 and sum(run["counts"][k] for k in ("employee_created", "employee_updated", "employee_skipped")) == 1, run["counts"]
     again = await wf_engine.run_integration(it["id"])
     assert again["counts"]["enrolled"] == 0 and again["counts"]["advanced"] == 0  # repeat-safe
-    logs = gq("MATCH (l:IntegrationLogRecord {run_id:$r}) RETURN l", r=run["id"])
-    assert len(logs) == 1 and json.loads(logs[0]["l"]["mapping"])  # per-candidate log with mapping snapshot
+    logs = wf_store.log_records(run["id"])
+    assert len(logs) == 1 and logs[0]["mapping"]  # per-candidate log with mapping snapshot
     # Changing an approved mapping pauses a live integration
     wf_service.save_mapping(it["id"], [r for r in wf_store.get(it["id"])["mapping"] if r["target_field"] != "job_title"])
     assert wf_store.get(it["id"])["status"] == "paused"
@@ -263,7 +262,7 @@ async def _wf():
     wf_service.decide_candidate(it2["id"], first["id"], True, None)
     r2 = await wf_engine.run_integration(it2["id"])
     assert wf_store.item(first["id"])["stage"] == "completed" and r2["counts"]["offer_sent"] >= 1 and r2["counts"]["approval_used"] >= 1
-    kinds = {m["kind"] for m in gq("MATCH (m:OutboundMessage {integration_id:$i}) RETURN m", i=it2["id"]) for m in [m["m"]]}
+    kinds = {m["kind"] for m in wf_store.outbound(it2["id"])}
     assert {"document_request", "offer_letter"} <= kinds
     # Documents were limited to the role's set (Software Engineer -> photo ID only, others -> 2)
     for i in wf_store.items(it2["id"]):

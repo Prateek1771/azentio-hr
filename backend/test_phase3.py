@@ -675,6 +675,134 @@ check("c_recutover_replaces_links_with_the_graphs", all(r["ok"] for r in res["la
       and q(f"MATCH (i:{CI}) WHERE i.secret IS NOT NULL RETURN count(i) AS n")[0]["n"] == 0
       and all(d["ok"] for d in gm.drift_since_cutover() if d["label"] in C_LABELS))
 
+# ---------- batch D: integrations move to Postgres ----------
+import integration_routes as iroutes  # noqa: E402
+from integrations import delivery as idelivery, engine as iengine, service as iservice, store as istore  # noqa: E402
+from integrations.run_log import exclusions_of, mask_record, snapshot_mapping  # noqa: E402
+
+INT, CAND, WRUN, LOGR, OUT, AMSG = ("Integration", "IntegrationCandidate", "WorkflowRun", "IntegrationLogRecord",
+                                    "OutboundMessage", "AgentMessage")
+D_LABELS = (INT, CAND, WRUN, LOGR, OUT, AMSG)
+db.execute("DELETE FROM bridge_state WHERE record_type = ANY(%s)", (list(D_LABELS),))
+db.execute("TRUNCATE integration_candidates, workflow_runs, integration_log_records, outbound_messages, agent_messages, "
+           "integrations CASCADE")
+q("MATCH (n) WHERE " + " OR ".join(f"n:{lbl}" for lbl in D_LABELS) + " DETACH DELETE n")
+cfg = {"description": "old", "source_id": "ci_cp", "target_id": "ci_hr", "setup_step": "review",
+       "log_exclusions": {"fields": ["email"], "sections": ["offers"]}}
+q(f"CREATE (:{INT} {{id:'int_old', name:'Old Sync', status:'active', created:$t, next_run_at:0, config:$c}})",
+  t=now - 900, c=json.dumps(cfg))
+q(f"""CREATE (:{CAND} {{id:'ic_1', integration_id:'int_old', record_id:'rec_c1', candidate_ref:'C-1', name:'Ananya K',
+       email:'ananya@x.com', stage:'pending', document_results:'[]', document_attempts:0, created:$t, updated:$t}})""", t=now - 800)
+q(f"""CREATE (:{CAND} {{id:'ic_2', integration_id:'int_old', record_id:'rec_x', candidate_ref:'C-2', name:'Ravi S',
+       email:'ravi@x.com', stage:'completed', document_results:'[{{"name": "ID", "status": "verified"}}]', document_attempts:1,
+       joiner_id:'E9100', last_error:'', generated_values:'{{"work_email": "ravi.s@x.com"}}', employee_record_id:'rec_h1',
+       access_results:'[{{"app": "Slack", "status": "invited"}}]', decided_at:$d, rejection_reason:'', created:$t, updated:$d}})""",
+  t=now - 790, d=now - 700)
+q(f"""CREATE (:{WRUN} {{id:'run_d1', integration_id:'int_old', integration_name:'Old Sync', trigger:'manual', status:'succeeded',
+       started:$s, finished:$f, counts:'{{"advanced": 1, "offer_sent": 1}}', details:'[]'}})""", s=now - 600, f=now - 590)
+q(f"""CREATE (:{LOGR} {{id:'log_1', integration_id:'int_old', run_id:'run_d1', candidate_record_id:'rec_x', candidate_ref:'C-2',
+       candidate_name:'Ravi S', outcome:'advanced', stage_before:'approved', stage_after:'completed',
+       actions:'[{{"section": "offers", "kind": "offer_sent", "message": "Sent offer"}}, {{"section": "mapping", "kind": "x", "message": "m"}}]',
+       mapping:'[{{"source_field": "email", "target_field": "work_email", "transform": "none", "from_default": false, "excluded": false, "value": "ravi@x.com"}}]',
+       error:'', ts:$t}})""", t=now - 595)
+q(f"""CREATE (:{OUT} {{id:'msg_1', integration_id:'int_old', item_id:'ic_2', kind:'offer_letter', to:'ravi@x.com', subject:'Offer',
+       content:'<p>hi</p>', attempt:1, delivered_by:'simulated', provider_ref:'sim-1', candidate:'Ravi S', ts:$t}})""", t=now - 594)
+for i, (role, text) in enumerate((("assistant", "Which candidates?"), ("user", "Hired ones"))):
+    q(f"CREATE (:{AMSG} {{id:$id, integration_id:'int_old', role:$r, content:$c, ts:$t}})", id=f"am_{i}", r=role, c=text,
+      t=now - 1000 + i)
+
+
+def old_views():  # what the previous release returned, read straight from the graph
+    node = q(f"MATCH (i:{INT} {{id:'int_old'}}) RETURN i")[0]["i"]
+    cands = [c["c"] for c in q(f"MATCH (c:{CAND} {{integration_id:'int_old'}}) RETURN c ORDER BY c.created")]
+    it = istore._load(dict(node))
+    fields, sections = exclusions_of(it)
+    logs = [dict(r["l"]) for r in q(f"MATCH (l:{LOGR} {{run_id:'run_d1'}}) RETURN l ORDER BY l.candidate_name")]
+    return {"get": it,
+            "items": [{**c, "document_results": json.loads(c.get("document_results") or "[]"),
+                       "access": json.loads(c.get("access_results") or "[]")} for c in cands],
+            "run_log": [iroutes._run(dict(r["r"]), it) for r in q(f"MATCH (r:{WRUN}) RETURN r ORDER BY r.started DESC")],
+            "run_records": [mask_record({**r, "actions": json.loads(r["actions"]), "mapping": json.loads(r["mapping"])}, fields, sections)
+                            for r in logs],
+            "outbound": [dict(r["m"]) for r in q(f"MATCH (m:{OUT} {{integration_id:'int_old'}}) RETURN m ORDER BY m.ts DESC")],
+            "agent": [dict(r["m"]) for r in q(f"MATCH (m:{AMSG} {{integration_id:'int_old'}}) RETURN m ORDER BY m.ts")]}
+
+
+def new_views():
+    return {"get": istore.get("int_old"), "items": istore.items("int_old"),
+            "run_log": iroutes.integration_log("int_old", 1, 15)["items"], "run_records": iroutes.run_records("run_d1"),
+            "outbound": idelivery.messages("int_old"), "agent": iservice.messages("int_old")}
+
+
+before_d = old_views()
+check("d_has_no_graph_read_paths_left", all(gm.read_paths(lbl) == [] for lbl in D_LABELS),
+      {lbl: gm.read_paths(lbl) for lbl in D_LABELS})
+res = gm.cutover("D", watch=0)
+reps = {r["label"]: r for r in res["labels"]}
+check("d_cutover_clean", all(r["ok"] and not r["unmapped_keys"] for r in reps.values())
+      and [reps[lbl]["pg_count"] for lbl in D_LABELS] == [1, 2, 1, 1, 1, 2], reps)
+after_d = new_views()
+diff = [k for k in before_d if before_d[k] != after_d[k]]
+check("d_reads_equal_the_old_graph_reader", not diff, {k: (before_d[k], after_d[k]) for k in diff})
+check("d_absent_graph_keys_stay_absent", "joiner_id" not in after_d["items"][0] and after_d["items"][1]["joiner_id"] == "E9100"
+      and istore.item_for_joiner("E9100")["id"] == "ic_2" and after_d["outbound"][0]["to"] == "ravi@x.com"
+      and "recipient" not in after_d["outbound"][0], after_d["items"])
+check("d_run_records_masked_by_current_exclusions", [a["section"] for a in after_d["run_records"][0]["actions"]] == ["mapping"]
+      and after_d["run_records"][0]["mapping"][0]["value"] is None, after_d["run_records"])
+
+# the database enforces what the graph could only check
+outs = []
+ths = [threading.Thread(target=lambda: outs.append(istore.enroll_candidate("int_old", "rec_new", "C-9", "New Person", "n@x.com")))
+       for _ in range(2)]
+[t.start() for t in ths]
+[t.join() for t in ths]
+check("d_enrolment_is_idempotent_under_two_threads", sorted(outs) == [False, True]
+      and db.fetch1("SELECT count(*) AS n FROM integration_candidates WHERE record_id='rec_new'")["n"] == 1, outs)
+it_old = istore.get("int_old")
+rid = iengine._start_run(it_old, "manual")
+e = raises(lambda: iengine._start_run(it_old, "scheduled"), iengine.AlreadyRunning)
+check("d_one_running_run_per_integration", e and "already running" in e)
+istore.finish_run(rid, "succeeded", {"advanced": 0}, [])
+check("d_finished_run_frees_the_slot", iengine._start_run(it_old, "manual") is not None)
+db.execute("UPDATE workflow_runs SET status='succeeded', finished=%s WHERE status='running'", (time.time(),))
+e = raises(lambda: istore.create("OLD sync", "", "ci_cp", "ci_hr"), istore.SetupError)
+new_it = istore.create("New Integration", "", "ci_cp", "ci_hr")
+e2 = raises(lambda: istore.update(new_it["id"], name="old SYNC"), istore.SetupError)
+check("d_duplicate_name_in_any_case_refused", e and e2 and istore.name_taken("OLD SYNC") and not istore.name_taken("Old Sync", "int_old"))
+
+# log exclusions are never written: the table itself holds no excluded value
+rules = [{"source_field": "email", "target_field": "work_email", "transform": "none"},
+         {"source_field": "designation", "target_field": "job_title", "transform": "none"}]
+snap = snapshot_mapping(rules, {"email": "secret.person@x.com", "designation": "SE"}, {"email"}, set())
+istore.add_log_record({"id": "log_new", "integration_id": "int_old", "run_id": rid, "candidate_record_id": "rec_new",
+                       "candidate_ref": "C-9", "candidate_name": "C-9", "outcome": "advanced", "stage_before": "pending",
+                       "stage_after": "approved", "actions": [], "mapping": snap, "error": "", "ts": time.time()})
+raw = db.fetch1("SELECT mapping::text AS m FROM integration_log_records WHERE id='log_new'")["m"]
+check("d_log_exclusions_masked_at_rest", "secret.person" not in raw and "SE" in raw, raw)
+asyncio.run(idelivery.send_email("int_old", "ic_1", "notification", "hr@x.com", "Run done", "<p>ok</p>"))
+iservice.say("int_old", "assistant", "All set.")
+check("d_outbound_and_agent_messages_recorded", idelivery.messages("int_old")[0]["delivered_by"] == "simulated"
+      and idelivery.messages("int_old")[0]["to"] == "hr@x.com" and iservice.messages("int_old")[-1]["content"] == "All set.")
+istore.set_item("ic_1", stage="documents_requested", last_error=None)
+check("d_set_item_keeps_graph_conventions", istore.item("ic_1")["last_error"] == "" and istore.item("ic_1")["stage"] == "documents_requested"
+      and raises(lambda: istore.set_item("ic_1", nonsense=1), AssertionError))
+check("d_no_drift_after_writes_through_the_app", all(d["ok"] for d in gm.drift_since_cutover() if d["label"] in D_LABELS))
+
+q(f"MATCH (m:{AMSG} {{id:'am_0'}}) SET m.content = 'stray'")
+check("d_drift_catches_a_stray_graph_write", not [d for d in gm.drift_since_cutover() if d["label"] == AMSG][0]["ok"])
+rb = gm.rollback("D", watch=0)
+cand_new = q(f"MATCH (c:{CAND} {{record_id:'rec_new'}}) RETURN c")[0]["c"]
+check("d_rollback_writes_new_rows_back_without_nulls", all(r["ok"] for r in rb["labels"])
+      and "joiner_id" not in cand_new and cand_new["stage"] == "pending"
+      and q(f"MATCH (i:{INT} {{name:'New Integration'}}) RETURN count(i) AS n")[0]["n"] == 1
+      and q(f"MATCH (m:{OUT} {{to:'hr@x.com'}}) RETURN count(m) AS n")[0]["n"] == 1
+      and q(f"MATCH (m:{AMSG} {{id:'am_0'}}) RETURN m.content AS c")[0]["c"] == "Which candidates?"
+      and json.loads(q(f"MATCH (r:{WRUN} {{id:'run_d1'}}) RETURN r.counts AS c")[0]["c"]) == {"advanced": 1, "offer_sent": 1}
+      and bridge.SOURCE[INT] == "graph", rb)
+res = gm.cutover("D", watch=0)
+check("d_cutover_again_after_rollback", all(r["ok"] for r in res["labels"]) and bridge.SOURCE[AMSG] == "postgres"
+      and istore.get("int_old")["log_exclusions"] == {"fields": ["email"], "sections": ["offers"]})
+
 # ---------- a lost graph never re-seeds over Postgres; the projection and the index are rebuilt from it ----------
 
 records.save_employee({"id": "E9001", "name": "Kept Name", "email": "kept@x.com", "role": "Engineer", "grade": "L2",

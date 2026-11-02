@@ -1,6 +1,6 @@
 # Phase 3: Retire graph record storage
 
-- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config), B (activity) and C (connectors) are done; D (integrations) is in progress; E follows.
+- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config), B (activity) and C (connectors) are done; D (integrations) are done; E (read model and cleanup) follows.
 - **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
 - **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
 - **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
@@ -97,8 +97,8 @@
   `normalise_rule` parses a text `compliance` cell. `graph_migration.load()` is never silently partial. Details and the
   upgrade/rollback-to-`main`/two-instance results are in the runbook's "Deep test" section.
 
-## Plan: batch D (integrations), written before coding
-Status: **in progress** on branch `phase-3-d`, stacked on `phase-3-c`. The migration file is `016_integrations.sql`,
+## Batch D (integrations): the plan, written before coding, then as built
+Status: **done** on branch `phase-3-d`, stacked on `phase-3-c`. The migration file is `016_integrations.sql`,
 because B and C took 014 and 015.
 
 **Dev graph at planning time** (2026-11-02):
@@ -176,6 +176,28 @@ every caller keeps its shapes.
   - the setup chat, a run, an approval, masked logs and messages (simulated delivery)
   - a full rollback to `main`, then re-upgrade
 - CI green on the PR stacked on #10.
+
+**As built** (the plan above held; these are the details and differences):
+- `integrations/store.py` owns the six tables and registers the six specs. `engine`, `delivery`, `service` and
+  `integration_routes` call it; no integration code issues Cypher any more.
+- **Masking at rest:** the run log was already written with the exclusions applied (`snapshot_mapping`,
+  `display_name`, `visible_actions`). `add_log_record` stores exactly that, and `run_records` still applies the current
+  exclusions on read. The test reads the raw table to prove an excluded value is never stored.
+- **Engine speed:** the read-path scan pruned `.venv` only after walking it, which cost about 2 s for each of the ~22k dependency files' walk, per label, on every report. With D's six labels the suite stalled. `source_files()` now prunes `.venv`, caches and migrations while walking (76 files), so `test_phase3` runs in about 3.5 min and startup cutovers are faster too.
+- The strict graph-JSON reader moved into the engine (`gm.json_strict`), shared by C and D: malformed `config`,
+  `counts`, `details`, `actions` or `mapping` refuses the cutover and names the node.
+- `test_phase3` D section, 16 checks (140 total):
+  - every store read and run-log endpoint equals what the old graph reader returned, key sets included
+  - enrolment from two threads, one running run, case-insensitive names
+  - masking at rest, outbound and agent messages, `set_item` conventions
+  - drift, a rollback without null properties, a second cutover
+- **Dev:** 3 integrations and 34 agent messages cut over. `rollback D` and a restart re-cut cleanly; all 21 labels are
+  on Postgres at parity with no drift.
+- **Throwaway stack:**
+  - `main` ran an integration with documents, offer and access up to HR approval.
+  - Six batches then cut over in one start. The approval and the final run happened on D: offer sent, employee created,
+    access granted.
+  - After a full rollback, `main` showed it all; then a re-upgrade.
 
 ## As built: batch C (connectors, secrets at rest)
 - Migration `015_connectors.sql` (014 went to B): `connectors`, `connector_instances` (+ `secret_enc`, `secret_key_id`,
