@@ -57,12 +57,153 @@ restore path.**
 
 | Batch | Labels | Cutover (dev) | Before → after (graph / pg, sha) | Freeze | Rollback drill | Sign-off |
 |---|---|---|---|---|---|---|
-| A1 | Owner, EmailTemplate, Config | | | | | |
-| A2 | Policy (PolicyChunk stays as an index) | | | | | |
-| A3 | Rule (legacy, removed) | | | | | |
-| B | Event, GuardrailEvent, EvalRun, EvalResult | | | | | |
+| A1 | Owner (stays as projection), EmailTemplate | 2026-11-02 03:08 UTC | Owner 8/0 → 8/8, EmailTemplate 4/0 → 4/4; sha equal | single writer, 15 s watch | pass | dev |
+| A2 | Policy (PolicyChunk stays as an index) | 2026-11-02 03:37 UTC | Policy 7/0 → 7/7; sha equal | single writer, 15 s watch | pass | dev |
+| A3 | Rule and Config (legacy, removed; Config moved here from A1) | | | | | |
+| B | Event, GuardrailEvent, EvalRun, EvalResult | 2026-11-02 09:46 UTC | Event 434/0 → 434/434, GuardrailEvent 1/1, EvalRun 2/2, EvalResult 25/25; sha equal | single writer | pass | dev |
 | C | Connector, ConnectorInstance, Record, links, CustomField, ImportRun, IntegrationRun (archived) | | | | | |
 | D | Integration, IntegrationCandidate, WorkflowRun, IntegrationLogRecord, OutboundMessage, AgentMessage | | | | | |
 | E | AuditLog (legacy, removed), read-model cleanup | | | | | |
 
 Each batch adds a `### <batch>` section here with the pasted report extract.
+
+### A1: Owner, EmailTemplate (dev stack, 2026-11-02)
+
+**Before** (graph / Postgres): Owner 8 / 0, graph sha `561f37e4…`; EmailTemplate 4 / 0, graph sha `831eaa95…`.
+Snapshot: `BGSAVE` taken first.
+
+**Cutover** at startup (`graph_migration.cutover batch=A1 labels=2`, 03:08:01 UTC), before the worker started:
+
+| Label | source | graph | pg | parity | unmapped keys | read paths left | drift since cutover |
+|---|---|---|---|---|---|---|---|
+| Owner | postgres | 8 | 8 | ok | none | none (`records.py` is the projection writer) | ok (projection: graph = Postgres) |
+| EmailTemplate | postgres | 4 | 4 | ok | none | none | ok |
+
+**Freeze evidence** (from `bridge_state.report.freeze` after the drill's re-cutover): `single_writer: true`,
+`watched_seconds: 15`, `recent_stopped_heartbeats: ["DESKTOP-968RPED:12956"]` (the instance stopped for the drill; its
+heartbeat didn't advance, so cutover went ahead).
+
+**Feature smoke:** `scripts/smoke.py` passes (every role; the Email templates page renders for each). By API:
+templates list and edit (HR Ops), `/api/rules` lists the 8 owners, manager scoping (the dev manager sees E1006, E1002),
+employee detail resolves owner-backed managers through `REPORTS_TO` (E1001 → Priya Menon), task items keep their owners.
+(The first smoke run hit a race in the rules-rollback check, unrelated to A1: it accepted the open version while it was
+still a draft. Fixed in `smoke.py`; the re-run passed.)
+
+**Rollback drill:**
+1. Through the app as HR Ops: imported owner `drill.owner@azentio.local`, edited the `intern` template subject.
+   The Owner projection picked up the new owner at once.
+2. Stopped the backend, ran `graph_migration rollback A1`: Owner ok 9 / 9, EmailTemplate ok 4 / 4, checksums equal. The
+   graph's `intern` template carried the edited subject.
+3. Restarted: cut over again at 03:09:56 UTC, Owner 9 / 9 and EmailTemplate 4 / 4, parity ok, drift ok.
+4. Put the dev data back (template from the seed, drill owner removed and re-projected); drift ok afterwards.
+
+**Sign-off:** dev ✓. CI on the PR covers `test_phase3` (A1 section and API contract).
+
+### A2: Policy (dev stack, 2026-11-02)
+
+**Before** (graph / Postgres): Policy 7 / 0, graph sha `7214fd3b…`; 31 `PolicyChunk` nodes (they stay). `BGSAVE` first.
+
+**Cutover** at startup, 03:37:03 UTC:
+
+| Label | source | graph | pg | parity | unmapped keys | read paths left | drift since cutover |
+|---|---|---|---|---|---|---|---|
+| Policy | postgres | 7 | 7 | ok | none | none | ok |
+
+**Freeze evidence** (after the drill's re-cutover): `single_writer: true`, `watched_seconds: 15`,
+`recent_stopped_heartbeats: ["DESKTOP-968RPED:23400"]` (the instance stopped for the drill).
+
+**Feature smoke:** `scripts/smoke.py` passes for every role. Through the app (HR Ops): a policy upload on `/api/ingest`
+lands in `policies` and `/api/policies`, with no new `Policy` node in the graph. `chat.retrieve("drill parking allowance")`
+returns `a2-drill-policy.md § Drill section` first. The portal shows the policy text on E1001's acknowledgement items
+(`infosec_ack`, `coc_ack`; `nda_ack` has no `policy_ref` in the seed rules, as before).
+
+**Rollback drill:**
+1. Uploaded `a2-drill-policy.md` through the app.
+2. Stopped the backend and ran `graph_migration rollback A2`: Policy ok 8 / 8, checksums equal, and the drill policy is a
+   graph node again.
+3. Restarted: cut over again at 03:38:23 UTC, 8 / 8, parity ok, drift ok.
+4. Removed the drill policy from `policies` and its chunks. Its stale graph node stays until PR E's cleanup, so drift
+   stays ok.
+
+**Sign-off:** dev ✓. CI on the PR covers `test_phase3` (A2 section and API contract).
+
+### Fresh install and wiped graph (throwaway stack, 2026-11-02)
+Run on a separate database and graph (`azentio_fresh` / `fresh`, port 8001, Gmail off), after A2:
+- **Fresh install:** A1 and A2 cut over on empty stores (0 / 0). The seed then wrote 8 owners, 4 templates and 7 policies to
+  Postgres, projected 8 `Owner` nodes and built 31 `PolicyChunk` nodes, with no `EmailTemplate` or `Policy` nodes. 22 API and
+  state checks passed: role gates, the audited template save, and quick onboard picking the manager from `owners`.
+- **Wiped graph:** edited a template, an owner and a joiner's name, stopped, ran `GRAPH.DELETE fresh`, and restarted.
+  Every edit survived. The projection was rebuilt from Postgres (7 employees, 101 items, 20 documents, matching
+  `HAS_DOC`/`SUBMITTED` and `REPORTS_TO` edges), the index was rebuilt (31 chunks), drift was ok, and the same 22
+  checks passed. Before the seed fix, this reset all three edits to the seed values.
+
+### Deep test of A1 + A2 + A3 together (throwaway stack, 2026-11-02)
+Database `azentio_deep`, graph `deep`; the previous release ran from a `main` worktree.
+
+| Step | Result |
+|---|---|
+| Baseline: ruff, guard + selftest, `test_core`, `test_phase0..3`, `tsc`, `eslint` | pass |
+| Upgrade `main` → A3 with HR edits made on `main` (template, mixed-case owner email, policy) | A1, A2, A3 cut over in one start, before the worker; parity, schema and read paths clean; edits served; new joiner `REPORTS_TO` the `main`-era owner; retrieval finds the `main`-era policy |
+| Writes on the new release (template, owner, policy, a two-approver rule version published) | pass |
+| Full rollback (`rollback A3`, `A2`, `A1`), then start `main` on the same data | each rollback at parity; `main` serves every new-release edit and rule set v2 |
+| Re-upgrade after an edit on `main` | clean second cutover of all three; the edit carried over |
+| Two instances started at once | one cut over; the other refused ("another instance is cutting over… nothing was switched"); restarted, it found nothing pending |
+| Wiped graph after an upgrade | edits kept, projection rebuilt, no false drift |
+| Dev stack: `smoke.py`, drift, `/ready` | pass |
+
+**Independent review:** 8 findings; 7 fixed with regression tests in `test_phase3`, 1 noted:
+1. An upgrade from before rule-set versions would have published the sample rules over HR's own: `seed_rules` now
+   builds v1 from the archived graph rules (`policy.legacy.archived_requirements`).
+2. A lost graph with no employees never re-projected owners: every start now refreshes the `Owner` projection.
+3. A legacy mixed-case `Owner` node passed parity (case-folded), and the next owner write would drop it and its
+   edges: a projection label's cutover now rebuilds the projection once.
+4. A wiped graph reported drift on retired labels forever: an emptied retired label isn't drift.
+5. A CSV `compliance` cell of "false", "no" or "0" counted as true: it's parsed as text now.
+6. Noted, not changed: an owner import commits, then refreshes the graph. With FalkorDB down it returns 500 after
+   saving. That's the same pattern as every employee write; the next start's owner refresh heals the projection.
+7. One failing spec module left a silently partial registry: `load()` now marks itself loaded only after every module
+   imports.
+8. The loser of a first-run import race reported rows imported and re-ran checklists: it now returns `imported: 0` and
+   does nothing.
+
+### B: Event, GuardrailEvent, EvalRun, EvalResult (dev stack, 2026-11-02)
+
+**Before** (graph / Postgres): Event 434 / 0 (sha `d4a74973…`), GuardrailEvent 1 / 0, EvalRun 2 / 0, EvalResult 25 / 0.
+`BGSAVE` first.
+
+**Cutover** at startup, 09:46:39 UTC:
+
+| Label | source | graph | pg | parity | unmapped keys | read paths left | drift since cutover |
+|---|---|---|---|---|---|---|---|
+| Event | postgres | 434 | 434 | ok | none | none | ok |
+| GuardrailEvent | postgres | 1 | 1 | ok | none | none | ok |
+| EvalRun | postgres | 2 | 2 | ok | none | none | ok |
+| EvalResult | postgres | 25 | 25 | ok | none | none | ok |
+
+**Feature smoke:**
+- `scripts/smoke.py` passes for every role, including `/activity` and the AI quality page.
+- By API:
+  - HR Ops sees 50 activity rows with names. The dev manager sees only E1002 and E1006.
+  - E1001's timeline has 75 events, newest first.
+  - `/api/quality` lists the runs and the guardrail counts.
+- Writes through the app:
+  - A prompt-injection message to E1001's portal assistant was blocked and counted (`prompt_injection` 1 → 2).
+  - An NDA acknowledgement added an event. Postgres went to 435; the graph stayed at 434.
+
+**Rollback drill:**
+1. Stopped the backend and ran `graph_migration rollback B`: Event 435 / 435, GuardrailEvent 2 / 2, EvalRun 2 / 2,
+   EvalResult 25 / 25, all ok. The new event and guardrail hit are in the graph.
+2. Restarted: cut over again at 09:48:36 UTC, parity ok, drift ok.
+3. All nine Phase 3 labels so far are on `postgres` at parity. Freeze evidence: `single_writer: true`. The stopped
+   instance's heartbeat was already older than 60 s, so there was nothing to watch.
+
+**Throwaway deep run:**
+- `main` → B: A1, A2, A3 and B cut over in one start. The `main`-era events and guardrail hit carried over.
+- An eval run started through `/api/quality/eval` finished 20/20 on the new storage and became the latest run.
+  (The throwaway instance still reached a free-tier model with the API keys blanked. Eval runs belong on a throwaway
+  stack anyway, never on the dev data.)
+- A full rollback (B, A3, A2, A1) followed, then `main` on the same data. `main` showed the run with its 20 results, the
+  run's guardrail hits and all the activity.
+- Re-upgrade: four clean cutovers.
+
+**Sign-off:** dev ✓. CI on the PR covers `test_phase3` (B section and API contract).

@@ -4,7 +4,7 @@ Input: block prompt-injection attempts and oversized messages before any LLM cal
 Output: after the stream, check that policy citations match a section that was actually retrieved and that no
 email address appears that wasn't in the context; on a hit, a visible note is appended to the answer.
 
-Every hit is stored as a (:GuardrailEvent) with the rule and surface only, never the message text, so the
+Every hit is stored as a row in `guardrail_events` (Postgres) with the rule and surface only, never the message text, so the
 quality dashboard can count them without holding employee data.
 
 ponytail: regex heuristics, no classifier model. They catch the common phrasings, not a determined attacker;
@@ -14,8 +14,10 @@ classifier (e.g. Llama Guard via the same OpenAI-compatible client) if blocked-r
 import re
 import time
 
+import graph_migration as gm
 import logging_setup as ls
-from graph import q, new_id
+from graph import new_id
+from shared import db
 
 log = ls.get("guardrails")
 MAX_CHARS = 2000
@@ -38,9 +40,30 @@ OUTPUT_NOTE = ("\n\n_Note: part of this answer could not be checked against an a
 
 
 def record(surface: str, rule: str, action: str) -> None:
-    q("CREATE (g:GuardrailEvent {id:$id, ts:$ts, surface:$s, rule:$r, action:$a})",
-      id=new_id("gr"), ts=time.time(), s=surface, r=rule, a=action)
+    db.execute("INSERT INTO guardrail_events (id, ts, surface, rule, action) VALUES (%s, %s, %s, %s, %s)",
+               (new_id("gr"), time.time(), surface, rule, action))
     ls.log_event(log, "guardrail.hit", surface=surface, rule=rule, action=action)
+
+
+def by_rule(since: float) -> list[dict]:
+    return db.fetch("""SELECT rule, action, count(*)::int AS n FROM guardrail_events WHERE ts > %s
+                       GROUP BY rule, action ORDER BY n DESC, rule""", (since,))
+
+
+def recent(limit: int = 25) -> list[dict]:
+    return db.fetch("SELECT * FROM guardrail_events ORDER BY ts DESC LIMIT %s", (limit,))
+
+
+def _canon(r: dict) -> dict:
+    return {"id": r["id"], "ts": gm.epoch(r.get("ts")), "surface": r.get("surface") or "", "rule": r.get("rule") or "",
+            "action": r.get("action") or ""}
+
+
+gm.register(gm.LabelSpec(
+    label="GuardrailEvent", batch="B", table="guardrail_events",
+    to_row=lambda p: {**_canon(p), "ts": float(p.get("ts") or 0)}, canonical=_canon,
+    from_row=lambda r: {**_canon(r), "ts": r["ts"]},
+    mapped_keys=frozenset({"id", "ts", "surface", "rule", "action"})))
 
 
 def check_input(message: str, history: list[dict]) -> tuple[str, str] | None:

@@ -113,12 +113,12 @@ def push_employee(eid: str):
         e = records.employee(eid)
         if e.get("integration_id"):  # the integration creates this employee after HR approval
             return
-        mgr = q1("MATCH (m:Owner) WHERE toLower(m.email)=$m RETURN m.name AS n", m=e.get("manager_email", "")) or \
-            ({"n": r["name"]} if (r := records.employee_by(email=e.get("manager_email") or "")) else None)
+        import owners
+        mgr = owners.get(e.get("manager_email") or "") or records.employee_by(email=e.get("manager_email") or "")
         first, _, last = e["name"].partition(" ")
         values = {"first_name": first, "last_name": last or first, "work_email": e["email"], "job_title": e["role"],
                   "department_name": e["department"], "grade": e["grade"], "location": e["location"],
-                  "manager_name": mgr["n"] if mgr else "", "start_date": e["joining_date"], "employee_number": e["id"]}
+                  "manager_name": mgr["name"] if mgr else "", "start_date": e["joining_date"], "employee_number": e["id"]}
         rid, outcome = HrPortal().upsert_record(iid, values, "update")
         q("MATCH (e:Employee {id:$e})-[s:SYNCED_TO]->() DELETE s", e=eid)
         q("MATCH (e:Employee {id:$e}), (r:Record {id:$r}) CREATE (e)-[:SYNCED_TO]->(r)", e=eid, r=rid)

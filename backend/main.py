@@ -21,9 +21,13 @@ import chat  # noqa: E402
 import logging_setup as ls  # noqa: E402
 import checklist  # noqa: E402
 import gmail  # noqa: E402
+import events as events_store  # noqa: E402  (the route below is named events)
 import ingest  # noqa: E402
+import owners  # noqa: E402
 import pipeline  # noqa: E402
+import policies as policies_store  # noqa: E402  (the route below is named policies)
 import records  # noqa: E402
+import templates as templates_store  # noqa: E402  (the route below is named templates)
 from graph import q, q1, event  # noqa: E402
 from identity import perms, service as identity  # noqa: E402
 from shared import bootstrap, db, jobs  # noqa: E402
@@ -222,7 +226,6 @@ def employee_detail(eid: str):
     items = items_with_state(eid)
     from documents import store as docs
     unmatched = [_doc(d) for d in docs.unmatched(eid)]
-    events = q("MATCH (v:Event {employee_id:$e}) RETURN v ORDER BY v.ts DESC LIMIT 100", e=eid)
     manager = q1("MATCH (:Employee {id:$e})-[:REPORTS_TO]->(m) RETURN m", e=eid)
     accepted = {}
     for i in items:  # structured HR record populated from accepted document extractions
@@ -232,7 +235,7 @@ def employee_detail(eid: str):
                     if v and not k.startswith("_") and k not in ("confidence", "notes", "legible", "doc_type"):
                         accepted.setdefault(k, {"value": v, "source": i["name"]})
     return {"employee": e, "items": items, "summary": summarize(items), "flags": flags(eid, items),
-            "unmatched_documents": unmatched, "events": [r["v"] for r in events],
+            "unmatched_documents": unmatched, "events": events_store.for_employee(eid),
             "manager": manager["m"] if manager else None, "hr_record": accepted}
 
 
@@ -367,9 +370,8 @@ async def poll_now():
 
 @app.get("/api/events")
 def events(limit: int = 50):
-    rows = q("""MATCH (v:Event) OPTIONAL MATCH (e:Employee {id:v.employee_id})
-                RETURN v, e.name AS name, e.manager_email AS mgr ORDER BY v.ts DESC LIMIT $l""", l=limit)
-    return [{**r["v"], "employee_name": r["name"]} for r in rows if _visible({"manager_email": r["mgr"]})]
+    rows = events_store.recent(limit)
+    return [{k: v for k, v in r.items() if k != "manager_email"} for r in rows if _visible({"manager_email": r["manager_email"]})]
 
 
 @app.get("/api/documents/{doc_id}/file")
@@ -406,7 +408,7 @@ async def ingest_file(kind: str = Form(...), file: UploadFile = File(...)):
 
 @app.get("/api/templates")
 def templates():
-    return [r["t"] for r in q("MATCH (t:EmailTemplate) RETURN t ORDER BY t.id")]
+    return templates_store.all()
 
 
 class Template(BaseModel):
@@ -418,8 +420,9 @@ class Template(BaseModel):
 
 @app.put("/api/templates/{tid}")
 def save_template(tid: str, t: Template):
-    audit.record_audit("template.saved", "email_template", tid, f"Saved email template {t.name}")
-    q("MERGE (x:EmailTemplate {id:$id}) SET x.name=$n, x.subject=$s, x.body=$b", id=tid, n=t.name, s=t.subject, b=t.body)
+    with db.tx() as c:
+        templates_store.upsert({**t.model_dump(), "id": tid}, conn=c)
+        audit.record_audit("template.saved", "email_template", tid, f"Saved email template {t.name}", conn=c)
     return t
 
 
@@ -427,18 +430,18 @@ def save_template(tid: str, t: Template):
 def rules():
     """The active rule-set version. Rules change only through /api/policy (draft -> approve -> publish)."""
     from policy import store
-    act = store.ensure_active()
+    act = store.active_version()
     return {"rules": checklist.load_rules(), "doc_types": checklist.config("doc_types"),
             "departments": checklist.config("departments"), "locations": checklist.config("locations"),
             "roles": checklist.config("roles") or [],
-            "owners": [r["o"] for r in q("MATCH (o:Owner) RETURN o ORDER BY o.type")],
+            "owners": owners.all(),
             "version": {"id": act["id"], "number": act["number"], "published_at": act["published_at"],
                         "author_email": act["author_email"]} if act else None}
 
 
 @app.get("/api/policies")
 def policies():
-    return [r["p"] for r in q("MATCH (p:Policy) RETURN p ORDER BY p.source")]
+    return policies_store.all()
 
 
 # ---------- employee portal ----------
@@ -447,7 +450,7 @@ def policies():
 def portal(token: str):
     e = emp_by_token(token)
     items = items_with_state(e["id"])
-    pol = {r["s"]: r["t"] for r in q("MATCH (p:Policy) RETURN p.source AS s, p.text AS t")}
+    pol = policies_store.texts()
     for i in items:
         i["policy_text"] = pol.get(i.get("policy_ref", ""), "") if i["kind"] == "ack" else ""
         i.pop("owner_email", None)
@@ -518,12 +521,12 @@ async def create_joiner(f: dict, template_id: str, send: bool, reason: str, cand
     """Shared by quick onboard and connector 'Start onboarding': validate, create, build checklist, optionally email."""
     preset = next((r for r in checklist.config("roles") or [] if r["role"] == f.get("role")), {})
     department = f.get("department") or preset.get("department", "")
-    manager = f.get("manager_email") or (q1("MATCH (o:Owner {type:'manager', department:$d}) RETURN o.email AS e", d=department) or {}).get("e", "")
+    manager = f.get("manager_email") or owners.manager_for(department)
     row = {"name": (f.get("name") or "").strip(), "email": (f.get("email") or "").strip(), "role": f.get("role", ""),
            "location": f.get("location", ""), "joining_date": f.get("joining_date", ""),
            "grade": f.get("grade") or preset.get("grade", ""), "department": department, "manager_email": manager,
            "date_of_birth": f.get("date_of_birth") or ""}
-    managers = {r["m"] for r in q("MATCH (m:Owner) RETURN toLower(m.email) AS m")} | records.emails()
+    managers = owners.emails() | records.emails()
     valid, errors = ingest.validate_employees([row], checklist.config("departments") or [], checklist.config("locations") or {}, managers)
     if errors:
         raise HTTPException(400, {"message": "Please fix the highlighted fields", "errors": errors})

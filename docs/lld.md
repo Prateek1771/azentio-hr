@@ -218,6 +218,13 @@ Two stores. Postgres is the system of record for everything built in Phases 0 to
 | `item_notices` (Phase 1) | `employee_id, version_id (PK together), sent_at` | One "new requirements" notice per joiner per published version |
 | `documents` (Phase 2) | `id, employee_id, item_id (NULL = not on the checklist), filename, path, mime, size, sha256, source, status (Submitted, Under Review, Accepted, Correction Requested, Rejected), doc_type, tier, confidence, extracted, issues, checks (jsonb), model, prompt_version, policy_version_id, current_decision_id, received_at, decided_at, extra` | Documents. `status` is the result of the current decision, never set on its own |
 | `document_mismatches` (Phase 2) | `document_id, field (PK together), expected, found` | Replaces the graph's `MISMATCH` edges |
+| `owners` (Phase 3 A1) | `email (PK, lowercase), name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | Department owners and managers. `owners.py` is the only reader and writer; each write re-projects graph `Owner` nodes (`records.project_owners`) |
+| `policies` (Phase 3 A2) | `source (PK), title, text` | Uploaded policy and process documents. `policies.py` is the only reader and writer; `chat.index_chunks` builds the graph's `PolicyChunk` index from them, and `chat.reindex_policies` rebuilds it in full |
+| `legacy_rules`, `legacy_config` (Phase 3 A3) | `id, props (jsonb)` / `key, value` | Archive of the retired graph `Rule`/`Config` nodes, only for `graph_migration rollback A3`; nothing reads them. Dropped in PR E |
+| `events` (Phase 3 B) | `id, employee_id ('' = system), kind, message, ts (epoch seconds)` | The activity timeline. Written only through `graph.event()` → `events.record`; read by the activity page, employee timelines and the HR co-pilot |
+| `guardrail_events` (Phase 3 B) | `id, ts, surface, rule, action` | Guardrail hits (`guardrails.record`), no message text |
+| `eval_runs`, `eval_results` (Phase 3 B) | run: `id, ts, status, judge, model, summary (jsonb), done, total, finished, error`; result: `id, run_id, n, question, reference, answer, ms, guardrail_ok, answered, faithfulness, context_precision, context_recall, sources (jsonb)` | Assistant evaluation runs (`evals.py`). Readers drop NULLs, so a missing metric is an absent key, as it was in the graph |
+| `email_templates` (Phase 3 A1) | `id (PK), name, subject, body` | HR-editable Jinja templates. `templates.py` is the only reader and writer; the graph no longer holds them |
 | `doc_decisions` (Phase 2) | `id, document_id, kind (auto_accept, auto_correction, routed_review, human_accept, human_reject, human_correction, human_override, spot_check_pass, spot_check_fail, backfill, demo_seed), decided_by (NULL = system), reason_code, reason_text, status_after, model, prompt_version, confidence, tier, threshold, policy_version_id, checks, extracted, corrected_fields, work_item_id, idempotency_key (unique), at` | Append-only decision history with provenance. Triggers refuse UPDATE/DELETE and any `auto_accept` of a `high` tier. Human and spot-check rows need a user and a reason (CHECK) |
 
 On `items`, trigger `items_status_from_document` (migration 010) refuses a document item status that no document of that item backs: only `Not Submitted`, `Cancelled`, or `doc_item_status(document.status)` of one of its documents is allowed (the one-time graph backfill sets `azentio.backfill` to copy history). `rule_set_versions.config.doc_policy` (Phase 2) holds the document tiers and thresholds; a trigger freezes `config` once a version leaves draft. **Planned:** connectors, integrations and runs (Phase 3). Schemas are in the [phase plans](plans/).
@@ -250,13 +257,13 @@ Integration nodes link by id properties rather than edges, because each one is r
 |---|---|---|
 | `Employee` | `id, name, email, role, grade, department, location, manager_email, joining_date, date_of_birth, token, thread_id` | A joiner. `token` grants portal access; `thread_id` links their Gmail thread. |
 | `Item` | `id, employee_id, key, name, kind (document, task, ack), category, rule_id, reason, policy_ref, due, status, owner_name, owner_email, auto, depends[]` | One checklist entry, with the reason it exists |
-| `Rule` | `id, item, name, kind, category, match (json), offset_days, depends_on[], description, policy_ref, auto, ord` | A requirement rule, editable by HR |
+| `Rule` | `id, item, name, kind, category, match (json), offset_days, depends_on[], description, policy_ref, auto, ord` | **Retired** (Phase 3 A3): rules live in rule-set versions. The last graph copy is archived in `legacy_rules` for rollback only |
 | `Document` | `id, employee_id, filename, path, mime, size, source (email, portal), status, extracted (json), issues (json), confidence, doc_type, ts` | One received file and its verification result |
-| `Owner` | `email, name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | Department owners and managers |
-| `Event` | `id, employee_id, kind, message, ts` | Audit and activity log, including AI model and token usage |
-| `Config` | `key (departments, locations, doc_types, roles), value (json)` | Reference data |
-| `EmailTemplate` | `id, name, subject, body` | HR-editable Jinja templates |
-| `Policy` / `PolicyChunk` | `source, title, text` / `source, section, text, embedding?` | Approved policy text, chunked by `##` section |
+| `Owner` | `email, name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | **Projection** of the `owners` table (Phase 3 A1), refreshed by `records.project_owners`; the target of `OWNED_BY` and `REPORTS_TO` |
+| `Event` | `id, employee_id, kind, message, ts` | **Retired** (Phase 3 B): the `events` table is the record |
+| `Config` | `key (departments, locations, doc_types, roles), value (json)` | **Retired** (Phase 3 A3): the active version's `config` holds it. Archived in `legacy_config` for rollback only |
+| `EmailTemplate` | `id, name, subject, body` | **Retired** (Phase 3 A1): stale nodes stay until PR E's cleanup; the `email_templates` table is the record |
+| `Policy` / `PolicyChunk` | `source, title, text` / `source, section, text, embedding?` | `Policy` is **retired** (Phase 3 A2; the `policies` table is the record, stale nodes go in PR E's cleanup). `PolicyChunk` is the retrieval index, chunked by `##` section and rebuilt from `policies` |
 | `Connector` | `key, name, role (source, target), record_kind, demo, description` | Connector catalog |
 | `ConnectorInstance` | `id, key, name` | This workspace's use of a connector |
 | `Record` | `id, instance_id, kind, values (json), created, updated` | A candidate or HR Portal employee |
@@ -269,8 +276,8 @@ Integration nodes link by id properties rather than edges, because each one is r
 | `AgentMessage` | `integration_id, role, content, ts` | The setup chat history |
 | `OutboundMessage` | `integration_id, item_id, kind, to, subject, content, attempt, delivered_by (gmail, simulated), provider_ref` | Every email an integration sent, exactly as sent |
 | `AuditLog` | `action, entity_type, entity_id, summary, actor, ts` | **Legacy.** No longer written. Bootstrap copies these rows once into the Postgres chain (§10.4) |
-| `GuardrailEvent` | `surface, rule, action (blocked, flagged), ts` | A guardrail hit. Rule and surface only, no message text |
-| `EvalRun` / `EvalResult` | run: `status, judge, model, done, total, summary (json)`; result: `question, reference, answer, sources, faithfulness, context_precision, context_recall, guardrail_ok` | Ragas evaluation history |
+| `GuardrailEvent` | `surface, rule, action (blocked, flagged), ts` | **Retired** (Phase 3 B): the `guardrail_events` table |
+| `EvalRun` / `EvalResult` | run: `status, judge, model, done, total, summary (json)`; result: `question, reference, answer, sources, faithfulness, context_precision, context_recall, guardrail_ok` | Ragas evaluation history **Retired** (Phase 3 B): `eval_runs` / `eval_results` are the record. |
 
 Relationship properties: `MISMATCH {field, expected, found}`.
 
@@ -416,7 +423,7 @@ sequenceDiagram
     BE->>LLM: system: answer only from context, cite [policy § section] or [checklist], else say "I don't know" + HR contact
     LLM-->>J: streamed answer
     BE->>BE: output guardrails (citations retrieved? emails known?) → note appended on a hit
-    BE->>G: Event (model, tokens), GuardrailEvent on a hit
+    BE->>PG: event (model, tokens), guardrail_events row on a hit
 ```
 
 ### 5.9 HR co-pilot (whole-organisation context)
@@ -548,10 +555,10 @@ A later upload never downgrades an item that is already *Accepted*.
 Seeded rules cover identity and address (everyone), PAN and bank (India), education (Engineering), experience letter (G3+), I-9 and W-4 (US), BGV, HR record, laptop, email account, badge, orientation, infosec and code-of-conduct acknowledgements, developer tools (Engineering) and CRM (Sales). `R-ID`, `R-I9` and `R-BGV` are flagged `compliance`.
 
 ### 6.1 Rule-set versions (Built, Phase 1; [ADR 0009](adr/0009-governed-policy-versions.md))
-- A version is a snapshot of **all** rules plus the engine config (`doc_types`, `locations`, `departments`, `roles`). Owners are directory data and stay live in the graph.
+- A version is a snapshot of **all** rules plus the engine config (`doc_types`, `locations`, `departments`, `roles`). Owners are directory data and stay live (`owners` table, Phase 3).
 - `checklist.load_rules()` and `config()` read the active version (`policy/store.ensure_active()` creates v1 from the legacy graph rules the first time, so behaviour didn't change).
 - Exactly one version is `active` and at most one is open (`draft`, `pending_approval` or `approved`); partial unique indexes enforce both. The `rules_frozen` trigger refuses writes to any version that isn't a draft.
-- Requirement uploads on **Add joiners** become a draft (`ingest.import_requirements_draft`); they never go live directly.
+- A requirements file enters only through `ingest.import_requirements`. On a fresh install (no active version) it becomes v1 directly (the seed does this, authored by `system`). Once a version is active, an upload on **Add joiners** becomes a draft (`import_requirements_draft`) and never goes live directly. Rows without a `compliance` value take `COMPLIANCE_DEFAULT`, so re-importing a file doesn't strip the flags.
 
 ### 6.2 Workflow (`policy/service.py`)
 ```
@@ -612,7 +619,7 @@ Typical usage measured in testing: extraction about 2.3k tokens, an employee ans
 | Output | An email address that isn't in the context | Note appended |
 | Output | The system prompt echoed back | Note appended |
 
-Every hit is stored as a `GuardrailEvent` (surface and rule only, no text) and counted on the AI quality page. The checks are regex heuristics: they catch common phrasings, not a determined attacker. The real protection is that each assistant only sees its own user's context. A classifier model (for example Llama Guard on the same client) is the upgrade if the hit data shows it's needed.
+Every hit is stored as a `guardrail_events` row (surface and rule only, no text) and counted on the AI quality page. The checks are regex heuristics: they catch common phrasings, not a determined attacker. The real protection is that each assistant only sees its own user's context. A classifier model (for example Llama Guard on the same client) is the upgrade if the hit data shows it's needed.
 
 ### 7.2 Evaluation (`evals.py`)
 - **Question set:** `seed/eval_assistant.json` has 20 policy questions with reference answers, asked as a seeded engineer in Bengaluru, plus 3 attack prompts.
@@ -622,7 +629,7 @@ Every hit is stored as a `GuardrailEvent` (surface and rule only, no text) and c
   - Context precision: the retrieved sections are relevant.
   - Context recall: retrieval found everything the reference needs.
 - **No-model checks:** the share of attack prompts blocked, and the share of answers that pass the output guardrails.
-- **Storage and display:** results are stored as `EvalRun` and `EvalResult` and shown on `/quality` with trend lines and the change since the last run.
+- **Storage and display:** results are stored in `eval_runs` and `eval_results` (Postgres, Phase 3 B) and shown on `/quality` with trend lines and the change since the last run.
 - **Failures:** a judge that returns bad JSON costs that one score, not the run. Questions the assistant couldn't answer (outage or rate limit) aren't scored, and a run where it answered nothing is marked failed.
 - **Judge choice:** free models make noisy judges, and a full run makes about 80 model calls, more than OpenRouter's free daily limit of 50. Set a stronger paid judge for steady numbers.
 - **Not covered:** document extraction and the setup agent aren't scored with Ragas. A gold set with exact field matching, and scripted tool-call conversations, fit them better.
@@ -1038,7 +1045,7 @@ Every route needs a signed-in session, except `/api/auth/login` and `/api/portal
 
 **Run** (see the README for full steps): `docker compose up -d` (Postgres and FalkorDB) → `cd backend && uv run uvicorn main:app --port 8000` → `cd frontend && npm run dev`, then sign in at `/login`.
 
-On start, the backend bootstraps itself (§12.1): migrations, the admin and dev accounts, and the legacy audit import. It then seeds joiners, owners, rules, roles, templates, policies and connectors into the graph. Seeding is additive and skips anything already present.
+On start, the backend bootstraps itself (§12.1): migrations, the admin and dev accounts, and the legacy audit import. It then seeds joiners, owners, rules, roles, templates, policies and connectors. Seeding decides "first run" per record type from Postgres (no employees, no owners, no templates, no policies, no active rule set), never from the graph: a lost or wiped graph never re-seeds over HR's data. Instead, if Postgres has employees but the graph has none, it rebuilds the projection (`records.rebuild_graph`), and if `policies` has rows but there are no chunks, it rebuilds the index (`chat.reindex_policies`).
 
 **Configuration** (`.env`):
 | Area | Variables |

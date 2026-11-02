@@ -352,7 +352,7 @@ async def notify_job(job: dict) -> None:
 
 def replay_one(eid: str, reason: str | None = None) -> dict:
     """Apply the active version to one joiner now. A direct HR action is itself the human decision: no near-start gate."""
-    act = store.ensure_active()
+    act = store.active_version()
     if not act:
         return {}
     rules, config = store.load_version(act["id"])
@@ -393,7 +393,7 @@ DEMO_NDA = {"id": "R-NDA", "item": "nda_ack", "name": "Confidentiality (NDA) ack
 
 def seed_demo() -> None:
     """Dev only, once: v2 pending with one of its two approvals, so the governance screens aren't empty."""
-    act = store.ensure_active()
+    act = store.active_version()
     if not act or db.fetch1("SELECT 1 AS x FROM rule_set_versions WHERE number > 1"):
         return
     hr = db.fetch1("SELECT id, email, role::text AS role FROM users WHERE email='hrops@azentio.local'")
