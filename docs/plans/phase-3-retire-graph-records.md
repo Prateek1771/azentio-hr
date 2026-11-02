@@ -1,6 +1,6 @@
 # Phase 3: Retire graph record storage
 
-- **Status:** in progress. PR 0 (tooling) is done; batches A1 → E follow, one PR each.
+- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config), B (activity) and C (connectors) are done; D and E follow, one PR each.
 - **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
 - **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
 - **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
@@ -31,6 +31,130 @@
   heartbeat, a stopped one, a held lock), refusal when not clean, cutover, idempotency, drift, the report, and a
   rollback round trip that includes rows written after cutover, and refusal to roll back while the app is live.
 
+## As built: batch A1 (owners, email templates)
+- **Changed from the plan:** `Config` moved from A1 to **A3**. Its only reader that matters is `policy.store.ensure_active`
+  building v1 from graph `Rule` + `Config` on a fresh install, and its only writer is `ingest.import_requirements`.
+  Retiring it means rewriting that import flow, which is A3, so A3 retires `Rule` and `Config` together.
+- Migration `011_owners_templates.sql`: `owners` (email PK, lowercase CHECK) and `email_templates`. The columns are exactly
+  the old graph properties, so `/api/templates` and `/api/rules.owners` keep their shape (the contract check passes).
+- `owners.py` (`all`, `get`, `emails(type)`, `by_category`, `manager_for`, `upsert`) and `templates.py` (`all`, `get`,
+  `upsert`) are the only readers and writers. Each registers its `LabelSpec`; `graph_migration.SPEC_MODULES` lists the
+  modules and `load()` imports them on first use (bootstrap, CLI, `/api/admin/migration`).
+- `Owner` stays in the graph as a **projection**: `records.project_owners()` MERGEs every owner from Postgres and deletes
+  the rest. It runs after every `owners.upsert` and at the start of a full `rebuild_graph()`. It never wipes the graph
+  from an empty table (a release before the cutover).
+- The engine got two small additions: `LabelSpec.graph_query` defaults to `MATCH (n:<label>) RETURN n`, built in the
+  engine, so the owning module isn't itself a read path. `LabelSpec.projection=True` makes drift compare the graph with
+  Postgres *now*, because a projection legitimately changes after cutover.
+- The CLI (`python -m graph_migration`) calls the imported module, not `__main__`, so it sees the registered specs.
+- The template save now writes the row and its audit entry in one transaction.
+- `test_phase3` A1 section: the old release's graph data, a clean cutover, reads from Postgres (`manager_for`,
+  `by_category`, `gmail.render`), the projection following app writes, drift on a stray template write and on an
+  out-of-step projection, `rebuild_graph` repairing it, then rollback (the new rows reach the graph) and a second cutover.
+- Dev cutover, freeze and rollback drill: see the runbook's A1 section.
+
+## As built: batch A2 (policies)
+- Migration `012_policies.sql`: `policies (source PK, title, text)`, exactly the old graph properties (contract unchanged).
+- `policies.py` (`all`, `texts`, `upsert`, `title_of`) is the only reader and writer, and registers the `Policy` spec.
+- `chat.index_policy` stores the upload in `policies`, then `index_chunks` rebuilds that file's `PolicyChunk` nodes (the
+  old chunk/embed code, unchanged). It no longer writes `Policy` nodes; the stale ones go in PR E's cleanup.
+- `chat.reindex_policies()` rebuilds the whole index from the table. `ingest.seed` calls it when `policies` has rows
+  but the graph has no chunks, so a wiped graph heals its index on restart. PR E's `rebuild_graph` will call it too.
+- `/api/policies` and the portal's acknowledgement text read the table.
+- `test_phase3` A2 section: cutover, reads, an upload that writes the table and chunks but no `Policy` node, drift on a
+  stray write, a wiped index rebuilt with the same retrieval results, then rollback and a second cutover.
+- **Found in depth testing: a wiped graph re-seeded over Postgres.** `ingest.seed` decided "first run" from a graph
+  `Config` node. Once the graph stopped being the record, losing the graph reset HR's edited templates and owners
+  (A1) and the seeded joiners' fields (since Phase 1) to the seed files. Now each record type is seeded only when its
+  Postgres table is empty, rules only when there's no active version. A lost graph is detected *before* anything
+  writes (a rule replay would project single employees and hide the loss), and the projection is rebuilt instead.
+  `test_phase3` "wiped graph" section: HR edits kept, nothing re-seeded, `REPORTS_TO`→`Owner` and the policy index
+  rebuilt, no drift. This was also run end to end on a throwaway instance: fresh install, then edits, a
+  `GRAPH.DELETE`, and a restart. All 7 employees, 101 items, 20 documents and their edges came back from Postgres.
+
+## As built: batch A3 (legacy rules and config)
+- `ingest.import_requirements(filename, data, user=None)` is the one way in. With no active version (a fresh install), it
+  creates v1 directly under the existing `pg_advisory_xact_lock(7243010)`, audited `policy.published` (actor `system`
+  without a user). With an active version, it opens a governed draft (`import_requirements_draft`, unchanged), and it
+  refuses without a user. Both share `_parse_requirements`.
+- **Changed from before:** rows without a `compliance` value take `store.COMPLIANCE_DEFAULT` in both paths. Before, an
+  imported draft cleared the flags, so re-importing the same file showed R-ID/R-I9/R-BGV as changed and needed two
+  approvals.
+- `policy.store.ensure_active` (v1 from graph `Rule` + `Config`) is deleted; its callers use `active_version()`.
+  `checklist.config` reads only the active version. `seed` gates on `active_version()`, and the `Config roles` top-up is
+  gone. `graph.ensure_indexes` no longer indexes `Rule`.
+- Graph `Rule`/`Config` are **removed**, but archived first: migration 013 adds `legacy_rules (id, props jsonb)` and
+  `legacy_config (key, value)`. The specs live in `policy/legacy.py`. The cutover copies the nodes there, and
+  `rollback A3` writes them back for the previous release. Nothing reads the tables; PR E drops them.
+- `test_core` creates v1 through the import instead of MERGEing `Config` nodes. `test_phase1`'s v1 check is now
+  `v1_created_by_import`. `test_phase3` A3 section: cutover, v1 from the import (rules, compliance, config,
+  audited as system), no graph writes, a draft with a user, a refusal without one or with a draft open, drift on a stray
+  write, then rollback (a deleted node comes back) and a second cutover.
+
+- **Deep test (A1–A3 together), fixes:** `ingest.seed_rules()` decides the first rule set: the archived graph rules on
+  an upgrade from before versions, otherwise the sample file; the loser of a race does nothing. Every start refreshes the
+  `Owner` projection. A projection label's cutover rebuilds the projection once. An emptied retired label isn't drift.
+  `normalise_rule` parses a text `compliance` cell. `graph_migration.load()` is never silently partial. Details and the
+  upgrade/rollback-to-`main`/two-instance results are in the runbook's "Deep test" section.
+
+## As built: batch C (connectors, secrets at rest)
+- Migration `015_connectors.sql` (014 went to B): `connectors`, `connector_instances` (+ `secret_enc`, `secret_key_id`,
+  `secret_hint`), `connector_records`, `employee_record_links`, `custom_fields`, `import_runs`, `legacy_sync_runs`.
+  The record's field values are the column `data`, because `values` is an SQL keyword; the API still says `values`.
+- `connectors/store.py` is the only reader and writer. The `Connector` interface is unchanged; `list_records` pages and
+  searches in SQL (search matches field values, not key names). `registry`, `hr_portal`, `candidates`, `seed`,
+  `connector_routes`, `integrations/service` and `integrations/engine` call it; `main.create_joiner` adds the
+  `from_candidate` link. `connectors/sync.run`/`runs` are deleted; the pure mapping helpers stay.
+- **Engine:** `EdgeSpec.backfill` copies edges that have no node of their own (the employee links) inside the cutover
+  transaction. Rollback now also deletes graph nodes that lack the key property (`CustomField` had no `id`).
+- **Secrets (ADR 0013):** `connectors/secrets.py`, Fernet via `MultiFernet` (`SECRETS_KEY`, `SECRETS_KEY_PREVIOUS`).
+  The cutover encrypts the graph's plaintext; parity compares a sha256 of the plaintext, so no secret reaches the report.
+  `check_at_startup` runs after the cutover. `python -m connectors.rotate_key` rotates in one transaction. The
+  connection test returns 422 "secret can't be decrypted with the current key" when no key can read it. Saving a
+  connection and testing it now write their audit rows in the same transaction.
+- `test_phase3` C section (32 checks): the old graph with a plaintext secret, links, a custom field, an import run and an
+  integration run; a clean cutover with edge counts; the API views; encryption, the hint and keep-on-blank; rotation;
+  wrong-key, production-without-key and malformed-key refusals; an undecryptable secret; SQL paging and search; the HR
+  Portal sync replacing `synced_to`; custom fields; imports; drift; rollback (plaintext secret and every edge back);
+  a second cutover.
+- Throwaway stack: `main` → C (five batches in one start) with a real key; an integration run; rotation; refusals;
+  a full rollback to `main` (connection test still passes on decrypted plaintext); re-upgrade.
+
+### Batch C deep test (an independent review plus my own probes; each finding reproduced, fixed and covered)
+- **Plaintext secrets stayed in the graph after cutover.** `LabelSpec.after_cutover` now scrubs them (`ConnectorInstance`
+  `secret` removed) once the batch is clean, and the drift baseline is taken after the scrub. Rollback writes them back.
+- **`KeyConfigError` was a `SystemExit`.** Raised inside a request (a save in production without a key, or a malformed
+  key), it could stop the server. It is now a `RuntimeError`: the routes answer 503 or 422, and `check_at_startup`,
+  which now also validates the key before any secret is stored, turns it into an exit.
+- **Engine, from PR 0:** `label_report` merged `**par` after `ok`, so edge-count and unmapped-key mismatches never
+  blocked a cutover or rollback. The computed `ok` now wins. Every batch's report re-checks clean.
+- **A re-cutover after a rollback kept stale links.** `_backfill_links` now replaces the table from the graph.
+- **Bad graph data** (malformed JSON, a missing id, a dangling reference) stopped startup with a raw traceback, and
+  malformed `values` silently became `{}`. Malformed JSON now refuses and names the node, and bootstrap reports any
+  mapping error as "nothing was switched".
+- **Search across fields** ("Ananya K") broke when search moved to SQL. Every word must now match some field value.
+- **Rollback without the key half-switched the batch.** Rollback now builds every payload before writing anything.
+- `rotate_key` refuses without `SECRETS_KEY`.
+- **Checks and dev:** 6 new checks (`test_phase3` now 124). On dev: `rollback C`, then a restart; the graph holds no
+  secret, and the hints and connection tests are unchanged.
+
+## As built: batch B (activity, guardrail hits, eval runs)
+- Migration `014_activity.sql`: `events`, `guardrail_events`, `eval_runs`, `eval_results`. Columns are the old graph
+  properties. `ts`/`finished` stay epoch seconds (`double precision`) and `ms` stays an integer, so every API keeps its
+  types (ponytail: timestamptz is a later cleanup).
+- `events.py` (`record`, `for_employee`, `recent(limit, exclude_kind)`) is the only reader and writer. `graph.event()`
+  keeps its signature and calls `events.record`, so its 27 callers didn't change. `recent` LEFT JOINs `employees` for
+  the name and the manager; `/api/events` keeps its limit-then-`_visible` manager scoping in `main`.
+- `guardrails.record` inserts a row; `by_rule` / `recent` serve the quality page. `evals.py` writes runs and results in
+  SQL (`_set`, `_insert_result`); `runs()` / `results()` drop NULLs so the API shape matches the graph's (a metric the
+  judge couldn't score is an absent key).
+- `quality_routes.overview`, the employee timeline and the HR co-pilot's recent activity read the tables.
+- `test_phase3` B section: the old release's nodes (including a run without `finished` and a result without metrics),
+  a cutover, the quality overview equal to what the old graph reader returned, the event choke point, the joins and
+  filters, guardrail counts, a failed eval run, the result shape, drift, rollback and a second cutover.
+- On a throwaway stack, `main` was upgraded straight to B (four batches in one start). A full eval run (20/20) then
+  succeeded on the new storage, and a full rollback to `main` showed the run, the guardrail hits and the activity.
+
 ## The approved plan
 
 ### Context
@@ -58,7 +182,7 @@ v2 builds all of them in.
 |---|---|---|---|---|
 | Owner | 8 | `owners` table; graph `Owner` becomes a projection | `owners.py` | A1 |
 | EmailTemplate | 4 | `email_templates` | `templates.py` | A1 |
-| Config | 4 | removed: the rule-set version config already owns it | `policy/store.py` | A1 |
+| Config | 4 | removed: the rule-set version config already owns it | `policy/store.py` | A3 (moved from A1, see "As built: A1") |
 | Policy | 7 | `policies` (uploads are authoritative) | `policies.py` | A2 |
 | PolicyChunk | 31 | stays in the graph: derived index, rebuilt from `policies` | `chat.index_policy` | A2 |
 | Rule (legacy) | 18 | removed: `import_requirements` writes rule-set versions | `ingest.py` → `policy/store.py` | A3 |
@@ -125,7 +249,7 @@ The known bypasses are closed in their batch:
 - **`/api/admin/migration`** (admin, auditor) and a System page with a Migration card: per label, source, parity, counts, cutover time and drift-since-cutover.
 
 ### Batches
-- **A1, config/owners/templates (migration 011):**
+- **A1, owners/templates (migration 011; Config moved to A3):**
   - Tables: `owners`, `email_templates`.
   - New modules `owners.py` (`all`, `get`, `by_category`, `upsert`, `manager_for`) and `templates.py`.
   - The 13 Owner sites and the template sites switch over.
@@ -139,6 +263,8 @@ The known bypasses are closed in their batch:
 - **A3, the import flow:**
   - `ingest.import_requirements` creates v1 in Postgres on a fresh install, and opens a governed draft when an active version exists.
   - It stops writing `Rule`/`Config` nodes; the legacy graph-rule reader in `ensure_active` is removed.
+  - `Config` retires here too: `checklist.config()` drops its graph fallback, and `ingest.seed` stops using
+    `Config {key:'doc_types'}` to detect a first run.
   - **Feature smoke:** an upload on `/import` → a draft appears → preview.
 - **B, activity (migration 013):**
   - Tables: `events` (no FK; indexed on (employee_id, ts) and ts), `guardrail_events`, `eval_runs`, `eval_results`.

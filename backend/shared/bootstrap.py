@@ -126,6 +126,9 @@ def migrate_graph_batches() -> dict:
             out[b] = gm.cutover(b)
         except (gm.FreezeError, gm.bridge.ParityError) as e:
             raise SystemExit(f"bootstrap: graph migration batch {b}: {e}. Nothing was switched.") from None
+        except Exception as e:  # graph data the mapping can't take (a missing id, a dangling reference, bad JSON)
+            raise SystemExit(f"bootstrap: graph migration batch {b} stopped on graph data it can't migrate "
+                             f"({type(e).__name__}: {e}). Nothing was switched; fix that node and restart.") from None
         ls.log_event(_log, "graph_migration.cutover", batch=b, labels=len(out[b].get("labels", [])))
     return out
 
@@ -150,6 +153,8 @@ def run() -> dict:
     migrate_records()
     migrate_documents()
     migrate_graph_batches()
+    from connectors import secrets
+    secrets.check_at_startup()  # stored secrets must be readable with the configured key (ADR 0013)
     state = {"migrations": applied, "users_created": created, "audit_imported": imported, "graph": graph_ok()}
     ls.log_event(_log, "done", **{k: (len(v) if isinstance(v, list) else v) for k, v in state.items()})
     if created and not is_production():

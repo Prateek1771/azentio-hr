@@ -35,6 +35,8 @@ class EdgeSpec:
     graph_count: str       # Cypher returning {n}
     pg_count: str          # SQL returning {n}
     restore: Callable[[], None] | None = None  # rollback: rebuild these edges in the graph from Postgres
+    backfill: Callable[[object], None] | None = None  # cutover: copy edges with no node of their own (e.g. links) into
+    #                                                   their table, given the cutover transaction's connection
 
 
 @dataclass
@@ -42,31 +44,51 @@ class LabelSpec:
     label: str
     batch: str
     table: str
-    graph_query: str                     # Cypher returning one node per row as `n` (extra columns are merged in)
     to_row: Callable[[dict], dict]       # graph props -> table columns
     canonical: Callable[[dict], dict]    # table row -> comparable dict (same function for both sides, after to_row)
     from_row: Callable[[dict], dict]     # table row -> graph props (rollback)
+    graph_query: str = ""                # Cypher returning one node per row as `n`; default MATCH (n:<label>) RETURN n.
+    #                                      Built here so the owning module doesn't show up as a graph read path.
     key: str = "id"
+    projection: bool = False             # the graph keeps the label as a projection of the table (e.g. Owner): drift
+    #                                      then means graph != Postgres now, not "the graph changed since cutover"
     mapped_keys: frozenset = frozenset()     # graph property names consumed by to_row
     dropped_keys: frozenset = frozenset()    # graph properties deliberately not carried over (documented)
     edges: list[EdgeSpec] = field(default_factory=list)
     allowed_readers: tuple = ()              # files allowed to keep MATCHing the label (e.g. the rebuild)
+    after_cutover: Callable[[], None] | None = None  # runs once the batch is clean, before the switch (e.g. scrub
+    #                                                  plaintext secrets from the graph); drift is measured from after it
 
 
 SPECS: dict[str, LabelSpec] = {}
+SPEC_MODULES = ("owners", "templates", "policies", "policy.legacy", "events", "guardrails", "evals",
+                "connectors.store")  # each registers its labels' specs on import (batch A1 onward)
+_loaded = False
 
 
 def register(spec: LabelSpec) -> LabelSpec:
+    if not spec.graph_query:
+        spec.graph_query = f"MATCH (n:{spec.label}) RETURN n"
     SPECS[spec.label] = spec
     return spec
 
 
+def load() -> dict[str, LabelSpec]:
+    global _loaded
+    if not _loaded:
+        import importlib
+        for m in SPEC_MODULES:  # a failing import raises here, every time: never a silently partial registry
+            importlib.import_module(m)
+        _loaded = True
+    return SPECS
+
+
 def batch_labels(batch: str) -> list[LabelSpec]:
-    return [s for s in SPECS.values() if s.batch == batch]
+    return [s for s in load().values() if s.batch == batch]
 
 
 def batches() -> list[str]:
-    return sorted({s.batch for s in SPECS.values()})
+    return sorted({s.batch for s in load().values()})
 
 
 # ---------- reading both sides ----------
@@ -154,7 +176,7 @@ def label_report(spec: LabelSpec) -> dict:
         edges.append({"edge": e.name, "graph": g, "pg": p, "ok": g == p})
     paths = read_paths(spec.label, spec.allowed_readers)
     ok = par["ok"] and not unmapped and all(e["ok"] for e in edges)
-    return {"label": spec.label, "table": spec.table, "ok": ok, **par, "graph_keys": seen, "unmapped_keys": unmapped,
+    return {"label": spec.label, "table": spec.table, **par, "ok": ok, "graph_keys": seen, "unmapped_keys": unmapped,
             "dropped_keys": sorted(spec.dropped_keys), "edges": edges, "read_paths_remaining": paths}
 
 
@@ -219,6 +241,10 @@ def _cutover(batch: str, todo: list[LabelSpec], freeze: dict) -> dict:
         c.execute("SET LOCAL azentio.backfill = '1'")
         for s in todo:
             backfill(s, c)
+        for s in todo:  # after every node, so a link's rows exist
+            for e in s.edges:
+                if e.backfill:
+                    e.backfill(c)
     reports = [label_report(s) for s in todo]
     bad = [r for r in reports if not r["ok"] or r["read_paths_remaining"]]
     if bad:
@@ -226,22 +252,34 @@ def _cutover(batch: str, todo: list[LabelSpec], freeze: dict) -> dict:
                                  + json.dumps([{k: r[k] for k in ('label', 'ok', 'first_mismatch_id', 'unmapped_keys',
                                                                      'edges', 'read_paths_remaining')} for r in bad]))
     at = datetime.now(timezone.utc).isoformat()
+    baseline = {}
+    for s in todo:
+        if s.after_cutover:
+            s.after_cutover()
+        baseline[s.label] = graph_checksum(s) if s.after_cutover else None
     for r in reports:
         _set_state(r["label"], "postgres", {**r, "batch": batch, "cutover_at": at, "before": before[r["label"]],
-                                             "freeze": freeze, "graph_checksum_at_cutover": r["graph_sha"]})
+                                             "freeze": freeze,
+                                             "graph_checksum_at_cutover": baseline[r["label"]] or r["graph_sha"]})
+    if any(s.projection for s in todo):  # e.g. a legacy Owner node keyed `A.B@x` vs the row `a.b@x`: re-project
+        import records                  # everything once, so no edge points at a node the next refresh would drop
+        records.rebuild_graph()
     return {"batch": batch, "cutover_at": at, "freeze": freeze, "labels": reports, "before": before}
 
 
 def drift_since_cutover() -> list[dict]:
     """For every switched label: has the graph side changed since cutover? (A stray writer of a retired label.)"""
     out = []
-    for s in SPECS.values():
+    for s in list(load().values()):
         st = _state(s.label)
         if not st or st["source"] != "postgres":
             continue
         then = (st["report"] or {}).get("graph_checksum_at_cutover")
+        if s.projection:  # the projection follows Postgres: compare with Postgres now
+            then = bridge.checksum(_canon_pg(s, pg_rows(s)), s.key)
         now = graph_checksum(s)
-        out.append({"label": s.label, "batch": s.batch, "ok": then == now, "at_cutover": then, "now": now,
+        emptied = not s.projection and now == bridge.checksum([], s.key)  # a wiped graph, not a stray write
+        out.append({"label": s.label, "batch": s.batch, "ok": then == now or emptied, "at_cutover": then, "now": now,
                     "cutover_at": (st["report"] or {}).get("cutover_at")})
     return out
 
@@ -267,11 +305,15 @@ def rollback(batch: str, watch: float | None = None) -> dict:
 def _rollback(batch: str, freeze: dict) -> dict:
     from graph import q
     reports = []
-    for s in batch_labels(batch):
-        rows = pg_rows(s)
-        q(f"MATCH (n:{s.label}) WHERE NOT n.{s.key} IN $keep DETACH DELETE n", keep=[r[s.key] for r in rows])
-        for r in rows:
-            q(f"MERGE (n:{s.label} {{{s.key}: $k}}) SET n = $p", k=r[s.key], p=s.from_row(r))
+    try:  # every payload first: a row that can't be converted aborts before anything is written or switched
+        plan = [(s, [(r[s.key], s.from_row(r)) for r in pg_rows(s)]) for s in batch_labels(batch)]
+    except Exception as e:
+        raise bridge.ParityError(f"rollback {batch}: a row can't be written back ({type(e).__name__}: {e}); "
+                                 "nothing was changed") from None
+    for s, payload in plan:
+        q(f"MATCH (n:{s.label}) WHERE n.{s.key} IS NULL OR NOT n.{s.key} IN $keep DETACH DELETE n", keep=[k for k, _ in payload])
+        for k, p in payload:
+            q(f"MERGE (n:{s.label} {{{s.key}: $k}}) SET n = $p", k=k, p=p)
         for e in s.edges:
             if e.restore:
                 e.restore()
@@ -289,7 +331,7 @@ def full_report() -> dict:
     states = {r["record_type"]: r for r in db.fetch("SELECT * FROM bridge_state")}
     drift = {d["label"]: d for d in drift_since_cutover()}
     labels = []
-    for s in SPECS.values():
+    for s in list(load().values()):
         st = states.get(s.label) or {}
         rep = st.get("report") or {}
         labels.append({"label": s.label, "batch": s.batch, "table": s.table, "source": st.get("source", "graph"),
@@ -343,14 +385,15 @@ if __name__ == "__main__":
     load_dotenv(ROOT.parent / ".env")
     db.init()
     bridge.load()
+    import graph_migration as gm  # under `python -m` this file is __main__; spec modules register into the real module
     if a.command == "report":
-        out = full_report()
+        out = gm.full_report()
     elif a.command == "drift":
-        out = drift_since_cutover()
+        out = gm.drift_since_cutover()
     else:
         if not a.batch:
             sys.exit("rollback needs a batch name")
-        out = rollback(a.batch)
+        out = gm.rollback(a.batch)
     text = json.dumps(out, indent=1, default=str)
     if a.out:
         Path(a.out).write_text(text + "\n", encoding="utf-8")

@@ -3,7 +3,8 @@ import re
 import secrets
 
 import records
-from graph import q, q1, event
+from graph import event
+from . import store
 from .base import Connector, FieldSpec, RecordRejected
 
 BUILTIN = [
@@ -59,8 +60,7 @@ class HrPortal(Connector):
     record_kind = "employee"
 
     def custom_fields(self, instance_id: str) -> list[FieldSpec]:
-        rows = q("MATCH (f:CustomField {instance_id:$i}) RETURN f ORDER BY f.created", i=instance_id)
-        return [FieldSpec(r["f"]["key"], r["f"]["label"], r["f"]["type"], r["f"]["required"], is_custom=True) for r in rows]
+        return [FieldSpec(f["key"], f["label"], f["type"], f["required"], is_custom=True) for f in store.custom_fields(instance_id)]
 
     def describe_schema(self, instance_id: str) -> list[FieldSpec]:
         return list(BUILTIN) + self.custom_fields(instance_id)
@@ -73,9 +73,7 @@ class HrPortal(Connector):
             raise ValueError(f"Type must be one of {', '.join(sorted(FIELD_TYPES))}")
         if any(f.key == key for f in self.describe_schema(instance_id)):
             raise KeyError(f"A field named '{key}' already exists")
-        import time
-        q("CREATE (f:CustomField {instance_id:$i, key:$k, label:$l, type:$t, required:$r, created:$c})",
-          i=instance_id, k=key, l=label.strip(), t=data_type, r=required, c=time.time())
+        store.add_custom_field(instance_id, key, label.strip(), data_type, required)
         event(None, "connector", f"HR Portal: custom field '{label.strip()}' ({data_type}) added")
         return FieldSpec(key, label.strip(), data_type, required, is_custom=True)
 
@@ -100,8 +98,7 @@ class HrPortal(Connector):
 
 
 def instance_id_for(key: str) -> str | None:
-    row = q1("MATCH (i:ConnectorInstance {key:$k}) RETURN i.id AS id", k=key)
-    return row["id"] if row else None
+    return store.instance_id_for(key)
 
 
 def push_employee(eid: str):
@@ -113,15 +110,14 @@ def push_employee(eid: str):
         e = records.employee(eid)
         if e.get("integration_id"):  # the integration creates this employee after HR approval
             return
-        mgr = q1("MATCH (m:Owner) WHERE toLower(m.email)=$m RETURN m.name AS n", m=e.get("manager_email", "")) or \
-            ({"n": r["name"]} if (r := records.employee_by(email=e.get("manager_email") or "")) else None)
+        import owners
+        mgr = owners.get(e.get("manager_email") or "") or records.employee_by(email=e.get("manager_email") or "")
         first, _, last = e["name"].partition(" ")
         values = {"first_name": first, "last_name": last or first, "work_email": e["email"], "job_title": e["role"],
                   "department_name": e["department"], "grade": e["grade"], "location": e["location"],
-                  "manager_name": mgr["n"] if mgr else "", "start_date": e["joining_date"], "employee_number": e["id"]}
+                  "manager_name": mgr["name"] if mgr else "", "start_date": e["joining_date"], "employee_number": e["id"]}
         rid, outcome = HrPortal().upsert_record(iid, values, "update")
-        q("MATCH (e:Employee {id:$e})-[s:SYNCED_TO]->() DELETE s", e=eid)
-        q("MATCH (e:Employee {id:$e}), (r:Record {id:$r}) CREATE (e)-[:SYNCED_TO]->(r)", e=eid, r=rid)
+        store.link(eid, rid, "synced_to", replace=True)
         stored = HrPortal().get_record(iid, rid) or {"values": {}}
         event(eid, "connector", f"HR Portal employee {outcome} ({stored['values'].get('employee_number', values['employee_number'])})")
     except RecordRejected as ex:

@@ -8,14 +8,14 @@ Azentio Onboard is an HR onboarding agent. For each new joiner it works out whic
 We're hardening it from a demo into governed HR operations in 7 phases: see [docs/plans/2026-11-01-hardening-design.md](docs/plans/2026-11-01-hardening-design.md).
 
 ## Current phase
-**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract) is done; batches A1 → E follow, one PR each. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
+**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract), A1 (owners, email templates), A2 (policies), A3 (legacy rules/config retired), B (activity, guardrail hits, eval runs) and C (connectors, secrets encrypted at rest) are done; D and E follow, one PR each. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
 
 | Phase | Status |
 |---|---|
 | 0 Trust + foundation (auth, 5 roles, audit chain, jobs/outbox, bootstrap) | **done** |
 | 1 Policy governance + Employee/Item migration | **done** |
 | 2 AI control + Document migration | **done** |
-| 3 Retire graph record storage | **in progress** (PR 0 done) |
+| 3 Retire graph record storage | **in progress** (PR 0, A1, A2, A3, B, C done) |
 | 4 Ops backbone + **Temporal** | planned |
 | 5 Lifecycle (transfer, offboarding, rechecks, contractor/rehire, leave) | planned |
 | 6 HR ops platform (manager view, SLAs, escalations, appeals, analytics) | planned |
@@ -23,7 +23,7 @@ We're hardening it from a demo into governed HR operations in 7 phases: see [doc
 ## Stack
 - **Backend:** FastAPI on Python 3.12, managed with `uv` (`backend/`).
 - **Postgres 17:** the system of record ([ADR 0005](docs/adr/0005-postgres-system-of-record.md)). Plain SQL through `psycopg`, no ORM.
-- **FalkorDB:** a read model only: the dependency graph, the relationship view, and the policy chunks the assistant retrieves ([ADR 0006](docs/adr/0006-graph-as-read-model.md)). Until Phase 3 finishes, it still holds connector records, events and policies.
+- **FalkorDB:** a read model only: the dependency graph, the relationship view, and the policy chunks the assistant retrieves ([ADR 0006](docs/adr/0006-graph-as-read-model.md)). Until Phase 3 finishes, it still holds integrations.
 - **Next.js 16 / React 19 / Tailwind 4 / shadcn on base-ui** (`frontend/`). The browser calls the API through the Next.js rewrite of `/api/*` to `BACKEND_URL`, so the app and the API share one origin and the session cookie works.
 - **Temporal:** arrives in **Phase 4**, for durable workflows on top of Postgres ([ADR 0011](docs/adr/0011-temporal-orchestration.md)). It isn't used yet.
 
@@ -60,6 +60,7 @@ cd backend && uv run python test_phase3.py    # migration engine (freeze, cutove
 - Each new phase adds `test_phaseN.py`.
 - `backend/.venv/Scripts/python scripts/api_contract.py --check` diffs the response shapes of 24 read endpoints against `backend/tests_snapshots/api_contract.json` (`test_phase3` runs it). Re-capture with `--capture` only for a deliberate API change.
 - `cd backend && uv run python -m graph_migration report|drift|rollback <batch>`: the Phase 3 migration report, drift since cutover, and the rollback tool (see the cutover runbook).
+- `cd backend && uv run python -m connectors.rotate_key`: re-encrypt connector secrets with the current `SECRETS_KEY` (rotation, ADR 0013). Production needs `SECRETS_KEY` once any connector has credentials; dev falls back to a built-in key.
 - `backend/.venv/Scripts/python scripts/smoke.py --base http://localhost:3000` runs headless Chrome against the running stack. For every role it signs in through the real form, checks the navigation, checks that allowed pages render and forbidden ones are gated, runs one workflow, and refreshes `docs/screenshots/`.
 - Frontend: `cd frontend && npx next typegen && npx tsc --noEmit && npx eslint app components`.
 
@@ -86,13 +87,16 @@ cd backend && uv run python test_phase3.py    # migration engine (freeze, cutove
 | `backend/graph_migration.py` | **Phase 3 engine:** a `LabelSpec` per graph label; freeze-checked `cutover(batch)`, report, `drift_since_cutover`, `rollback(batch)`, CLI |
 | `backend/documents/` | **Documents (Phase 2).** `store` is the only read/write path for documents, mismatches and decisions (append-only `doc_decisions`); `route` is the pure policy router (`decide`, `ALWAYS_HIGH`, `backtest`) |
 | `backend/records.py` | **The only way to read or write employees and checklist items.** Refreshes the graph projection in place after each write |
+| `backend/events.py`, `backend/guardrails.py`, `backend/evals.py` | **Activity events, guardrail hits and eval runs** (Postgres, Phase 3 B). `graph.event()` is the event choke point and calls `events.record` |
+| `backend/owners.py`, `backend/templates.py`, `backend/policies.py` | **The only way to read or write owners, email templates and policies** (Postgres, Phase 3 A1/A2; `chat.index_chunks` builds the `PolicyChunk` index from `policies`). Owner writes re-project graph `Owner` nodes (`records.project_owners`) |
 | `backend/policy/` | Rule-set versions: `store` (versions, drafts, diff), `replay` (pure `plan_diff` + `apply`), `service` (preview, approvals, publish/notify jobs), `routes` |
 | `backend/migrations/NNN_*.sql` | Schema, applied at startup |
 | `backend/identity/` | Users, sessions, scrypt, **`perms.py` (every permission rule)**, auth routes |
 | `backend/audit.py` → `backend/audit_log/service.py` | Hash-chained, append-only audit log |
 | `backend/work_queue.py` | The one exceptions inbox: anything that needs a human |
 | `backend/checklist.py`, `validate.py`, `extract.py`, `pipeline.py`, `gmail.py`, `chat.py` | Rules engine, document checks, LLM extraction, intake, email, assistant (moving into modules in Phases 1 to 5) |
-| `backend/connectors/`, `backend/integrations/` | Connector catalog, integration engine and agent |
+| `backend/connectors/` | Connector catalog and implementations. **`store.py` is the only reader and writer of connectors, records, employee links, custom fields and import runs** (Postgres, Phase 3 C); `secrets.py` encrypts connection secrets (ADR 0013) |
+| `backend/integrations/` | Integration engine and agent (graph until Phase 3 D) |
 | `frontend/app/(hr)/` | HR app pages; `frontend/app/portal/[token]` is the joiner portal (public, token-scoped) |
 | `frontend/app/login`, `frontend/app/(hr)/users` | Sign-in screen; user and role management (admin) |
 | `frontend/app/(hr)/system` | System page: the Phase 3 storage migration report (admin, auditor) |
@@ -114,10 +118,10 @@ cd backend && uv run python test_phase3.py    # migration engine (freeze, cutove
   - Always enqueue inside the transaction of the change that caused it.
 - **Employees and items only through `records.py`; documents only through `documents/store.py`.** Never write `Employee`/`Item`/`Document` or document edges with Cypher; the graph is a projection refreshed by `records.project`.
 - **AI perceives; policy decides** ([ADR 0012](docs/adr/0012-document-decisions-as-built.md)). Document outcomes come only from `documents.route.decide` and recorded `doc_decisions` rows; item status for a document item is derived (`item_status_for`), never set, and the database enforces it (trigger `items_status_from_document`). Demo/test data uses `documents.seed.accept_for_demo`. `ALWAYS_HIGH` types are never auto-accepted (code + DB trigger).
-- **Rules change only by publishing a version** (`policy/`). Replay never deletes an item: not-started items are cancelled, done items or items with documents are kept as evidence.
+- **Rules change only by publishing a version** (`policy/`). A requirements file enters only through `ingest.import_requirements`: v1 on a fresh install, a governed draft after that. Replay never deletes an item: not-started items are cancelled, done items or items with documents are kept as evidence.
 - **One open draft at a time is a deliberate limit**, not a bug: two drafts of the same rule set would need merging. Revisit only if HR asks for parallel drafts.
 - **Every `work_queue` kind is a contract** in `work_queue.KINDS`: an SLA, an escalation role and resolution steps. Register a kind before opening items of it.
-- **Graph labels move through `graph_migration.py` only** (Phase 3): register a `LabelSpec`, then the cutover runs at startup before any worker, refuses unless parity, schema diff, edges and the read-path scan are clean, and records before/after evidence. Follow `docs/runbooks/phase-3-cutover.md` per batch.
+- **Graph labels move through `graph_migration.py` only** (Phase 3): register a `LabelSpec` in the owning module (listed in `graph_migration.SPEC_MODULES`; `projection=True` if the graph keeps it as a projection; edges as `EdgeSpec` with counts, a `restore` for rollback and, for edges with no node of their own, a `backfill`; `after_cutover` for anything that must leave the graph once Postgres holds it, such as plaintext secrets). The cutover runs at startup before any worker, refuses unless parity, edge counts, the schema diff (no unmapped keys) and the read-path scan are all clean, and records before/after evidence (LLD §12.4). Follow `docs/runbooks/phase-3-cutover.md` per batch. An install that ran the first batch C build (before the graph secret scrub) needs `rollback C` and a restart.
 - **Postgres is the system of record.**
   - Read migrating record types only through `shared/bridge.py`.
   - A type may switch to Postgres only after `parity()` passes.

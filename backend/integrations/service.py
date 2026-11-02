@@ -58,12 +58,13 @@ def _audit(action: str, it: dict, summary: str, actor: str = "HR", **meta):
 
 def owners() -> dict[str, str]:
     """Workspace members who can be notified: owner name -> email."""
-    return {r["n"]: r["e"] for r in q("MATCH (o:Owner) RETURN o.name AS n, o.email AS e ORDER BY o.name")}
+    import owners
+    return {o["name"]: o["email"] for o in sorted(owners.all(), key=lambda o: o["name"])}
 
 
 def connectors_by_name() -> dict[str, dict]:
-    rows = q("MATCH (i:ConnectorInstance)-[:OF]->(c:Connector) RETURN i.id AS id, i.name AS name, c.role AS role")
-    return {r["name"].lower(): r for r in rows}
+    from connectors import store as connectors
+    return {r["name"].lower(): {"id": r["id"], "name": r["name"], "role": r["role"]} for r in connectors.instances()}
 
 
 def departments() -> list[str]:
@@ -400,8 +401,9 @@ def documents_for(it: dict, role: str) -> list[str] | None:
 def apps() -> list[dict]:
     """App connectors (Slack, Jira, …) and the actions each can take."""
     from connectors.apps import ACTIONS
-    rows = q("""MATCH (i:ConnectorInstance)-[:OF]->(c:Connector {role:'app'}) RETURN i.id AS id, i.name AS name, c.key AS key
-                ORDER BY i.name""")
+    from connectors import store as connectors
+    rows = sorted(({"id": r["id"], "name": r["name"], "key": r["key"]} for r in connectors.instances("app")),
+                  key=lambda r: r["name"])
     return [{**r, "actions": [{"key": k, "label": lbl, "needs_resource": need} for k, (lbl, need) in ACTIONS[r["key"]].items()]}
             for r in rows]
 

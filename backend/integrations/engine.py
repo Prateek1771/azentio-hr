@@ -193,8 +193,8 @@ def _create_employee(it: dict, item: dict) -> tuple[str, str]:
     rid, outcome = target.upsert_record(it["target_id"], values, it["duplicate_policy"])
     store.set_item(item["id"], stage="completed", employee_record_id=rid)
     if item.get("joiner_id"):
-        q("MATCH (e:Employee {id:$e})-[s:SYNCED_TO]->() DELETE s", e=item["joiner_id"])
-        q("MATCH (e:Employee {id:$e}), (r:Record {id:$r}) CREATE (e)-[:SYNCED_TO]->(r)", e=item["joiner_id"], r=rid)
+        from connectors import store as connectors
+        connectors.link(item["joiner_id"], rid, "synced_to", replace=True)
     return {"created": "Created employee", "updated": "Updated existing employee",
             "skipped": "Employee already exists, left unchanged"}[outcome], outcome
 
