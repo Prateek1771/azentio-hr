@@ -218,6 +218,8 @@ Two stores. Postgres is the system of record for everything built in Phases 0 to
 | `item_notices` (Phase 1) | `employee_id, version_id (PK together), sent_at` | One "new requirements" notice per joiner per published version |
 | `documents` (Phase 2) | `id, employee_id, item_id (NULL = not on the checklist), filename, path, mime, size, sha256, source, status (Submitted, Under Review, Accepted, Correction Requested, Rejected), doc_type, tier, confidence, extracted, issues, checks (jsonb), model, prompt_version, policy_version_id, current_decision_id, received_at, decided_at, extra` | Documents. `status` is the result of the current decision, never set on its own |
 | `document_mismatches` (Phase 2) | `document_id, field (PK together), expected, found` | Replaces the graph's `MISMATCH` edges |
+| `owners` (Phase 3 A1) | `email (PK, lowercase), name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | Department owners and managers. `owners.py` is the only reader and writer; each write re-projects graph `Owner` nodes (`records.project_owners`) |
+| `email_templates` (Phase 3 A1) | `id (PK), name, subject, body` | HR-editable Jinja templates. `templates.py` is the only reader and writer; the graph no longer holds them |
 | `doc_decisions` (Phase 2) | `id, document_id, kind (auto_accept, auto_correction, routed_review, human_accept, human_reject, human_correction, human_override, spot_check_pass, spot_check_fail, backfill, demo_seed), decided_by (NULL = system), reason_code, reason_text, status_after, model, prompt_version, confidence, tier, threshold, policy_version_id, checks, extracted, corrected_fields, work_item_id, idempotency_key (unique), at` | Append-only decision history with provenance. Triggers refuse UPDATE/DELETE and any `auto_accept` of a `high` tier. Human and spot-check rows need a user and a reason (CHECK) |
 
 On `items`, trigger `items_status_from_document` (migration 010) refuses a document item status that no document of that item backs: only `Not Submitted`, `Cancelled`, or `doc_item_status(document.status)` of one of its documents is allowed (the one-time graph backfill sets `azentio.backfill` to copy history). `rule_set_versions.config.doc_policy` (Phase 2) holds the document tiers and thresholds; a trigger freezes `config` once a version leaves draft. **Planned:** connectors, integrations and runs (Phase 3). Schemas are in the [phase plans](plans/).
@@ -252,10 +254,10 @@ Integration nodes link by id properties rather than edges, because each one is r
 | `Item` | `id, employee_id, key, name, kind (document, task, ack), category, rule_id, reason, policy_ref, due, status, owner_name, owner_email, auto, depends[]` | One checklist entry, with the reason it exists |
 | `Rule` | `id, item, name, kind, category, match (json), offset_days, depends_on[], description, policy_ref, auto, ord` | A requirement rule, editable by HR |
 | `Document` | `id, employee_id, filename, path, mime, size, source (email, portal), status, extracted (json), issues (json), confidence, doc_type, ts` | One received file and its verification result |
-| `Owner` | `email, name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | Department owners and managers |
+| `Owner` | `email, name, department, type (manager, owner:HR, owner:IT, owner:Facilities, owner:Compliance)` | **Projection** of the `owners` table (Phase 3 A1), refreshed by `records.project_owners`; the target of `OWNED_BY` and `REPORTS_TO` |
 | `Event` | `id, employee_id, kind, message, ts` | Audit and activity log, including AI model and token usage |
 | `Config` | `key (departments, locations, doc_types, roles), value (json)` | Reference data |
-| `EmailTemplate` | `id, name, subject, body` | HR-editable Jinja templates |
+| `EmailTemplate` | `id, name, subject, body` | **Retired** (Phase 3 A1): stale nodes stay until PR E's cleanup; the `email_templates` table is the record |
 | `Policy` / `PolicyChunk` | `source, title, text` / `source, section, text, embedding?` | Approved policy text, chunked by `##` section |
 | `Connector` | `key, name, role (source, target), record_kind, demo, description` | Connector catalog |
 | `ConnectorInstance` | `id, key, name` | This workspace's use of a connector |
@@ -548,7 +550,7 @@ A later upload never downgrades an item that is already *Accepted*.
 Seeded rules cover identity and address (everyone), PAN and bank (India), education (Engineering), experience letter (G3+), I-9 and W-4 (US), BGV, HR record, laptop, email account, badge, orientation, infosec and code-of-conduct acknowledgements, developer tools (Engineering) and CRM (Sales). `R-ID`, `R-I9` and `R-BGV` are flagged `compliance`.
 
 ### 6.1 Rule-set versions (Built, Phase 1; [ADR 0009](adr/0009-governed-policy-versions.md))
-- A version is a snapshot of **all** rules plus the engine config (`doc_types`, `locations`, `departments`, `roles`). Owners are directory data and stay live in the graph.
+- A version is a snapshot of **all** rules plus the engine config (`doc_types`, `locations`, `departments`, `roles`). Owners are directory data and stay live (`owners` table, Phase 3).
 - `checklist.load_rules()` and `config()` read the active version (`policy/store.ensure_active()` creates v1 from the legacy graph rules the first time, so behaviour didn't change).
 - Exactly one version is `active` and at most one is open (`draft`, `pending_approval` or `approved`); partial unique indexes enforce both. The `rules_frozen` trigger refuses writes to any version that isn't a draft.
 - Requirement uploads on **Add joiners** become a draft (`ingest.import_requirements_draft`); they never go live directly.

@@ -15,7 +15,7 @@ from markupsafe import Markup
 import logging_setup as ls
 import pipeline
 import records
-from graph import q1, event
+from graph import event
 
 LABEL = "azentio-processed"
 _log = ls.get("gmail")
@@ -35,7 +35,8 @@ def svc():
 
 
 def render(template_id: str, ctx: dict) -> tuple[str, str]:
-    t = q1("MATCH (t:EmailTemplate {id:$id}) RETURN t", id=template_id)["t"]
+    import templates
+    t = templates.get(template_id)
     ctx = {k: Markup(v) if k in ("doc_list", "issues") else v for k, v in ctx.items()}
     return _env.from_string(t["subject"]).render(**ctx), _env.from_string(t["body"]).render(**ctx)
 

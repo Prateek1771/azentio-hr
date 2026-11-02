@@ -58,7 +58,8 @@ def _audit(action: str, it: dict, summary: str, actor: str = "HR", **meta):
 
 def owners() -> dict[str, str]:
     """Workspace members who can be notified: owner name -> email."""
-    return {r["n"]: r["e"] for r in q("MATCH (o:Owner) RETURN o.name AS n, o.email AS e ORDER BY o.name")}
+    import owners
+    return {o["name"]: o["email"] for o in sorted(owners.all(), key=lambda o: o["name"])}
 
 
 def connectors_by_name() -> dict[str, dict]:

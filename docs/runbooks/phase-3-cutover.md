@@ -57,12 +57,44 @@ restore path.**
 
 | Batch | Labels | Cutover (dev) | Before → after (graph / pg, sha) | Freeze | Rollback drill | Sign-off |
 |---|---|---|---|---|---|---|
-| A1 | Owner, EmailTemplate, Config | | | | | |
+| A1 | Owner (stays as projection), EmailTemplate | 2026-11-02 03:08 UTC | Owner 8/0 → 8/8, EmailTemplate 4/0 → 4/4; sha equal | single writer, 15 s watch | pass | dev |
 | A2 | Policy (PolicyChunk stays as an index) | | | | | |
-| A3 | Rule (legacy, removed) | | | | | |
+| A3 | Rule and Config (legacy, removed; Config moved here from A1) | | | | | |
 | B | Event, GuardrailEvent, EvalRun, EvalResult | | | | | |
 | C | Connector, ConnectorInstance, Record, links, CustomField, ImportRun, IntegrationRun (archived) | | | | | |
 | D | Integration, IntegrationCandidate, WorkflowRun, IntegrationLogRecord, OutboundMessage, AgentMessage | | | | | |
 | E | AuditLog (legacy, removed), read-model cleanup | | | | | |
 
 Each batch adds a `### <batch>` section here with the pasted report extract.
+
+### A1: Owner, EmailTemplate (dev stack, 2026-11-02)
+
+**Before** (graph / Postgres): Owner 8 / 0, graph sha `561f37e4…`; EmailTemplate 4 / 0, graph sha `831eaa95…`.
+Snapshot: `BGSAVE` taken first.
+
+**Cutover** at startup (`graph_migration.cutover batch=A1 labels=2`, 03:08:01 UTC), before the worker started:
+
+| Label | source | graph | pg | parity | unmapped keys | read paths left | drift since cutover |
+|---|---|---|---|---|---|---|---|
+| Owner | postgres | 8 | 8 | ok | none | none (`records.py` is the projection writer) | ok (projection: graph = Postgres) |
+| EmailTemplate | postgres | 4 | 4 | ok | none | none | ok |
+
+**Freeze evidence** (from `bridge_state.report.freeze` after the drill's re-cutover): `single_writer: true`,
+`watched_seconds: 15`, `recent_stopped_heartbeats: ["DESKTOP-968RPED:12956"]` (the instance stopped for the drill; its
+heartbeat didn't advance, so cutover went ahead).
+
+**Feature smoke:** `scripts/smoke.py` passes (every role; the Email templates page renders for each). By API:
+templates list and edit (HR Ops), `/api/rules` lists the 8 owners, manager scoping (the dev manager sees E1006, E1002),
+employee detail resolves owner-backed managers through `REPORTS_TO` (E1001 → Priya Menon), task items keep their owners.
+(The first smoke run hit a race in the rules-rollback check, unrelated to A1: it accepted the open version while it was
+still a draft. Fixed in `smoke.py`; the re-run passed.)
+
+**Rollback drill:**
+1. Through the app as HR Ops: imported owner `drill.owner@azentio.local`, edited the `intern` template subject.
+   The Owner projection picked up the new owner at once.
+2. Stopped the backend, ran `graph_migration rollback A1`: Owner ok 9 / 9, EmailTemplate ok 4 / 4, checksums equal. The
+   graph's `intern` template carried the edited subject.
+3. Restarted: cut over again at 03:09:56 UTC, Owner 9 / 9 and EmailTemplate 4 / 4, parity ok, drift ok.
+4. Put the dev data back (template from the seed, drill owner removed and re-projected); drift ok afterwards.
+
+**Sign-off:** dev ✓. CI on the PR covers `test_phase3` (A1 section and API contract).

@@ -8,14 +8,14 @@ Azentio Onboard is an HR onboarding agent. For each new joiner it works out whic
 We're hardening it from a demo into governed HR operations in 7 phases: see [docs/plans/2026-11-01-hardening-design.md](docs/plans/2026-11-01-hardening-design.md).
 
 ## Current phase
-**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract) is done; batches A1 → E follow, one PR each. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
+**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract) and batch A1 (owners, email templates) are done; A2 → E follow, one PR each. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
 
 | Phase | Status |
 |---|---|
 | 0 Trust + foundation (auth, 5 roles, audit chain, jobs/outbox, bootstrap) | **done** |
 | 1 Policy governance + Employee/Item migration | **done** |
 | 2 AI control + Document migration | **done** |
-| 3 Retire graph record storage | **in progress** (PR 0 done) |
+| 3 Retire graph record storage | **in progress** (PR 0, A1 done) |
 | 4 Ops backbone + **Temporal** | planned |
 | 5 Lifecycle (transfer, offboarding, rechecks, contractor/rehire, leave) | planned |
 | 6 HR ops platform (manager view, SLAs, escalations, appeals, analytics) | planned |
@@ -86,6 +86,7 @@ cd backend && uv run python test_phase3.py    # migration engine (freeze, cutove
 | `backend/graph_migration.py` | **Phase 3 engine:** a `LabelSpec` per graph label; freeze-checked `cutover(batch)`, report, `drift_since_cutover`, `rollback(batch)`, CLI |
 | `backend/documents/` | **Documents (Phase 2).** `store` is the only read/write path for documents, mismatches and decisions (append-only `doc_decisions`); `route` is the pure policy router (`decide`, `ALWAYS_HIGH`, `backtest`) |
 | `backend/records.py` | **The only way to read or write employees and checklist items.** Refreshes the graph projection in place after each write |
+| `backend/owners.py`, `backend/templates.py` | **The only way to read or write owners and email templates** (Postgres, Phase 3 A1). Owner writes re-project graph `Owner` nodes (`records.project_owners`) |
 | `backend/policy/` | Rule-set versions: `store` (versions, drafts, diff), `replay` (pure `plan_diff` + `apply`), `service` (preview, approvals, publish/notify jobs), `routes` |
 | `backend/migrations/NNN_*.sql` | Schema, applied at startup |
 | `backend/identity/` | Users, sessions, scrypt, **`perms.py` (every permission rule)**, auth routes |
@@ -117,7 +118,7 @@ cd backend && uv run python test_phase3.py    # migration engine (freeze, cutove
 - **Rules change only by publishing a version** (`policy/`). Replay never deletes an item: not-started items are cancelled, done items or items with documents are kept as evidence.
 - **One open draft at a time is a deliberate limit**, not a bug: two drafts of the same rule set would need merging. Revisit only if HR asks for parallel drafts.
 - **Every `work_queue` kind is a contract** in `work_queue.KINDS`: an SLA, an escalation role and resolution steps. Register a kind before opening items of it.
-- **Graph labels move through `graph_migration.py` only** (Phase 3): register a `LabelSpec`, then the cutover runs at startup before any worker, refuses unless parity, schema diff, edges and the read-path scan are clean, and records before/after evidence. Follow `docs/runbooks/phase-3-cutover.md` per batch.
+- **Graph labels move through `graph_migration.py` only** (Phase 3): register a `LabelSpec` in the owning module (listed in `graph_migration.SPEC_MODULES`; `projection=True` if the graph keeps it as a projection), then the cutover runs at startup before any worker, refuses unless parity, schema diff, edges and the read-path scan are clean, and records before/after evidence. Follow `docs/runbooks/phase-3-cutover.md` per batch.
 - **Postgres is the system of record.**
   - Read migrating record types only through `shared/bridge.py`.
   - A type may switch to Postgres only after `parity()` passes.

@@ -194,8 +194,9 @@ def hr_context(question: str, chunks: list[dict], focus_id: str | None) -> str:
                 ex = {k: v for k, v in (d.get("extracted") or {}).items() if v and not k.startswith("_")}
                 lines.append(f"  - {d['filename']} via {d['source']}: {d['status']}; extracted {ex}; issues {d.get('issues')}")
     lines.append("\nOWNERS:")
-    for o in q("MATCH (o:Owner) RETURN o.name AS n, o.email AS e, o.type AS t, o.department AS d ORDER BY o.type"):
-        lines.append(f"- {o['n']} ({o['t']}, {o['d']}): {o['e']}")
+    import owners
+    for o in owners.all():
+        lines.append(f"- {o['name']} ({o['type']}, {o['department']}): {o['email']}")
     lines.append("\nRECENT ACTIVITY [activity]:")
     for ev in q("""MATCH (v:Event) WHERE v.kind <> 'ai' OPTIONAL MATCH (e:Employee {id:v.employee_id})
                    RETURN v.message AS m, e.name AS n ORDER BY v.ts DESC LIMIT 15"""):

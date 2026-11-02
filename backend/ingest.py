@@ -10,7 +10,9 @@ from pathlib import Path
 import pandas as pd
 
 import checklist
+import owners
 import records
+import templates
 from graph import q, q1, event
 
 SEED = Path(__file__).parent / "seed"
@@ -100,8 +102,7 @@ def upsert_employee(r: dict, reason: str = "import") -> str:
 
 def import_employees(filename: str, data: bytes) -> dict:
     rows = read_table(filename, data)
-    managers = {r["m"] for r in q("MATCH (o:Owner {type:'manager'}) RETURN toLower(o.email) AS m")}
-    managers |= records.emails()
+    managers = owners.emails("manager") | records.emails()
     valid, errors = validate_employees(rows, checklist.config("departments") or [], checklist.config("locations") or {}, managers)
     ids = [upsert_employee(r) for r in valid]
     return {"kind": "employees", "total": len(rows), "imported": len(ids), "errors": errors, "ids": ids}
@@ -110,7 +111,7 @@ def import_employees(filename: str, data: bytes) -> dict:
 def import_owners(filename: str, data: bytes) -> dict:
     rows = read_table(filename, data)
     hr = os.getenv("HR_MAILBOX", "hr@example.com")
-    errors, n = [], 0
+    errors, good = [], []
     for i, r in enumerate(rows, start=1):
         r = {k: str(v).strip() for k, v in r.items()}
         m = re.fullmatch(r"\{HR\+(\w+)\}", r.get("email", ""))  # seed placeholder → plus-address of the HR mailbox
@@ -123,9 +124,8 @@ def import_owners(filename: str, data: bytes) -> dict:
             if not miss:
                 errors.append({"row": i, "field": "email", "message": f"Invalid email '{r['email']}'", "name": r.get("name", "")})
             continue
-        q("MERGE (o:Owner {email:$e}) SET o.name=$n, o.department=$d, o.type=$t",
-          e=r["email"].lower(), n=r["name"], d=r["department"], t=r["type"])
-        n += 1
+        good.append(r)
+    n = owners.upsert(good) if good else 0
     return {"kind": "owners", "total": len(rows), "imported": n, "errors": errors}
 
 
@@ -195,7 +195,7 @@ async def seed():
         import_requirements("requirements.json", (SEED / "requirements.json").read_bytes())
         import_owners("owners.csv", (SEED / "owners.csv").read_bytes())
         for t in json.loads((SEED / "email_templates.json").read_text(encoding="utf-8")):
-            q("MERGE (t:EmailTemplate {id:$id}) SET t += $p", id=t["id"], p=t)
+            templates.upsert(t)
         import_employees("employees.csv", (SEED / "employees.csv").read_bytes())
         demo_progress()
     from connectors.seed import seed_connectors
