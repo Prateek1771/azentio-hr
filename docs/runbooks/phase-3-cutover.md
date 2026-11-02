@@ -12,6 +12,10 @@ restore path.**
 1. **Pre-checks**
    - CI is green on the batch PR. That covers `test_phase3`, the API contract and smoke.
    - Take a graph snapshot: `docker compose exec falkordb redis-cli BGSAVE`, then wait until `LASTSAVE` changes.
+     **The snapshot is sensitive.** It keeps every graph value as it was, including the plaintext connector secrets
+     that batch C encrypts and then removes from the graph. Store it like a credential, delete it once its batch is
+     signed off (after E it's the cleanup's rollback point; delete it once E is signed off), and rotate any real
+     credential it held.
    - Save the "before" report: `cd backend && uv run python -m graph_migration report --out ../before-<batch>.json`.
 2. **Freeze**
    - Stop **every** backend instance. The cutover refuses to run while another instance's heartbeat is still
@@ -249,8 +253,3 @@ counts equal. Both secrets became Fernet tokens (`secret_key_id d8f1b5e4`, the d
   onboarding links. Re-upgrade: five clean cutovers.
 
 **Sign-off:** dev ✓. CI on the PR covers `test_phase3` (C section and API contract) with a throwaway `SECRETS_KEY`.
-
-**Deep test (2026-11-02):** the review found the graph still held the plaintext secrets after cutover. The fixed
-cutover removes them, so dev was rolled back (`rollback C`) and restarted: cut over at 15:58:20 UTC, no `secret`
-property left in the graph, the Slack and Jira hints unchanged, both connection tests 200, and all 15 labels at parity
-with no drift. Upgrading an install that ran the earlier C build means the same two steps: `rollback C`, then restart.

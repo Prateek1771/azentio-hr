@@ -859,6 +859,9 @@ Every step is idempotent: running it twice gives the same state as running it on
 3. **`db.migrate()`:** applies `migrations/NNN_*.sql` in order under an advisory lock (safe with several replicas). Each file runs in its own transaction and is recorded in `schema_migrations`.
 4. **`import_graph_rows()`:** imports the legacy audit history (§10.4), if the graph is reachable.
 5. **`ensure_users()`:** creates the admin from `ADMIN_EMAIL`/`ADMIN_PASSWORD` if missing. In dev the defaults are `admin@azentio.local` / `admin-dev-pass`. An existing password is never overwritten. Outside production it also creates the dev accounts `hrops@`, `approver@`, `manager@` and `auditor@azentio.local`, and prints them once.
+5a. **`migrate_records()` / `migrate_documents()`:** the one-time Phase 1 and Phase 2 backfill gates (§12.3).
+5b. **`migrate_graph_batches()`:** cuts over every Phase 3 batch not yet on Postgres (§12.4). It runs before the job worker, the Gmail poller and the scheduler start, and refuses to start, with "nothing was switched", on a live second instance, a parity or edge mismatch, or graph data the mapping can't take.
+5c. **`secrets.check_at_startup()`:** stored connector secrets must be readable with the configured key ([ADR 0013](adr/0013-connector-secrets-at-rest.md)). A malformed key, production without `SECRETS_KEY` while secrets are stored, or no key matching the stored fingerprints stops startup with the fingerprints named.
 6. **Lifespan:** if the graph is up, it runs `ingest.seed()` (default rules, templates, sample joiners, connectors, policies) and `ensure_dev_manager_reports()`. Then it starts the job worker, the Gmail poller and the integration scheduler.
 
 ### 12.2 Health
@@ -885,6 +888,38 @@ Every step is idempotent: running it twice gives the same state as running it on
   4. stop graph writes, once every read path has switched
 
   The graph then becomes a rebuild-only read model.
+
+### 12.4 The Phase 3 migration engine (`graph_migration.py`)
+Every remaining graph record label moves through one engine, in batches (A1, A2, A3, B, C, D, E). The runbook is `docs/runbooks/phase-3-cutover.md`.
+- **`LabelSpec`, registered by the module that owns the table** (`SPEC_MODULES`):
+  - the `table` and `key`
+  - `to_row`, which maps graph properties to columns
+  - `canonical`, one comparable form used for both sides
+  - `from_row`, which maps a row back to graph properties for rollback; it never emits null
+  - `mapped_keys` / `dropped_keys`, for the schema diff
+  - `projection=True` when the graph keeps the label as a projection (`Owner`)
+  - `allowed_readers`
+  - `edges`
+  - `after_cutover`
+- **`EdgeSpec`:**
+  - `graph_count` / `pg_count`, the counts that must match
+  - `restore()`, which rebuilds the edges in the graph on rollback
+  - optional `backfill(conn)`, for edges that have no node of their own (the employee ↔ connector record links). It runs inside the cutover transaction and replaces the table's contents.
+- **`cutover(batch)`:**
+  1. Takes the advisory lock and checks the freeze: refuses if another instance's heartbeat is still advancing.
+  2. Backfills every label idempotently, then the edges, in one transaction.
+  3. Reports per label: counts, checksums, the first mismatch, the schema diff, edge counts, and the read-path scan (code that still names the label). A label is `ok` only if parity, edges and the schema diff are all clean.
+  4. If anything isn't clean, it raises and switches nothing.
+  5. Otherwise, `after_cutover` runs (batch C removes the plaintext secrets from the graph), and the graph checksum taken after it becomes the drift baseline. Then the bridge switches.
+- **`drift_since_cutover()`:**
+  - A retired label is compared with its baseline; a graph emptied by a wipe counts as ok.
+  - A projection label is compared with Postgres as it is now.
+- **`rollback(batch)`:**
+  1. Builds every graph payload first, so a row that can't be converted (for example, a secret with no key) aborts before anything changes.
+  2. Removes graph nodes that aren't in the table, including nodes that lack the key property.
+  3. Writes every row back and restores the edges.
+  4. Checks parity per label, then switches the bridge back.
+- **CLI:** `python -m graph_migration report|drift|rollback <batch>`. `/api/admin/migration` (admin and auditor) serves the same report on the System page.
 
 ---
 
