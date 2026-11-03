@@ -12,6 +12,9 @@ Rules (see AGENTS.md "Rules for changes"):
   7. No bulk status write for document items (records.set_items_status with a "document" key) outside
      backend/documents/. A document item's status is derived from a document decision; the database trigger
      items_status_from_document (migration 010) enforces it for every other write path.
+  8. The graph is a read model (Phase 3 E): no Cypher in backend/ or scripts/ (tests included) writes a label outside
+     Employee, Item, Document, Owner, PolicyChunk. Owner nodes are written only in backend/records.py and PolicyChunk
+     only in backend/chat.py. graph.q() enforces the same at runtime (ReadModelViolation).
 
 Usage:  python scripts/check_boundaries.py [--base <git-ref>]     # default base: merge-base with origin/main
         python scripts/check_boundaries.py --selftest             # proves each rule rejects a known-bad snippet
@@ -124,6 +127,53 @@ def check_document_writes(files) -> list[str]:
             for v in document_violations(s):
                 errs.append(f"{rel}:{line}: {v}. No direct graph writes of Documents or their edges outside "
                             f"backend/documents/store.py; write through documents.store (the graph is a projection)")
+    return errs
+
+
+# ---------- rule 8: the graph is a read model ----------
+
+READ_MODEL = {"Employee", "Item", "Document", "Owner", "PolicyChunk"}
+WRITE_KW = re.compile(r"\b(CREATE|MERGE|SET|DELETE|REMOVE)\b")
+NODE_LABELS = re.compile(r"\(\s*\w*\s*((?::\s*\w+)+)")
+TEST_LABEL = re.compile(r"\b(?:WHERE|AND|OR|XOR|NOT)\s+\(?\s*\w+:(\w+)")
+SET_LABEL = re.compile(r"\b(?:SET|REMOVE)\s+\w+((?::\s*\w+)+)")
+INDEX_DDL = re.compile(r"^\s*CREATE\s+(VECTOR\s+)?INDEX\b")
+# The Phase 3 inventory of retired record labels. Tests may write synthetic labels (engine probes), never these.
+RETIRED = {"EmailTemplate", "Config", "Policy", "Rule", "Event", "GuardrailEvent", "EvalRun",
+           "EvalResult", "Connector", "ConnectorInstance", "Record", "CustomField", "ImportRun", "IntegrationRun",
+           "Integration", "IntegrationCandidate", "WorkflowRun", "IntegrationLogRecord", "OutboundMessage",
+           "AgentMessage", "AuditLog"}
+# label writer -> the one file allowed to write it (Employee/Item and Document are rules 1 and 6)
+LABEL_OWNERS = {"Owner": "backend/records.py", "PolicyChunk": "backend/chat.py"}
+
+
+def read_model_violations(text: str, only: set[str] | None = None) -> list[str]:
+    """A Cypher write naming any label outside the read model (or, with `only`, one of those labels)."""
+    if not WRITE_KW.search(text) or not re.search(r"\b(MATCH|MERGE|CREATE)\b", text) or INDEX_DDL.match(text):
+        return []
+    text = text.replace("`", "")
+    labels = {lbl for rx in (NODE_LABELS, SET_LABEL) for m in rx.finditer(text) for lbl in re.findall(r"\w+", m.group(1))}
+    bad = (labels | set(TEST_LABEL.findall(text))) - READ_MODEL
+    if only is not None:
+        bad &= only
+    return [f"writes {', '.join(sorted(bad))}, outside the graph read model"] if bad else []
+
+
+def check_read_model(files) -> list[str]:
+    errs = []
+    for path, rel in files:
+        if rel == "scripts/check_boundaries.py":  # its selftest samples
+            continue
+        for line, s in strings(ast.parse(path.read_text(encoding="utf-8"))):
+            for v in read_model_violations(s, RETIRED if is_test(rel) else None):
+                errs.append(f"{rel}:{line}: {v}. The record lives in Postgres; the graph holds only the projection "
+                            f"and the policy index (graph.q refuses this at runtime too)")
+            if not re.search(r"\b(MATCH|MERGE|CREATE)\b", s):
+                continue
+            for label, owner in LABEL_OWNERS.items():
+                if rel != owner and not is_test(rel):
+                    for v in node_violations(s, label):
+                        errs.append(f"{rel}:{line}: {v}. Only {owner} writes {label} nodes")
     return errs
 
 
@@ -246,8 +296,9 @@ def check_audit(paths) -> list[str]:
 def run(base: str | None) -> list[str]:
     files = list(py_files())
     sql = [(p, p.relative_to(ROOT).as_posix()) for p in sorted((BACKEND / "migrations").glob("*.sql"))]
+    scripts = [(p, p.relative_to(ROOT).as_posix()) for p in sorted((ROOT / "scripts").glob("*.py"))]
     return (check_graph_writes(files) + check_document_writes(files) + check_doc_item_status(files) + check_roles(files) + check_migrations(base)
-            + check_kinds(files, registered_kinds()) + check_audit(files + sql))
+            + check_kinds(files, registered_kinds()) + check_audit(files + sql) + check_read_model(files + scripts))
 
 
 def selftest() -> None:
@@ -263,7 +314,7 @@ def selftest() -> None:
         "MATCH (e:Employee {id:$e}), (d:Document {id:$id}) CREATE (e)-[:SUBMITTED]->(d)",
         "MATCH (e:Employee {id:$e})-[s:SYNCED_TO]->() DELETE s",
         "MATCH (i:Item {id:$id})-[:HAS_DOC]->(d:Document) WITH d ORDER BY d.ts DESC LIMIT 1 SET d.status=$s",
-        "MATCH (e:Employee {id:$e}), (r:Record {id:$r}) MERGE (e)-[:FROM_CANDIDATE]->(r)",
+        "MATCH (e:Employee {id:$e}), (c:Contact {id:$r}) MERGE (e)-[:KNOWS]->(c)",
     ]
     for c in bad_cypher:
         assert cypher_violations(c), f"rule 1 missed: {c}"
@@ -289,6 +340,21 @@ def selftest() -> None:
         assert ROLE_CHECK.search(line), f"rule 2 missed: {line}"
     for line in ['if c["role"] == role:', 'job_title = e["role"]', 'if s_inst["role"] != "source":']:
         assert not ROLE_CHECK.search(line), f"rule 2 false positive: {line}"
+    bad8 = ["CREATE (r:Record {id:$id})", "MATCH (i:ConnectorInstance {id:$id}) SET i.secret=$s",
+            "MATCH (n) WHERE n:Event DETACH DELETE n", "MERGE (n:AuditLog {id:$k}) SET n = $p",
+            "MATCH (e:Employee {id:$e}), (r:Record {id:$r}) CREATE (e)-[:SYNCED_TO]->(r)", "MATCH (i:Integration) REMOVE i.x",
+            "MATCH (n {id:$id}) SET n:Event", "CREATE (r:`Record` {id:1})", "MATCH (n) WHERE n:Owner XOR n:Rule DELETE n"]
+    ok8 = ["MATCH (r:Record) RETURN r", "CREATE INDEX FOR (n:Rule) ON (n.id)", "MATCH (n) DETACH DELETE n",
+           "MATCH (e:Employee {id:$id}), (m) WHERE (m:Owner OR m:Employee) AND m <> e CREATE (e)-[:REPORTS_TO]->(m)",
+           "UNWIND $rows AS r MERGE (o:Owner {email:r.email}) SET o = r", "MATCH (c:PolicyChunk {source:$s}) DELETE c"]
+    for c in bad8:
+        assert read_model_violations(c), f"rule 8 missed: {c}"
+    for c in ok8:
+        assert not read_model_violations(c), f"rule 8 false positive: {c} -> {read_model_violations(c)}"
+    assert read_model_violations("CREATE (n:Event {id:1})", RETIRED), "rule 8 missed a retired label in a test"
+    assert not read_model_violations("CREATE (n:SyntheticProbe {id:1})", RETIRED), "rule 8 flagged a synthetic test label"
+    assert node_violations("MERGE (o:Owner {email:$e}) SET o.name=$n", "Owner"), "rule 8 missed an Owner write"
+    assert node_violations("CREATE (c:PolicyChunk {id:$id})", "PolicyChunk"), "rule 8 missed a PolicyChunk write"
     bad7 = ast.parse('records.set_items_status(e, keys, {"document": "Accepted", "task": "Completed"})')
     ok7 = ast.parse('records.set_items_status(e, keys, {"ack": "Acknowledged", "task": "Completed"})')
     assert bulk_doc_status_calls(bad7), "rule 7 missed a bulk document status write"
@@ -306,7 +372,7 @@ def selftest() -> None:
     finally:
         tmp.unlink(missing_ok=True)
     assert registered_kinds() >= {"ops", "policy.approval", "policy.near_start"}, "could not read work_queue.KINDS"
-    print("boundary guard selftest: ok (rules 1, 2, 4, 5, 6, 7 reject known-bad code; rule 3 is a git diff)")
+    print("boundary guard selftest: ok (rules 1, 2, 4, 5, 6, 7, 8 reject known-bad code; rule 3 is a git diff)")
 
 
 if __name__ == "__main__":

@@ -16,8 +16,26 @@ The graph is rebuilt on purpose, from Postgres:
 
 There's no background sync.
 
+### As built (Phase 3, batch E)
+- **Enforced, not just agreed:**
+  - The graph may hold only `Employee`, `Item`, `Document`, `Owner` (the projection) and `PolicyChunk` (the retrieval
+    index).
+  - `graph.q()` refuses any write naming another label (`ReadModelViolation`). The rollback tool and old-release test
+    setups opt in explicitly (`graph.legacy_writes()`).
+  - Guard rule 8 refuses such Cypher in code.
+- **Self-healing:**
+  - `read_model.rebuild()` wipes the graph and projects everything from Postgres.
+  - A lost graph found at startup, or unexpected labels after the cleanup, queue that rebuild as a job (`graph.rebuild`).
+  - While it runs, the relationship view returns 503 and policy search says it's rebuilding: a partial projection is
+    never served. Records are unaffected.
+- **Drift repair:**
+  - `read_model.verify()` runs hourly and re-projects any employee whose graph differs from Postgres.
+  - If the drift survives the repair, it opens one `ops` work item.
+- **Cleanup:** the one-time cleanup (`python -m read_model cleanup`) removed every retired record label and the legacy
+  `AuditLog` nodes.
+
 ## Consequences
-- The graph can't drift from Postgres unnoticed, and it can be thrown away and rebuilt at any time.
+- The graph can't drift from Postgres unnoticed (`/ready` shows `graph_projection`), and it can be thrown away and rebuilt at any time, automatically.
 - Graph reads stay fast for dependency walks and the graph view.
 - Harder: writes that touch an employee pay for a small rebuild of that subgraph, so watch that write path's latency.
 

@@ -35,6 +35,8 @@ class EdgeSpec:
     graph_count: str       # Cypher returning {n}
     pg_count: str          # SQL returning {n}
     restore: Callable[[], None] | None = None  # rollback: rebuild these edges in the graph from Postgres
+    backfill: Callable[[object], None] | None = None  # cutover: copy edges with no node of their own (e.g. links) into
+    #                                                   their table, given the cutover transaction's connection
 
 
 @dataclass
@@ -42,31 +44,51 @@ class LabelSpec:
     label: str
     batch: str
     table: str
-    graph_query: str                     # Cypher returning one node per row as `n` (extra columns are merged in)
     to_row: Callable[[dict], dict]       # graph props -> table columns
     canonical: Callable[[dict], dict]    # table row -> comparable dict (same function for both sides, after to_row)
     from_row: Callable[[dict], dict]     # table row -> graph props (rollback)
+    graph_query: str = ""                # Cypher returning one node per row as `n`; default MATCH (n:<label>) RETURN n.
+    #                                      Built here so the owning module doesn't show up as a graph read path.
     key: str = "id"
+    projection: bool = False             # the graph keeps the label as a projection of the table (e.g. Owner): drift
+    #                                      then means graph != Postgres now, not "the graph changed since cutover"
     mapped_keys: frozenset = frozenset()     # graph property names consumed by to_row
     dropped_keys: frozenset = frozenset()    # graph properties deliberately not carried over (documented)
     edges: list[EdgeSpec] = field(default_factory=list)
     allowed_readers: tuple = ()              # files allowed to keep MATCHing the label (e.g. the rebuild)
+    after_cutover: Callable[[], None] | None = None  # runs once the batch is clean, before the switch (e.g. scrub
+    #                                                  plaintext secrets from the graph); drift is measured from after it
 
 
 SPECS: dict[str, LabelSpec] = {}
+SPEC_MODULES = ("owners", "templates", "policies", "policy.legacy", "events", "guardrails", "evals",
+                "connectors.store", "integrations.store")  # each registers its labels' specs on import (batch A1 onward)
+_loaded = False
 
 
 def register(spec: LabelSpec) -> LabelSpec:
+    if not spec.graph_query:
+        spec.graph_query = f"MATCH (n:{spec.label}) RETURN n"
     SPECS[spec.label] = spec
     return spec
 
 
+def load() -> dict[str, LabelSpec]:
+    global _loaded
+    if not _loaded:
+        import importlib
+        for m in SPEC_MODULES:  # a failing import raises here, every time: never a silently partial registry
+            importlib.import_module(m)
+        _loaded = True
+    return SPECS
+
+
 def batch_labels(batch: str) -> list[LabelSpec]:
-    return [s for s in SPECS.values() if s.batch == batch]
+    return [s for s in load().values() if s.batch == batch]
 
 
 def batches() -> list[str]:
-    return sorted({s.batch for s in SPECS.values()})
+    return sorted({s.batch for s in load().values()})
 
 
 # ---------- reading both sides ----------
@@ -85,12 +107,29 @@ def pg_rows(spec: LabelSpec, conn=None) -> list[dict]:
     return db.fetch(f"SELECT * FROM {spec.table}", conn=conn)
 
 
+def graph_float(x: float) -> float:
+    """A float as the graph hands it back: FalkorDB returns ~15 significant digits (1793675757.310502 comes back as
+    1793675757.3105). Both sides are compared at that precision, or a full-precision Postgres value written back by a
+    rollback fails parity on read-back (about 0.5% of millisecond-rounded timestamps did)."""
+    return float(f"{x:.15g}")
+
+
+def _norm(v):
+    if isinstance(v, float):
+        return graph_float(v)
+    if isinstance(v, dict):
+        return {k: _norm(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_norm(x) for x in v]
+    return v
+
+
 def _canon_graph(spec: LabelSpec, props: list[dict]) -> list[dict]:
-    return [spec.canonical(spec.to_row(p)) for p in props]
+    return [_norm(spec.canonical(_norm(spec.to_row(p)))) for p in props]
 
 
 def _canon_pg(spec: LabelSpec, rows: list[dict]) -> list[dict]:
-    return [spec.canonical(r) for r in rows]
+    return [_norm(spec.canonical(_norm(r))) for r in rows]
 
 
 def graph_checksum(spec: LabelSpec) -> str:
@@ -129,15 +168,29 @@ def read_paths(label: str, allowed: tuple = ()) -> list[str]:
     ponytail: a label built at runtime (f"(n:{label})") can't be seen statically; graph.q()'s runtime check covers it."""
     rx = label_rx(label)
     hits = []
-    for base in (ROOT, ROOT.parent / "scripts"):
-        for p in base.rglob("*.py"):
-            rel = p.relative_to(ROOT.parent).as_posix()
-            if ".venv" in rel or rel.endswith("graph_migration.py") or rel in allowed or "/migrations/" in rel:
-                continue
-            for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-                if rx.search(line):
-                    hits.append(f"{rel}:{i}")
+    for p in source_files():
+        rel = p.relative_to(ROOT.parent).as_posix()
+        if rel.endswith("graph_migration.py") or rel == "scripts/check_boundaries.py" or rel in allowed:  # the analysers
+            continue
+        for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if rx.search(line):
+                hits.append(f"{rel}:{i}")
     return hits
+
+
+_SKIP_DIRS = {".venv", "venv", "node_modules", "__pycache__", ".ruff_cache", ".git", "migrations", "uploads"}
+
+
+def source_files() -> list[Path]:
+    """The app's own Python files (backend/ and scripts/). Prunes .venv and friends while walking: an rglob that
+    filtered them afterwards walked ~22k dependency files per call, seconds per label on every report."""
+    import os
+    out = []
+    for base in (ROOT, ROOT.parent / "scripts"):
+        for d, dirs, files in os.walk(base):
+            dirs[:] = [x for x in dirs if x not in _SKIP_DIRS]
+            out += [Path(d) / f for f in files if f.endswith(".py")]
+    return out
 
 
 def label_report(spec: LabelSpec) -> dict:
@@ -154,7 +207,7 @@ def label_report(spec: LabelSpec) -> dict:
         edges.append({"edge": e.name, "graph": g, "pg": p, "ok": g == p})
     paths = read_paths(spec.label, spec.allowed_readers)
     ok = par["ok"] and not unmapped and all(e["ok"] for e in edges)
-    return {"label": spec.label, "table": spec.table, "ok": ok, **par, "graph_keys": seen, "unmapped_keys": unmapped,
+    return {"label": spec.label, "table": spec.table, **par, "ok": ok, "graph_keys": seen, "unmapped_keys": unmapped,
             "dropped_keys": sorted(spec.dropped_keys), "edges": edges, "read_paths_remaining": paths}
 
 
@@ -219,6 +272,10 @@ def _cutover(batch: str, todo: list[LabelSpec], freeze: dict) -> dict:
         c.execute("SET LOCAL azentio.backfill = '1'")
         for s in todo:
             backfill(s, c)
+        for s in todo:  # after every node, so a link's rows exist
+            for e in s.edges:
+                if e.backfill:
+                    e.backfill(c)
     reports = [label_report(s) for s in todo]
     bad = [r for r in reports if not r["ok"] or r["read_paths_remaining"]]
     if bad:
@@ -226,22 +283,36 @@ def _cutover(batch: str, todo: list[LabelSpec], freeze: dict) -> dict:
                                  + json.dumps([{k: r[k] for k in ('label', 'ok', 'first_mismatch_id', 'unmapped_keys',
                                                                      'edges', 'read_paths_remaining')} for r in bad]))
     at = datetime.now(timezone.utc).isoformat()
+    baseline = {}
+    for s in todo:
+        if s.after_cutover:
+            from graph import legacy_writes
+            with legacy_writes():  # e.g. scrubbing a retired label's plaintext
+                s.after_cutover()
+        baseline[s.label] = graph_checksum(s) if s.after_cutover else None
     for r in reports:
         _set_state(r["label"], "postgres", {**r, "batch": batch, "cutover_at": at, "before": before[r["label"]],
-                                             "freeze": freeze, "graph_checksum_at_cutover": r["graph_sha"]})
+                                             "freeze": freeze,
+                                             "graph_checksum_at_cutover": baseline[r["label"]] or r["graph_sha"]})
+    if any(s.projection for s in todo):  # e.g. a legacy Owner node keyed `A.B@x` vs the row `a.b@x`: re-project
+        import records                  # everything once, so no edge points at a node the next refresh would drop
+        records.rebuild_graph()
     return {"batch": batch, "cutover_at": at, "freeze": freeze, "labels": reports, "before": before}
 
 
 def drift_since_cutover() -> list[dict]:
     """For every switched label: has the graph side changed since cutover? (A stray writer of a retired label.)"""
     out = []
-    for s in SPECS.values():
+    for s in list(load().values()):
         st = _state(s.label)
         if not st or st["source"] != "postgres":
             continue
         then = (st["report"] or {}).get("graph_checksum_at_cutover")
+        if s.projection:  # the projection follows Postgres: compare with Postgres now
+            then = bridge.checksum(_canon_pg(s, pg_rows(s)), s.key)
         now = graph_checksum(s)
-        out.append({"label": s.label, "batch": s.batch, "ok": then == now, "at_cutover": then, "now": now,
+        emptied = not s.projection and now == bridge.checksum([], s.key)  # a wiped graph, not a stray write
+        out.append({"label": s.label, "batch": s.batch, "ok": then == now or emptied, "at_cutover": then, "now": now,
                     "cutover_at": (st["report"] or {}).get("cutover_at")})
     return out
 
@@ -261,17 +332,23 @@ def rollback(batch: str, watch: float | None = None) -> dict:
     """Write the batch's Postgres rows back to the graph (including rows written after cutover), check parity,
     and switch the bridge back to the graph. Use with the previous release. Refuses while any instance is live:
     a running app would keep writing Postgres after the switch back (split brain)."""
-    return _exclusive(f"rollback {batch}", watch, lambda freeze: _rollback(batch, freeze))
+    from graph import legacy_writes
+    with legacy_writes():  # the one sanctioned writer of retired labels: it restores them for the previous release
+        return _exclusive(f"rollback {batch}", watch, lambda freeze: _rollback(batch, freeze))
 
 
 def _rollback(batch: str, freeze: dict) -> dict:
     from graph import q
     reports = []
-    for s in batch_labels(batch):
-        rows = pg_rows(s)
-        q(f"MATCH (n:{s.label}) WHERE NOT n.{s.key} IN $keep DETACH DELETE n", keep=[r[s.key] for r in rows])
-        for r in rows:
-            q(f"MERGE (n:{s.label} {{{s.key}: $k}}) SET n = $p", k=r[s.key], p=s.from_row(r))
+    try:  # every payload first: a row that can't be converted aborts before anything is written or switched
+        plan = [(s, [(r[s.key], s.from_row(r)) for r in pg_rows(s)]) for s in batch_labels(batch)]
+    except Exception as e:
+        raise bridge.ParityError(f"rollback {batch}: a row can't be written back ({type(e).__name__}: {e}); "
+                                 "nothing was changed") from None
+    for s, payload in plan:
+        q(f"MATCH (n:{s.label}) WHERE n.{s.key} IS NULL OR NOT n.{s.key} IN $keep DETACH DELETE n", keep=[k for k, _ in payload])
+        for k, p in payload:
+            q(f"MERGE (n:{s.label} {{{s.key}: $k}}) SET n = $p", k=k, p=p)
         for e in s.edges:
             if e.restore:
                 e.restore()
@@ -281,6 +358,8 @@ def _rollback(batch: str, freeze: dict) -> dict:
         _set_state(s.label, "graph", {"rolled_back_at": datetime.now(timezone.utc).isoformat(), "parity": rep,
                                        "freeze": freeze})
         reports.append(rep)
+    if db.fetch1("SELECT to_regclass('graph_state') AS t")["t"]:  # retired labels are back on purpose: not drift to wipe
+        db.execute("UPDATE graph_state SET cleaned_at = NULL WHERE id = 1")
     return {"batch": batch, "labels": reports}
 
 
@@ -289,7 +368,7 @@ def full_report() -> dict:
     states = {r["record_type"]: r for r in db.fetch("SELECT * FROM bridge_state")}
     drift = {d["label"]: d for d in drift_since_cutover()}
     labels = []
-    for s in SPECS.values():
+    for s in list(load().values()):
         st = states.get(s.label) or {}
         rep = st.get("report") or {}
         labels.append({"label": s.label, "batch": s.batch, "table": s.table, "source": st.get("source", "graph"),
@@ -309,8 +388,8 @@ def epoch(v) -> float | None:
     if v in (None, "", 0):
         return None
     if isinstance(v, datetime):
-        return round(v.timestamp(), 3)
-    return round(float(v), 3)
+        return round(graph_float(v.timestamp()), 3)
+    return round(graph_float(float(v)), 3)
 
 
 def ts(v) -> datetime | None:
@@ -325,6 +404,17 @@ def jsonv(v, default):
         except ValueError:
             return default
     return default if v is None else v
+
+
+def json_strict(v, default, what: str):
+    """A graph JSON string for a cutover: empty -> default; malformed -> refuse, naming the node (mapping it to the
+    default would pass parity on both sides and silently lose the data)."""
+    if isinstance(v, str) and v.strip():
+        try:
+            return json.loads(v)
+        except ValueError:
+            raise ValueError(f"{what} holds malformed JSON; fix it in the graph and restart") from None
+    return default if v in (None, "") else v
 
 
 def sha(obj) -> str:
@@ -343,14 +433,15 @@ if __name__ == "__main__":
     load_dotenv(ROOT.parent / ".env")
     db.init()
     bridge.load()
+    import graph_migration as gm  # under `python -m` this file is __main__; spec modules register into the real module
     if a.command == "report":
-        out = full_report()
+        out = gm.full_report()
     elif a.command == "drift":
-        out = drift_since_cutover()
+        out = gm.drift_since_cutover()
     else:
         if not a.batch:
             sys.exit("rollback needs a batch name")
-        out = rollback(a.batch)
+        out = gm.rollback(a.batch)
     text = json.dumps(out, indent=1, default=str)
     if a.out:
         Path(a.out).write_text(text + "\n", encoding="utf-8")

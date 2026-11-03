@@ -50,7 +50,7 @@ def drain():
 
 
 # ---------- fixtures ----------
-ingest.import_requirements("requirements.json", (SEED / "requirements.json").read_bytes())  # legacy graph rules + config
+ingest.import_requirements("requirements.json", (SEED / "requirements.json").read_bytes())  # no active version yet: becomes v1
 ingest.import_owners("owners.csv", (SEED / "owners.csv").read_bytes())
 hr = idsvc.create_user("hr@t.io", "HR", "hr_ops", "hr-pass-12345", actor="test")
 ap1 = idsvc.create_user("ap1@t.io", "Ap One", "approver", "ap1-pass-12345", actor="test")
@@ -68,7 +68,7 @@ far = joiner("Far Away", "far@t.io", 20)
 near = joiner("Near Start", "near@t.io", 2)
 hr_dept = joiner("Hana HR", "hana@t.io", 25, department="Human Resources")
 v1 = store.active_version()
-check("v1_created_from_legacy_rules", v1 and v1["number"] == 1 and len(store.rules_of(v1["id"])) == 18)
+check("v1_created_by_import", v1 and v1["number"] == 1 and len(store.rules_of(v1["id"])) == 18)
 check("v1_compliance_flags", {r["id"] for r in store.rules_of(v1["id"]) if r["compliance"]} == {"R-ID", "R-I9", "R-BGV"})
 keys_far = {i["key"] for i in records.items(far)}
 check("joiner_built_from_active_version", {"photo_id", "pan_card", "background_verification"} <= keys_far)

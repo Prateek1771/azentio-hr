@@ -118,7 +118,7 @@ def diff(old, new, path="") -> list[str]:
 def build() -> dict:
     from shared import db
     db.use_test_database("azentio_contract")
-    from graph import q, q1
+    from graph import q
     q("MATCH (n) DETACH DELETE n")
     import llm
     llm.API_KEY = ""
@@ -141,8 +141,8 @@ def build() -> dict:
     # one integration, set up through the rule-based agent and run once (simulated delivery)
     from integrations import chat as wf_chat, engine as wf_engine, service as wf_service
     from integrations import store as wf_store
-    cp_id = q1("MATCH (i:ConnectorInstance {key:'candidate_portal'}) RETURN i.id AS id")["id"]
-    hr_id = q1("MATCH (i:ConnectorInstance {key:'hr_portal'}) RETURN i.id AS id")["id"]
+    from connectors import store as connectors
+    cp_id, hr_id = connectors.instance_id_for("candidate_portal"), connectors.instance_id_for("hr_portal")
 
     async def setup():
         it = wf_service.create("Contract integration", "", cp_id, hr_id)
@@ -182,7 +182,7 @@ def build() -> dict:
 
     # a CSV import into the candidate import connector
     from connectors import registry
-    ci_id = q1("MATCH (i:ConnectorInstance {key:'candidate_import'}) RETURN i.id AS id")["id"]
+    ci_id = connectors.instance_id_for("candidate_import")
     csv = "\n".join([
         "candidate_id,first_name,last_name,email,designation,department_name,grade,location,joining_date,status",
         "C900,Asha,Rao,asha.rao@example.com,Analyst,Finance,G2,Bengaluru,2026-12-01,hired",
