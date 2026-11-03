@@ -1,7 +1,7 @@
 """Rule-set versions in Postgres (ADR 0009). A version is a snapshot of ALL rules plus the config the engine reads,
 so preview = build_items(emp, draft) vs the joiner's current items, and rollback = publish an older snapshot again.
 
-Owners are directory data, not policy: they stay live (graph Owner nodes) and aren't snapshotted.
+Owners are directory data, not policy: they stay live (`owners.py`, Postgres) and aren't snapshotted.
 """
 import json
 

@@ -1,6 +1,6 @@
 # Phase 3: Retire graph record storage
 
-- **Status:** in progress. PR 0 (tooling) is done; batches A1 → E follow, one PR each.
+- **Status:** in progress. PR 0 (tooling) and batch A1 (owners, email templates) are done; A2 → E follow, one PR each.
 - **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
 - **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
 - **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
@@ -31,6 +31,28 @@
   heartbeat, a stopped one, a held lock), refusal when not clean, cutover, idempotency, drift, the report, and a
   rollback round trip that includes rows written after cutover, and refusal to roll back while the app is live.
 
+## As built: batch A1 (owners, email templates)
+- **Changed from the plan:** `Config` moved from A1 to **A3**. Its only reader that matters is `policy.store.ensure_active`
+  building v1 from graph `Rule` + `Config` on a fresh install, and its only writer is `ingest.import_requirements`.
+  Retiring it means rewriting that import flow, which is A3, so A3 retires `Rule` and `Config` together.
+- Migration `011_owners_templates.sql`: `owners` (email PK, lowercase CHECK) and `email_templates`. The columns are exactly
+  the old graph properties, so `/api/templates` and `/api/rules.owners` keep their shape (the contract check passes).
+- `owners.py` (`all`, `get`, `emails(type)`, `by_category`, `manager_for`, `upsert`) and `templates.py` (`all`, `get`,
+  `upsert`) are the only readers and writers. Each registers its `LabelSpec`; `graph_migration.SPEC_MODULES` lists the
+  modules and `load()` imports them on first use (bootstrap, CLI, `/api/admin/migration`).
+- `Owner` stays in the graph as a **projection**: `records.project_owners()` MERGEs every owner from Postgres and deletes
+  the rest. It runs after every `owners.upsert` and at the start of a full `rebuild_graph()`. It never wipes the graph
+  from an empty table (a release before the cutover).
+- The engine got two small additions: `LabelSpec.graph_query` defaults to `MATCH (n:<label>) RETURN n`, built in the
+  engine, so the owning module isn't itself a read path. `LabelSpec.projection=True` makes drift compare the graph with
+  Postgres *now*, because a projection legitimately changes after cutover.
+- The CLI (`python -m graph_migration`) calls the imported module, not `__main__`, so it sees the registered specs.
+- The template save now writes the row and its audit entry in one transaction.
+- `test_phase3` A1 section: the old release's graph data, a clean cutover, reads from Postgres (`manager_for`,
+  `by_category`, `gmail.render`), the projection following app writes, drift on a stray template write and on an
+  out-of-step projection, `rebuild_graph` repairing it, then rollback (the new rows reach the graph) and a second cutover.
+- Dev cutover, freeze and rollback drill: see the runbook's A1 section.
+
 ## The approved plan
 
 ### Context
@@ -58,7 +80,7 @@ v2 builds all of them in.
 |---|---|---|---|---|
 | Owner | 8 | `owners` table; graph `Owner` becomes a projection | `owners.py` | A1 |
 | EmailTemplate | 4 | `email_templates` | `templates.py` | A1 |
-| Config | 4 | removed: the rule-set version config already owns it | `policy/store.py` | A1 |
+| Config | 4 | removed: the rule-set version config already owns it | `policy/store.py` | A3 (moved from A1, see "As built: A1") |
 | Policy | 7 | `policies` (uploads are authoritative) | `policies.py` | A2 |
 | PolicyChunk | 31 | stays in the graph: derived index, rebuilt from `policies` | `chat.index_policy` | A2 |
 | Rule (legacy) | 18 | removed: `import_requirements` writes rule-set versions | `ingest.py` → `policy/store.py` | A3 |
@@ -125,7 +147,7 @@ The known bypasses are closed in their batch:
 - **`/api/admin/migration`** (admin, auditor) and a System page with a Migration card: per label, source, parity, counts, cutover time and drift-since-cutover.
 
 ### Batches
-- **A1, config/owners/templates (migration 011):**
+- **A1, owners/templates (migration 011; Config moved to A3):**
   - Tables: `owners`, `email_templates`.
   - New modules `owners.py` (`all`, `get`, `by_category`, `upsert`, `manager_for`) and `templates.py`.
   - The 13 Owner sites and the template sites switch over.
@@ -139,6 +161,8 @@ The known bypasses are closed in their batch:
 - **A3, the import flow:**
   - `ingest.import_requirements` creates v1 in Postgres on a fresh install, and opens a governed draft when an active version exists.
   - It stops writing `Rule`/`Config` nodes; the legacy graph-rule reader in `ensure_active` is removed.
+  - `Config` retires here too: `checklist.config()` drops its graph fallback, and `ingest.seed` stops using
+    `Config {key:'doc_types'}` to detect a first run.
   - **Feature smoke:** an upload on `/import` → a draft appears → preview.
 - **B, activity (migration 013):**
   - Tables: `events` (no FK; indexed on (employee_id, ts) and ts), `guardrail_events`, `eval_runs`, `eval_results`.

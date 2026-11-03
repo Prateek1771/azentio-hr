@@ -180,7 +180,8 @@ from documents.seed import accept_for_demo  # noqa: E402
 _docsvc.UPLOADS = _Path(tempfile.mkdtemp(prefix="azentio-core-"))  # demo documents never land in the real uploads folder
 if not gq1("MATCH (r:Rule) RETURN r LIMIT 1"):
     _ingest.import_requirements("requirements.json", (Path(__file__).parent / "seed" / "requirements.json").read_bytes())
-if not gq1("MATCH (o:Owner {type:'manager'}) RETURN o LIMIT 1"):
+import owners as _owners  # noqa: E402
+if not _owners.emails("manager"):
     _ingest.import_owners("owners.csv", (Path(__file__).parent / "seed" / "owners.csv").read_bytes())
 cp_id = gq1("MATCH (i:ConnectorInstance {key:'candidate_portal'}) RETURN i.id AS id")["id"]
 

@@ -3,7 +3,7 @@ import json
 from datetime import date, timedelta
 
 import records
-from graph import q, q1, event
+from graph import q1, event
 
 DONE = {"Accepted", "Completed", "Acknowledged"}
 INITIAL = {"document": "Not Submitted", "task": "Pending", "ack": "Pending"}
@@ -102,8 +102,8 @@ def load_rules() -> list[dict]:
 
 
 def category_owners() -> dict:
-    rows = q("MATCH (o:Owner) WHERE o.type STARTS WITH 'owner:' RETURN o")
-    return {r["o"]["type"].split(":", 1)[1]: r["o"] for r in rows}
+    import owners
+    return owners.by_category()
 
 
 def employee_items(eid: str) -> list[dict]:

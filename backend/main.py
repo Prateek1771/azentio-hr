@@ -22,8 +22,10 @@ import logging_setup as ls  # noqa: E402
 import checklist  # noqa: E402
 import gmail  # noqa: E402
 import ingest  # noqa: E402
+import owners  # noqa: E402
 import pipeline  # noqa: E402
 import records  # noqa: E402
+import templates as templates_store  # noqa: E402  (the route below is named templates)
 from graph import q, q1, event  # noqa: E402
 from identity import perms, service as identity  # noqa: E402
 from shared import bootstrap, db, jobs  # noqa: E402
@@ -406,7 +408,7 @@ async def ingest_file(kind: str = Form(...), file: UploadFile = File(...)):
 
 @app.get("/api/templates")
 def templates():
-    return [r["t"] for r in q("MATCH (t:EmailTemplate) RETURN t ORDER BY t.id")]
+    return templates_store.all()
 
 
 class Template(BaseModel):
@@ -418,8 +420,9 @@ class Template(BaseModel):
 
 @app.put("/api/templates/{tid}")
 def save_template(tid: str, t: Template):
-    audit.record_audit("template.saved", "email_template", tid, f"Saved email template {t.name}")
-    q("MERGE (x:EmailTemplate {id:$id}) SET x.name=$n, x.subject=$s, x.body=$b", id=tid, n=t.name, s=t.subject, b=t.body)
+    with db.tx() as c:
+        templates_store.upsert({**t.model_dump(), "id": tid}, conn=c)
+        audit.record_audit("template.saved", "email_template", tid, f"Saved email template {t.name}", conn=c)
     return t
 
 
@@ -431,7 +434,7 @@ def rules():
     return {"rules": checklist.load_rules(), "doc_types": checklist.config("doc_types"),
             "departments": checklist.config("departments"), "locations": checklist.config("locations"),
             "roles": checklist.config("roles") or [],
-            "owners": [r["o"] for r in q("MATCH (o:Owner) RETURN o ORDER BY o.type")],
+            "owners": owners.all(),
             "version": {"id": act["id"], "number": act["number"], "published_at": act["published_at"],
                         "author_email": act["author_email"]} if act else None}
 
@@ -518,12 +521,12 @@ async def create_joiner(f: dict, template_id: str, send: bool, reason: str, cand
     """Shared by quick onboard and connector 'Start onboarding': validate, create, build checklist, optionally email."""
     preset = next((r for r in checklist.config("roles") or [] if r["role"] == f.get("role")), {})
     department = f.get("department") or preset.get("department", "")
-    manager = f.get("manager_email") or (q1("MATCH (o:Owner {type:'manager', department:$d}) RETURN o.email AS e", d=department) or {}).get("e", "")
+    manager = f.get("manager_email") or owners.manager_for(department)
     row = {"name": (f.get("name") or "").strip(), "email": (f.get("email") or "").strip(), "role": f.get("role", ""),
            "location": f.get("location", ""), "joining_date": f.get("joining_date", ""),
            "grade": f.get("grade") or preset.get("grade", ""), "department": department, "manager_email": manager,
            "date_of_birth": f.get("date_of_birth") or ""}
-    managers = {r["m"] for r in q("MATCH (m:Owner) RETURN toLower(m.email) AS m")} | records.emails()
+    managers = owners.emails() | records.emails()
     valid, errors = ingest.validate_employees([row], checklist.config("departments") or [], checklist.config("locations") or {}, managers)
     if errors:
         raise HTTPException(400, {"message": "Please fix the highlighted fields", "errors": errors})

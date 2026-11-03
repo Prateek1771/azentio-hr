@@ -188,6 +188,59 @@ del gm.SPECS["P3Probe"]
 db.execute("DROP TABLE p3_probe")
 db.execute("DELETE FROM bridge_state WHERE record_type LIKE 'P3%%'")
 
+# ---------- batch A1: Owner (Postgres + graph projection), EmailTemplate (retired from the graph) ----------
+gm.load()
+import gmail  # noqa: E402
+import owners  # noqa: E402
+import templates  # noqa: E402
+
+OWN, TPL = "Owner", "EmailTemplate"  # labels built at runtime: this file plays the old release, not a read path
+db.execute("DELETE FROM bridge_state WHERE record_type IN ('Owner', 'EmailTemplate')")
+db.execute("TRUNCATE owners, email_templates")
+q(f"MATCH (n:{OWN}) DETACH DELETE n")
+q(f"MATCH (n:{TPL}) DETACH DELETE n")
+for e, n, d, t in [("Mgr.Eng@x.com", "Asha", "Engineering", "manager"), ("it@x.com", "IT desk", "IT", "owner:IT"),
+                   ("fac@x.com", "Facilities", "Admin", "owner:Facilities")]:
+    q(f"MERGE (o:{OWN} {{email:$e}}) SET o.name=$n, o.department=$d, o.type=$t", e=e.lower(), n=n, d=d, t=t)
+q(f"CREATE (t:{TPL} {{id:'standard', name:'Standard', subject:'Hi {{{{name}}}}', body:'<p>{{{{doc_list}}}}</p>'}})")
+q(f"CREATE (t:{TPL} {{id:'intern', name:'Intern', subject:'Hey', body:'b'}})")
+
+check("a1_has_no_graph_read_paths_left", gm.read_paths(OWN, ("backend/records.py",)) == [] and gm.read_paths(TPL) == [],
+      (gm.read_paths(OWN, ("backend/records.py",)), gm.read_paths(TPL)))
+res = gm.cutover("A1", watch=0)
+reps = {r["label"]: r for r in res["labels"]}
+check("a1_cutover_clean", all(r["ok"] and not r["unmapped_keys"] for r in reps.values())
+      and reps[OWN]["pg_count"] == 3 and reps[TPL]["pg_count"] == 2 and bridge.SOURCE[OWN] == "postgres", reps)
+check("a1_owners_read_from_postgres", owners.manager_for("Engineering") == "mgr.eng@x.com"
+      and set(owners.by_category()) == {"IT", "Facilities"} and owners.get("MGR.ENG@x.com")["name"] == "Asha")
+check("a1_template_renders_from_postgres", gmail.render("standard", {"name": "Ravi", "doc_list": "<ul></ul>"})
+      == ("Hi Ravi", "<p><ul></ul></p>"))
+
+owners.upsert([{"email": "hr.ops@x.com", "name": "Neha", "department": "HR", "type": "manager"},
+               {"email": "it@x.com", "name": "IT service desk", "department": "IT", "type": "owner:IT"}])
+templates.upsert({"id": "welcome", "name": "Welcome", "subject": "s", "body": "b"})
+g = {r["n"]["email"]: r["n"] for r in q(f"MATCH (n:{OWN}) RETURN n")}
+check("a1_owner_projection_follows_postgres", g.get("hr.ops@x.com", {}).get("name") == "Neha"
+      and g["it@x.com"]["name"] == "IT service desk")
+dr = {d["label"]: d for d in gm.drift_since_cutover()}
+check("a1_no_drift_after_writes_through_the_app", dr[OWN]["ok"] and dr[TPL]["ok"], dr)
+q(f"MATCH (t:{TPL} {{id:'intern'}}) SET t.subject = 'stray'")
+check("a1_drift_catches_a_stray_template_write", not [d for d in gm.drift_since_cutover() if d["label"] == TPL][0]["ok"])
+q(f"MATCH (t:{TPL} {{id:'intern'}}) SET t.subject = 'Hey'")
+q(f"MATCH (o:{OWN} {{email:'it@x.com'}}) SET o.name = 'stray'")
+check("a1_drift_catches_projection_out_of_step", not [d for d in gm.drift_since_cutover() if d["label"] == OWN][0]["ok"])
+import records  # noqa: E402
+records.rebuild_graph()  # the repair path: re-project owners from Postgres
+check("a1_rebuild_repairs_owner_projection", [d for d in gm.drift_since_cutover() if d["label"] == OWN][0]["ok"])
+
+rb = gm.rollback("A1", watch=0)
+gt = {r["n"]["id"] for r in q(f"MATCH (n:{TPL}) RETURN n")}
+check("a1_rollback_writes_new_rows_back", "welcome" in gt and all(r["ok"] for r in rb["labels"])
+      and bridge.SOURCE[TPL] == "graph", rb)
+res = gm.cutover("A1", watch=0)
+check("a1_cutover_again_after_rollback", all(r["ok"] for r in res["labels"]) and bridge.SOURCE[TPL] == "postgres"
+      and len(templates.all()) == 3 and len(owners.all()) == 4)
+
 # ---------- API contract ----------
 out = subprocess.run([sys.executable, str(ROOT / "scripts" / "api_contract.py"), "--check"], capture_output=True, text=True)
 check("api_contract_unchanged", out.returncode == 0, out.stdout[-3000:] + out.stderr[-3000:])

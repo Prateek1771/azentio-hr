@@ -42,11 +42,14 @@ class LabelSpec:
     label: str
     batch: str
     table: str
-    graph_query: str                     # Cypher returning one node per row as `n` (extra columns are merged in)
     to_row: Callable[[dict], dict]       # graph props -> table columns
     canonical: Callable[[dict], dict]    # table row -> comparable dict (same function for both sides, after to_row)
     from_row: Callable[[dict], dict]     # table row -> graph props (rollback)
+    graph_query: str = ""                # Cypher returning one node per row as `n`; default MATCH (n:<label>) RETURN n.
+    #                                      Built here so the owning module doesn't show up as a graph read path.
     key: str = "id"
+    projection: bool = False             # the graph keeps the label as a projection of the table (e.g. Owner): drift
+    #                                      then means graph != Postgres now, not "the graph changed since cutover"
     mapped_keys: frozenset = frozenset()     # graph property names consumed by to_row
     dropped_keys: frozenset = frozenset()    # graph properties deliberately not carried over (documented)
     edges: list[EdgeSpec] = field(default_factory=list)
@@ -54,19 +57,33 @@ class LabelSpec:
 
 
 SPECS: dict[str, LabelSpec] = {}
+SPEC_MODULES = ("owners", "templates")  # each registers its labels' specs on import (batch A1 onward)
+_loaded = False
 
 
 def register(spec: LabelSpec) -> LabelSpec:
+    if not spec.graph_query:
+        spec.graph_query = f"MATCH (n:{spec.label}) RETURN n"
     SPECS[spec.label] = spec
     return spec
 
 
+def load() -> dict[str, LabelSpec]:
+    global _loaded
+    if not _loaded:
+        _loaded = True
+        import importlib
+        for m in SPEC_MODULES:
+            importlib.import_module(m)
+    return SPECS
+
+
 def batch_labels(batch: str) -> list[LabelSpec]:
-    return [s for s in SPECS.values() if s.batch == batch]
+    return [s for s in load().values() if s.batch == batch]
 
 
 def batches() -> list[str]:
-    return sorted({s.batch for s in SPECS.values()})
+    return sorted({s.batch for s in load().values()})
 
 
 # ---------- reading both sides ----------
@@ -235,11 +252,13 @@ def _cutover(batch: str, todo: list[LabelSpec], freeze: dict) -> dict:
 def drift_since_cutover() -> list[dict]:
     """For every switched label: has the graph side changed since cutover? (A stray writer of a retired label.)"""
     out = []
-    for s in SPECS.values():
+    for s in list(load().values()):
         st = _state(s.label)
         if not st or st["source"] != "postgres":
             continue
         then = (st["report"] or {}).get("graph_checksum_at_cutover")
+        if s.projection:  # the projection follows Postgres: compare with Postgres now
+            then = bridge.checksum(_canon_pg(s, pg_rows(s)), s.key)
         now = graph_checksum(s)
         out.append({"label": s.label, "batch": s.batch, "ok": then == now, "at_cutover": then, "now": now,
                     "cutover_at": (st["report"] or {}).get("cutover_at")})
@@ -289,7 +308,7 @@ def full_report() -> dict:
     states = {r["record_type"]: r for r in db.fetch("SELECT * FROM bridge_state")}
     drift = {d["label"]: d for d in drift_since_cutover()}
     labels = []
-    for s in SPECS.values():
+    for s in list(load().values()):
         st = states.get(s.label) or {}
         rep = st.get("report") or {}
         labels.append({"label": s.label, "batch": s.batch, "table": s.table, "source": st.get("source", "graph"),
@@ -343,14 +362,15 @@ if __name__ == "__main__":
     load_dotenv(ROOT.parent / ".env")
     db.init()
     bridge.load()
+    import graph_migration as gm  # under `python -m` this file is __main__; spec modules register into the real module
     if a.command == "report":
-        out = full_report()
+        out = gm.full_report()
     elif a.command == "drift":
-        out = drift_since_cutover()
+        out = gm.drift_since_cutover()
     else:
         if not a.batch:
             sys.exit("rollback needs a batch name")
-        out = rollback(a.batch)
+        out = gm.rollback(a.batch)
     text = json.dumps(out, indent=1, default=str)
     if a.out:
         Path(a.out).write_text(text + "\n", encoding="utf-8")
