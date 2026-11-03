@@ -111,6 +111,7 @@ cd backend && uv run python test_phase3.py    # migration engine, every batch, r
 | `scripts/check_boundaries.py`, `scripts/smoke.py`, `scripts/api_contract.py` | Architecture guard; headless-Chrome UI smoke test; API response-shape contract |
 | `.github/workflows/ci.yml`, `backend/Dockerfile`, `frontend/Dockerfile` | CI and the GHCR images |
 | `docs/` | HLD, LLD, the hardening design, phase plans, ADRs |
+| `docs/backlog.md` | **Index of every tracked GitHub issue** (phase epics, production readiness, backlog). Add or close work in the issue and this table in the same PR |
 
 ## Rules for changes
 - **Permissions are defined in exactly one place:** `backend/identity/perms.py`. Any path it doesn't list is denied. Add a rule there and a row to the matrix in `test_phase0.py`; never check roles inside a route. The one exception is data scoping, such as managers seeing only their own reports (`main._visible`).
