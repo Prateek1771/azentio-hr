@@ -29,7 +29,7 @@ import read_model  # noqa: E402  (registers the graph.rebuild job)
 import policies as policies_store  # noqa: E402  (the route below is named policies)
 import records  # noqa: E402
 import templates as templates_store  # noqa: E402  (the route below is named templates)
-from graph import q, q1, event  # noqa: E402
+from graph import q, event  # noqa: E402
 from identity import perms, service as identity  # noqa: E402
 from shared import bootstrap, db, jobs  # noqa: E402
 
@@ -234,7 +234,7 @@ def employee_detail(eid: str):
     items = items_with_state(eid)
     from documents import store as docs
     unmatched = [_doc(d) for d in docs.unmatched(eid)]
-    manager = q1("MATCH (:Employee {id:$e})-[:REPORTS_TO]->(m) RETURN m", e=eid)
+    manager = _manager(e)
     accepted = {}
     for i in items:  # structured HR record populated from accepted document extractions
         for d in i["documents"]:
@@ -244,7 +244,16 @@ def employee_detail(eid: str):
                         accepted.setdefault(k, {"value": v, "source": i["name"]})
     return {"employee": e, "items": items, "summary": summarize(items), "flags": flags(eid, items),
             "unmatched_documents": unmatched, "events": events_store.for_employee(eid),
-            "manager": manager["m"] if manager else None, "hr_record": accepted}
+            "manager": manager, "hr_record": accepted}
+
+
+def _manager(e: dict) -> dict | None:
+    """The joiner's manager, from Postgres (an owner, else an employee), as the graph's REPORTS_TO node held it."""
+    email = (e.get("manager_email") or "").strip()
+    if not email:
+        return None
+    m = owners.get(email) or records.employee_by(email=email)
+    return records._props(m) if m and m.get("id") != e.get("id") else None
 
 
 @app.get("/api/employees/{eid}/graph")
@@ -464,7 +473,8 @@ def portal(token: str):
     for i in items:
         i["policy_text"] = pol.get(i.get("policy_ref", ""), "") if i["kind"] == "ack" else ""
         i.pop("owner_email", None)
-    manager = q1("MATCH (:Employee {id:$e})-[:REPORTS_TO]->(m) RETURN m.name AS n", e=e["id"])
+    manager = _manager(e)
+    manager = {"n": manager["name"]} if manager else None
     safe = {k: e[k] for k in ("id", "name", "role", "grade", "department", "location", "joining_date", "email")}
     return {"employee": {**safe, "manager": manager["n"] if manager else ""}, "items": items, "summary": summarize(items)}
 
@@ -592,7 +602,7 @@ def ready():
         pass
     try:  # informational: records keep serving while the graph read model rebuilds or drifts
         if checks["postgres"] and checks["graph"]:
-            body["graph_projection"] = read_model.summary()
+            body["graph_projection"] = read_model.summary_cached()
     except Exception:
         pass
     from llm import unavailable_reason

@@ -135,7 +135,8 @@ def check_document_writes(files) -> list[str]:
 READ_MODEL = {"Employee", "Item", "Document", "Owner", "PolicyChunk"}
 WRITE_KW = re.compile(r"\b(CREATE|MERGE|SET|DELETE|REMOVE)\b")
 NODE_LABELS = re.compile(r"\(\s*\w*\s*((?::\s*\w+)+)")
-TEST_LABEL = re.compile(r"\b(?:WHERE|AND|OR|NOT)\s+\(?\s*\w+:(\w+)")
+TEST_LABEL = re.compile(r"\b(?:WHERE|AND|OR|XOR|NOT)\s+\(?\s*\w+:(\w+)")
+SET_LABEL = re.compile(r"\b(?:SET|REMOVE)\s+\w+((?::\s*\w+)+)")
 INDEX_DDL = re.compile(r"^\s*CREATE\s+(VECTOR\s+)?INDEX\b")
 # The Phase 3 inventory of retired record labels. Tests may write synthetic labels (engine probes), never these.
 RETIRED = {"EmailTemplate", "Config", "Policy", "Rule", "Event", "GuardrailEvent", "EvalRun",
@@ -150,7 +151,8 @@ def read_model_violations(text: str, only: set[str] | None = None) -> list[str]:
     """A Cypher write naming any label outside the read model (or, with `only`, one of those labels)."""
     if not WRITE_KW.search(text) or not re.search(r"\b(MATCH|MERGE|CREATE)\b", text) or INDEX_DDL.match(text):
         return []
-    labels = {lbl for m in NODE_LABELS.finditer(text) for lbl in re.findall(r"\w+", m.group(1))}
+    text = text.replace("`", "")
+    labels = {lbl for rx in (NODE_LABELS, SET_LABEL) for m in rx.finditer(text) for lbl in re.findall(r"\w+", m.group(1))}
     bad = (labels | set(TEST_LABEL.findall(text))) - READ_MODEL
     if only is not None:
         bad &= only
@@ -340,7 +342,8 @@ def selftest() -> None:
         assert not ROLE_CHECK.search(line), f"rule 2 false positive: {line}"
     bad8 = ["CREATE (r:Record {id:$id})", "MATCH (i:ConnectorInstance {id:$id}) SET i.secret=$s",
             "MATCH (n) WHERE n:Event DETACH DELETE n", "MERGE (n:AuditLog {id:$k}) SET n = $p",
-            "MATCH (e:Employee {id:$e}), (r:Record {id:$r}) CREATE (e)-[:SYNCED_TO]->(r)", "MATCH (i:Integration) REMOVE i.x"]
+            "MATCH (e:Employee {id:$e}), (r:Record {id:$r}) CREATE (e)-[:SYNCED_TO]->(r)", "MATCH (i:Integration) REMOVE i.x",
+            "MATCH (n {id:$id}) SET n:Event", "CREATE (r:`Record` {id:1})", "MATCH (n) WHERE n:Owner XOR n:Rule DELETE n"]
     ok8 = ["MATCH (r:Record) RETURN r", "CREATE INDEX FOR (n:Rule) ON (n.id)", "MATCH (n) DETACH DELETE n",
            "MATCH (e:Employee {id:$id}), (m) WHERE (m:Owner OR m:Employee) AND m <> e CREATE (e)-[:REPORTS_TO]->(m)",
            "UNWIND $rows AS r MERGE (o:Owner {email:r.email}) SET o = r", "MATCH (c:PolicyChunk {source:$s}) DELETE c"]

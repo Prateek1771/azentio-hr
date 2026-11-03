@@ -235,6 +235,30 @@ retrieval index). Nothing else.
   - a full rollback; `main` serves everything
   - re-upgrade: the self-heal rebuild removed the eight retired labels again
 
+### Batch E deep test (an independent review plus my own probes; each finding reproduced, fixed and covered)
+- **Rollback float precision (engine, every batch):** FalkorDB returns doubles with about 15 significant digits.
+  `epoch()` and every canonical float now compare at that precision (`graph_float`, `_norm`). Before, roughly 0.5% of
+  timestamps written back by a rollback failed parity, so a batch with hundreds of post-cutover rows couldn't be
+  rolled back. A dev drill with one or two new rows never showed it; a `test_phase3` flake did.
+- **A dead rebuild job left the graph `rebuilding` indefinitely:**
+  - `request_rebuild` now dedupes on a live job, not a 30-minute timer.
+  - `verify` re-queues a rebuild that has no job (a crashed CLI run).
+  - A `dead` job's own `ops` item reaches a person, and a restart retries; it isn't re-queued every hour, which would
+    open an `ops` item per hour.
+- **Two full rebuilds could interleave** (a CLI cleanup with an hourly job, `requeue_stuck`, a second instance). A Postgres
+  advisory lock now covers `rebuild()`, and a second rebuild stands down.
+- **Cleanup's audit check** passed whenever `audit_log` had any rows. It now requires every legacy `AuditLog` node to be
+  in `audit_log`.
+- **A rollback, then a re-upgrade, wiped the graph automatically.** `rollback` now clears `cleaned_at`; the retired
+  nodes stay until a person runs the cleanup again.
+- **The write guard (runtime and rule 8)** now sees label assignments (`SET n:Event`, `REMOVE n:X`), backtick-quoted
+  labels and `XOR`. A `ponytail:` note names what it still can't see: string-compared labels and label-less writes.
+- **Owner, document and policy-index count drift** was reported but never repaired. `verify` now re-projects everyone
+  in place or rebuilds the index, and opens the `ops` item only if the drift survives.
+- **`/ready`** caches the read-model summary for 30 s (it scans every node).
+- **Employee detail and the joiner portal** read the manager from Postgres instead of the graph.
+- 8 new checks: `test_phase3` 156. Dev restarted on the fix: `graph_projection: ok`, smoke passed, `verify` clean.
+
 ## Batch D (integrations): the plan, written before coding, then as built
 Status: **done** on branch `phase-3-d`, stacked on `phase-3-c`. The migration file is `016_integrations.sql`,
 because B and C took 014 and 015.

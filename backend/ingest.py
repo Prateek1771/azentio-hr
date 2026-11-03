@@ -226,8 +226,8 @@ async def seed():
         demo_progress()
     import read_model
     st = read_model.status()
-    rebuild = "graph lost" if graph_lost else (f"unexpected labels: {', '.join(st['unexpected_labels'])}"
-                                                if st["unexpected_labels"] else "")
+    rebuild = ("graph lost" if graph_lost else f"unexpected labels: {', '.join(st['unexpected_labels'])}"
+               if st["unexpected_labels"] else "the previous rebuild didn't finish" if st["state"] == "rebuilding" else "")
     owners_lost = st["counts"].get("Owner", 0) < len(owners.all())
     if rebuild:  # self-heal in the background: the worker rebuilds everything from Postgres while records keep serving
         read_model.request_rebuild(rebuild)

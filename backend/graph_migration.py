@@ -107,12 +107,29 @@ def pg_rows(spec: LabelSpec, conn=None) -> list[dict]:
     return db.fetch(f"SELECT * FROM {spec.table}", conn=conn)
 
 
+def graph_float(x: float) -> float:
+    """A float as the graph hands it back: FalkorDB returns ~15 significant digits (1793675757.310502 comes back as
+    1793675757.3105). Both sides are compared at that precision, or a full-precision Postgres value written back by a
+    rollback fails parity on read-back (about 0.5% of millisecond-rounded timestamps did)."""
+    return float(f"{x:.15g}")
+
+
+def _norm(v):
+    if isinstance(v, float):
+        return graph_float(v)
+    if isinstance(v, dict):
+        return {k: _norm(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_norm(x) for x in v]
+    return v
+
+
 def _canon_graph(spec: LabelSpec, props: list[dict]) -> list[dict]:
-    return [spec.canonical(spec.to_row(p)) for p in props]
+    return [_norm(spec.canonical(_norm(spec.to_row(p)))) for p in props]
 
 
 def _canon_pg(spec: LabelSpec, rows: list[dict]) -> list[dict]:
-    return [spec.canonical(r) for r in rows]
+    return [_norm(spec.canonical(_norm(r))) for r in rows]
 
 
 def graph_checksum(spec: LabelSpec) -> str:
@@ -341,6 +358,8 @@ def _rollback(batch: str, freeze: dict) -> dict:
         _set_state(s.label, "graph", {"rolled_back_at": datetime.now(timezone.utc).isoformat(), "parity": rep,
                                        "freeze": freeze})
         reports.append(rep)
+    if db.fetch1("SELECT to_regclass('graph_state') AS t")["t"]:  # retired labels are back on purpose: not drift to wipe
+        db.execute("UPDATE graph_state SET cleaned_at = NULL WHERE id = 1")
     return {"batch": batch, "labels": reports}
 
 
@@ -369,8 +388,8 @@ def epoch(v) -> float | None:
     if v in (None, "", 0):
         return None
     if isinstance(v, datetime):
-        return round(v.timestamp(), 3)
-    return round(float(v), 3)
+        return round(graph_float(v.timestamp()), 3)
+    return round(graph_float(float(v)), 3)
 
 
 def ts(v) -> datetime | None:

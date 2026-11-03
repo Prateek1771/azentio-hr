@@ -27,7 +27,8 @@ READ_MODEL = frozenset({"Employee", "Item", "Document", "Owner", "PolicyChunk"})
 _WRITE = re.compile(r"\b(CREATE|MERGE|SET|DELETE|REMOVE)\b", re.I)
 _INDEX = re.compile(r"^\s*CREATE\s+(VECTOR\s+)?INDEX\b", re.I)
 _NODE_LABELS = re.compile(r"\(\s*\w*\s*((?::\s*\w+)+)")              # (n:A:B  (:A
-_TEST_LABEL = re.compile(r"\b(?i:WHERE|AND|OR|NOT)\s+\(?\s*\w+:(\w+)")  # WHERE n:A, OR n:B
+_TEST_LABEL = re.compile(r"\b(?i:WHERE|AND|OR|XOR|NOT)\s+\(?\s*\w+:(\w+)")  # WHERE n:A, OR n:B
+_SET_LABEL = re.compile(r"\b(?i:SET|REMOVE)\s+\w+((?::\s*\w+)+)")          # SET n:A, REMOVE n:A:B
 ALLOW_LEGACY_WRITES = False
 
 
@@ -36,7 +37,11 @@ class ReadModelViolation(RuntimeError):
 
 
 def labels_in(cypher: str) -> set[str]:
-    found = {lbl for m in _NODE_LABELS.finditer(cypher) for lbl in re.findall(r"\w+", m.group(1))}
+    """Labels a query names: node patterns, label tests and label assignments (backtick quoting removed).
+    ponytail: a guard against reintroducing a retired label, not against hostile Cypher. A label compared as a string
+    (`'Event' IN labels(n)`) or a write that names no label at all isn't seen; guard rule 8 and review cover code."""
+    cypher = cypher.replace("`", "")
+    found = {lbl for rx in (_NODE_LABELS, _SET_LABEL) for m in rx.finditer(cypher) for lbl in re.findall(r"\w+", m.group(1))}
     return found | set(_TEST_LABEL.findall(cypher))
 
 

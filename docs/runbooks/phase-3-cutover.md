@@ -312,12 +312,36 @@ drift repair, and runs the one-time cleanup.
 1. Stop every instance.
 2. Run `graph_migration rollback <batch>` for D, C, B, A3, A2, A1. It restores the retired nodes from Postgres.
 3. Deploy the previous release, or restore the `BGSAVE` snapshot.
-4. If this release later starts again, it cuts the batches over again, and the self-heal removes the retired labels
-   (proven on the throwaway stack).
+4. Rollback clears the cleanup mark (`cleaned_at`). If this release later starts again, it cuts the batches over
+   again and leaves the restored retired nodes in place: no automatic wipe. Run the cleanup again, after a fresh
+   `BGSAVE`, when the release is signed off.
 
 **Throwaway deep run:**
 - `main` → E: six cutovers, then the cleanup leaves the read model only.
 - A full rollback; `main` serves every page.
-- Re-upgrade: the self-heal rebuild removed the eight retired labels again.
+- Re-upgrade: the self-heal rebuild removed the eight retired labels again. This run predates the deep-test fix
+  below: a re-upgrade now keeps them until the cleanup is run again.
+
+**Deep test (2026-11-03):** an independent review and my own probes found seven issues, each fixed with a check
+(`test_phase3` 156). The rebuild ones:
+- a dead rebuild job left the graph `rebuilding` indefinitely
+- two full rebuilds could interleave
+- re-queuing a dead job hourly would have flooded the inbox
+
+The cleanup ones:
+- its audit check passed whenever `audit_log` had any rows
+- a rollback followed by a re-upgrade wiped the graph automatically
+
+The read-model ones:
+- the write guard missed label assignments, backtick-quoted labels and `XOR`
+- owner, document and policy-index drift was reported but never repaired
+- two manager reads used the graph
+
+**The rollback precision bug:** FalkorDB returns doubles with about 15 significant digits. A full-precision Postgres
+value written back by a rollback failed parity on read-back for about 0.5% of millisecond-rounded timestamps; any
+batch with hundreds of rows written after cutover would have failed its rollback. The engine now compares floats at
+the graph's precision.
+
+Dev: restarted on the fix, `graph_projection: ok`, smoke passed, and `verify` found nothing to repair.
 
 **Sign-off:** dev ✓. CI on the PR covers `test_phase3` (E section, the wipe drill and the API contract).

@@ -931,25 +931,38 @@ Every remaining graph record label moves through one engine, in batches (A1, A2,
   2. Sets `rebuilding` and wipes the graph.
   3. Recreates the indexes and projects owners, then every employee with items and documents.
   4. Re-indexes `PolicyChunk` from `policies` and sets `ready`.
-  - It runs as the job `graph.rebuild`. `request_rebuild(reason)` queues it once (a pending rebuild older than 30 min
-    is requested again).
+  - It holds a Postgres advisory lock, so a CLI cleanup, a job and a second instance never interleave wipes; a second
+    rebuild stands down (`RebuildBusy`).
+  - It runs as the job `graph.rebuild`. `request_rebuild(reason)` queues it unless a `graph.rebuild` job is already
+    queued or running. The check is on a live job, not on the state, so a rebuild whose job died is queued again.
+- **Managers** in the employee detail and the joiner portal come from Postgres (`owners`, else `employees`), not
+  from the graph.
 - **No partial serving:** while `rebuilding`:
   - `GET /api/employees/{id}/graph` answers 503 "The relationship view is rebuilding; try again in a moment"
   - `chat.retrieve` raises `Rebuilding`, and both assistants reply that policy search is rebuilding
   - records and every other page are unaffected
 - **Self-heal at startup (`ingest.seed`):**
-  - a lost graph (employees in Postgres, no `Employee` node), or unexpected labels after the cleanup → `request_rebuild`
+  - a lost graph (employees in Postgres, no `Employee` node), unexpected labels after the cleanup, or a rebuild that
+    didn't finish → `request_rebuild`
   - owners missing from the graph → every employee is re-projected, so `REPORTS_TO` / `OWNED_BY` come back
 - **`status()` / `/ready`:**
   - graph label counts are compared with Postgres (employees, items, owners, documents, policy sources)
   - unexpected labels count only after the cleanup
-  - `/ready` shows `graph_projection: ok | rebuilding | drift (…)`, informational only (never a 503)
+  - `/ready` shows `graph_projection: ok | rebuilding | drift (…)`, informational only (never a 503), cached for 30 s
+    because it scans every node
 - **`verify()`, hourly from the scheduler:**
   - lost or unexpected labels → a rebuild
   - an employee whose node is missing or whose item count differs → re-projected
+  - owner or document counts off → everyone re-projected in place; policy sources off → the index rebuilt
   - drift that survives → one `ops` work item (`dedupe_key` `graph.drift`)
+  - a rebuild that went `dead` isn't re-queued hourly: its own `ops` item reaches a person, and a restart (or
+    `python -m read_model rebuild`) retries it
+  - a `rebuilding` state with no job at all (a crashed CLI rebuild) is queued again
 - **`cleanup()`, run once by hand** (`python -m read_model cleanup`, after a `BGSAVE`):
-  - refuses unless every migrated label is on Postgres and the legacy `AuditLog` history is in `audit_log`
+  - refuses unless every migrated label is on Postgres and every legacy `AuditLog` node is in `audit_log`
+    (matched by action, entity and time, not just "the table has rows")
+  - `graph_migration rollback` clears `cleaned_at`. Restored retired nodes aren't treated as drift to wipe until a
+    person runs the cleanup again.
   - otherwise records `cleaned_at`, runs the full rebuild, and checks that the label scan shows only the read model
 
 ---

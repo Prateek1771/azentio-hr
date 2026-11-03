@@ -100,6 +100,15 @@ check("read_path_scan_patterns", not wrong, wrong)
 check("read_path_scan_allows_listed_files", gm.read_paths("P3Probe", (ME,)) == [])
 check("read_path_scan_finds_graph_reads", any(h.startswith(ME) for h in gm.read_paths("P3Probe")))
 
+# floats survive the graph's ~15-digit round trip: canonical values compare equal after a write-back
+import random  # noqa: E402
+
+vals = [time.time() + random.random() * 1e5 for _ in range(1500)] + [1793675757.310502, 0.8333333333333334]
+back = [r["x"] for r in q("UNWIND $v AS x RETURN x", v=vals)]
+lossy = sum(round(a, 3) != round(b, 3) for a, b in zip(vals, back))
+check("float_roundtrip_through_graph_compares_equal", all(gm.epoch(a) == gm.epoch(b) and gm._norm(a) == gm._norm(b)
+                                                          for a, b in zip(vals, back)), lossy)
+
 # ---------- freeze ----------
 stop = threading.Event()
 
@@ -856,6 +865,27 @@ check("wiped_graph_is_rebuilt_in_the_background_without_partial_serving",
 check("rebuild_job_restores_the_read_model", run_rebuild_jobs() == 1 and read_model.status()["ok"]
       and projection() == before_wipe and main.employee_graph("E9001") == graph_view
       and chat.keyword_retrieve("notice period days", 2), (read_model.status(), projection(), before_wipe))
+# a rebuild whose job died must not leave the graph 'rebuilding' with nothing running
+read_model.request_rebuild("drill")
+db.execute("UPDATE jobs SET state='dead', finished_at=now() WHERE kind='graph.rebuild' AND state='queued'")  # as jobs._fail does
+stuck = read_model.rebuilding()
+v1, v2 = read_model.verify(), read_model.verify()  # hourly: no new job (and no new dead-job ops item) per hour
+asyncio.run(ingest.seed())  # a restart queues it again
+check("dead_rebuild_job_is_retried_on_restart_not_hourly", stuck and v1["action"] == v2["action"] == "none"
+      and "ops item" in v1["reason"] and run_rebuild_jobs() == 1 and not read_model.rebuilding()
+      and read_model.status()["ok"], (v1, v2))
+# a crashed CLI rebuild (state 'rebuilding', no job at all) is picked up by the next verify
+db.execute("UPDATE graph_state SET state='rebuilding', started_at=now() WHERE id=1")
+v = read_model.verify()
+check("crashed_cli_rebuild_is_requeued_by_verify", v["action"] == "rebuild" and run_rebuild_jobs() == 1
+      and read_model.status()["ok"], v)
+# one full rebuild at a time: a second one (CLI, job, another instance) stands down
+with db.pool().connection() as _lock:
+    _lock.execute("SELECT pg_advisory_lock(%s)", (read_model.REBUILD_LOCK,))
+    busy = raises(lambda: asyncio.run(read_model.rebuild("second")), read_model.RebuildBusy)
+    job_ok = raises(lambda: asyncio.run(read_model._rebuild_job({"payload": {"reason": "second"}})), Exception) is None
+    _lock.execute("SELECT pg_advisory_unlock(%s)", (read_model.REBUILD_LOCK,))
+check("concurrent_full_rebuilds_stand_down", busy and job_ok and read_model.status()["ok"], busy)
 check("wiped_graph_keeps_hr_edits", templates.get("intern")["subject"] == "HR edit"
       and owners.get("it@x.com")["name"] == "HR renamed desk" and records.employee("E9001")["name"] == "Kept Name")
 check("wiped_graph_seeds_nothing_over_postgres",
@@ -876,7 +906,8 @@ check("a_start_restores_a_lost_owner_projection", q(f"MATCH (o:{OWN}) RETURN cou
 LEGACY_AUDIT = "AuditLog"
 retired = sorted({s.label for s in gm.load().values() if not s.projection} | {LEGACY_AUDIT})
 writes = ["CREATE (n:{L} {{id:'x'}})", "MERGE (n:{L} {{id:'x'}})", "MATCH (n:{L}) SET n.x = 1", "MATCH (n:{L}) DELETE n",
-          "MATCH (n:{L}) REMOVE n.x", "MATCH (n) WHERE n:{L} DETACH DELETE n"]
+          "MATCH (n:{L}) REMOVE n.x", "MATCH (n) WHERE n:{L} DETACH DELETE n", "MATCH (n {{id:'x'}}) SET n:{L}",
+          "CREATE (n:`{L}` {{id:'x'}})", "MATCH (n) WHERE n:Employee XOR n:{L} DELETE n", "MATCH (n) REMOVE n:{L}"]
 _graph.ALLOW_LEGACY_WRITES = False
 missed = [w.format(L=lbl) for lbl in retired for w in writes
           if not raises(lambda: q(w.format(L=lbl)), _graph.ReadModelViolation)]
@@ -904,6 +935,12 @@ ops = db.fetch("SELECT * FROM work_queue WHERE dedupe_key='graph.drift' AND stat
 check("e_persistent_drift_opens_exactly_one_ops_item", v1["persistent"] == [DRIFT] and v2["persistent"] == [DRIFT]
       and len(ops) == 1 and ops[0]["kind"] == "ops", (v1, v2, ops))
 read_model.verify()  # repaired for real now
+q(f"MATCH (o:{OWN}) WITH o LIMIT 1 DETACH DELETE o")
+q(f"MATCH (c:{CHUNK}) WITH c.source AS s LIMIT 1 MATCH (c:{CHUNK} {{source:s}}) DELETE c")
+drift = read_model.status()["mismatched"]
+v = read_model.verify()
+check("e_verify_repairs_owner_and_policy_index_drift", {"Owner", "PolicyChunk sources"} <= set(drift)
+      and not v["counts_left"] and read_model.status()["ok"] and projection() == before_wipe, (drift, v))
 
 db.execute("UPDATE bridge_state SET source='graph' WHERE record_type='Record'")
 e = raises(read_model.cleanup, RuntimeError)
@@ -913,6 +950,11 @@ with _graph.legacy_writes():
     q(f"CREATE (:{LEGACY_AUDIT} {{id:'legacy_audit', action:'x', ts:1}})")
     q(f"CREATE (:{REC} {{id:'old_record'}})")  # retired nodes an old graph still holds
     q(f"CREATE (:{INT} {{id:'old_integration'}})")
+e = raises(read_model.cleanup, RuntimeError)
+from datetime import datetime as _dtm, timezone as _tzm  # noqa: E402
+from audit_log import service as _audit  # noqa: E402
+_audit.record("x", "legacy", "", "legacy graph audit row", actor="HR", ts=_dtm.fromtimestamp(1, _tzm.utc))  # the import
+check("e_cleanup_refuses_until_legacy_audit_is_imported", e and "AuditLog" in e and "audit_log" in e, e)
 before_labels = {r["l"] for r in q("MATCH (n) UNWIND labels(n) AS l RETURN DISTINCT l")}
 db.execute("INSERT INTO bridge_state (record_type, source, report) VALUES ('Document', 'postgres', '{}') "
            "ON CONFLICT (record_type) DO NOTHING")
@@ -931,6 +973,13 @@ check("e_unexpected_label_after_cleanup_is_drift_and_rebuilt",
       st["unexpected_labels"] == ["Event"] and "unexpected labels: Event" in read_model.summary(st)
       and v["action"] == "rebuild" and run_rebuild_jobs() == 1 and read_model.status()["ok"]
       and not q(f"MATCH (n:{EV}) RETURN n LIMIT 1"), (st, v))
+gm.rollback("D", watch=0)
+st = read_model.status()
+check("e_rollback_clears_the_cleanup_mark", st["cleaned_at"] is None and not st["unexpected_labels"]
+      and q(f"MATCH (n:{INT}) RETURN count(n) AS n")[0]["n"] > 0 and read_model.verify()["action"] != "rebuild", st)
+gm.cutover("D", watch=0)
+read_model.cleanup()  # a person runs it again (after a BGSAVE), as the runbook says
+check("e_cleanup_again_after_rollback", set(read_model.status()["counts"]) <= _graph.READ_MODEL)
 _graph.ALLOW_LEGACY_WRITES = True
 
 # a spec module that fails to import fails every time, never a silently partial registry
