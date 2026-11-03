@@ -67,7 +67,7 @@ restore path.**
 | B | Event, GuardrailEvent, EvalRun, EvalResult | 2026-11-02 09:46 UTC | Event 434/0 → 434/434, GuardrailEvent 1/1, EvalRun 2/2, EvalResult 25/25; sha equal | single writer | pass | dev |
 | C | Connector, ConnectorInstance, Record, links, CustomField, ImportRun, IntegrationRun (archived) | 2026-11-02 14:43 UTC | Connector 7/7, ConnectorInstance 7/7 (OF 7), Record 20/20 (IN 20, SYNCED_TO 3, FROM_CANDIDATE 3), CustomField 0/0, ImportRun 1/1, IntegrationRun 3/3; sha equal | single writer | pass | dev |
 | D | Integration, IntegrationCandidate, WorkflowRun, IntegrationLogRecord, OutboundMessage, AgentMessage | 2026-11-02 16:41 UTC | Integration 3/3, AgentMessage 34/34, the other four 0/0; sha equal | single writer | pass | dev |
-| E | AuditLog (legacy, removed), read-model cleanup | | | | | |
+| E | AuditLog (legacy, removed), read-model cleanup | 2026-11-03 02:43 UTC | 21 labels on Postgres; graph after cleanup: Employee 11, Item 167, Document 32, Owner 8, PolicyChunk 31, nothing else | single writer | pass | dev |
 
 Each batch adds a `### <batch>` section here with the pasted report extract.
 
@@ -284,3 +284,40 @@ OutboundMessage 0 each. There are no edges. `BGSAVE` first.
   masked log. Re-upgrade: six clean cutovers.
 
 **Sign-off:** dev ✓. CI on the PR covers `test_phase3` (D section and API contract).
+
+### E: the read model, cleanup and the wipe drill (dev stack, 2026-11-03)
+
+E moves no label. It enforces the read model (`graph.q()` and guard rule 8), adds self-healing rebuilds and hourly
+drift repair, and runs the one-time cleanup.
+
+**Steps:**
+1. `BGSAVE`, after the previous snapshot has been handled; see the warning in the checklist.
+2. Start on the E code. Migration 017 applies, and `/ready` should show `graph_projection: ok`. On dev the counts
+   matched Postgres while the retired labels were still present.
+3. Stop the backend, then run `cd backend && uv run python -m read_model cleanup`. It refuses unless every label is on
+   Postgres and the legacy `AuditLog` history is in `audit_log`. Dev result: only `Document 32, Owner 8,
+   PolicyChunk 31, Employee 11, Item 167` remain.
+4. Start. `/ready` shows `graph_projection: ok`. `scripts/smoke.py` passed, and the graph view, connectors,
+   integrations and activity all serve.
+
+**The wipe drill, by hand:**
+1. Stop the backend.
+2. Run `docker compose exec falkordb redis-cli GRAPH.DELETE hr`.
+3. Start: `/ready` shows `graph_projection: rebuilding`, and the log shows `graph.rebuild_requested reason="graph
+   lost"`.
+4. About a second later, `graph.rebuilt employees=11`.
+5. `graph_projection: ok`, E1001's graph view is identical to before the wipe, and policy retrieval works.
+
+**Rollback after the cleanup:**
+1. Stop every instance.
+2. Run `graph_migration rollback <batch>` for D, C, B, A3, A2, A1. It restores the retired nodes from Postgres.
+3. Deploy the previous release, or restore the `BGSAVE` snapshot.
+4. If this release later starts again, it cuts the batches over again, and the self-heal removes the retired labels
+   (proven on the throwaway stack).
+
+**Throwaway deep run:**
+- `main` → E: six cutovers, then the cleanup leaves the read model only.
+- A full rollback; `main` serves every page.
+- Re-upgrade: the self-heal rebuild removed the eight retired labels again.
+
+**Sign-off:** dev ✓. CI on the PR covers `test_phase3` (E section, the wipe drill and the API contract).

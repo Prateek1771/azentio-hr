@@ -239,6 +239,8 @@ On `items`, trigger `items_status_from_document` (migration 010) refuses a docum
 
 ### 4.2 FalkorDB graph `hr`
 
+**A read model since Phase 3 E** ([ADR 0006](adr/0006-graph-as-read-model.md)): only `Employee`, `Item`, `Document`, `Owner` (the projection) and `PolicyChunk` (the retrieval index). `graph.q()` refuses writes to any other label, guard rule 8 refuses them in code, and `read_model.py` rebuilds the graph from Postgres when it's lost, drifts or holds an unexpected label (§12.5). The labels marked **Retired** below survive only until the one-time cleanup.
+
 ```mermaid
 flowchart LR
     E((Employee)) -->|HAS_ITEM| I((Item))
@@ -919,7 +921,36 @@ Every remaining graph record label moves through one engine, in batches (A1, A2,
   2. Removes graph nodes that aren't in the table, including nodes that lack the key property.
   3. Writes every row back and restores the edges.
   4. Checks parity per label, then switches the bridge back.
-- **CLI:** `python -m graph_migration report|drift|rollback <batch>`. `/api/admin/migration` (admin and auditor) serves the same report on the System page.
+- **CLI:** `python -m graph_migration report|drift|rollback <batch>`. The rollback tool writes retired labels inside `graph.legacy_writes()`, the one sanctioned exception to the read model's write guard. `/api/admin/migration` (admin and auditor) serves the same report on the System page.
+
+### 12.5 The graph read model (`read_model.py`, Phase 3 E)
+- **State:** one row in `graph_state`: `ready` or `rebuilding`, the reason, the times, `cleaned_at` and the last
+  rebuild report.
+- **`rebuild()`:**
+  1. Loads the bridge state.
+  2. Sets `rebuilding` and wipes the graph.
+  3. Recreates the indexes and projects owners, then every employee with items and documents.
+  4. Re-indexes `PolicyChunk` from `policies` and sets `ready`.
+  - It runs as the job `graph.rebuild`. `request_rebuild(reason)` queues it once (a pending rebuild older than 30 min
+    is requested again).
+- **No partial serving:** while `rebuilding`:
+  - `GET /api/employees/{id}/graph` answers 503 "The relationship view is rebuilding; try again in a moment"
+  - `chat.retrieve` raises `Rebuilding`, and both assistants reply that policy search is rebuilding
+  - records and every other page are unaffected
+- **Self-heal at startup (`ingest.seed`):**
+  - a lost graph (employees in Postgres, no `Employee` node), or unexpected labels after the cleanup → `request_rebuild`
+  - owners missing from the graph → every employee is re-projected, so `REPORTS_TO` / `OWNED_BY` come back
+- **`status()` / `/ready`:**
+  - graph label counts are compared with Postgres (employees, items, owners, documents, policy sources)
+  - unexpected labels count only after the cleanup
+  - `/ready` shows `graph_projection: ok | rebuilding | drift (…)`, informational only (never a 503)
+- **`verify()`, hourly from the scheduler:**
+  - lost or unexpected labels → a rebuild
+  - an employee whose node is missing or whose item count differs → re-projected
+  - drift that survives → one `ops` work item (`dedupe_key` `graph.drift`)
+- **`cleanup()`, run once by hand** (`python -m read_model cleanup`, after a `BGSAVE`):
+  - refuses unless every migrated label is on Postgres and the legacy `AuditLog` history is in `audit_log`
+  - otherwise records `cleaned_at`, runs the full rebuild, and checks that the label scan shows only the read model
 
 ---
 

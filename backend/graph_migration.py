@@ -153,7 +153,7 @@ def read_paths(label: str, allowed: tuple = ()) -> list[str]:
     hits = []
     for p in source_files():
         rel = p.relative_to(ROOT.parent).as_posix()
-        if rel.endswith("graph_migration.py") or rel in allowed:
+        if rel.endswith("graph_migration.py") or rel == "scripts/check_boundaries.py" or rel in allowed:  # the analysers
             continue
         for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if rx.search(line):
@@ -269,7 +269,9 @@ def _cutover(batch: str, todo: list[LabelSpec], freeze: dict) -> dict:
     baseline = {}
     for s in todo:
         if s.after_cutover:
-            s.after_cutover()
+            from graph import legacy_writes
+            with legacy_writes():  # e.g. scrubbing a retired label's plaintext
+                s.after_cutover()
         baseline[s.label] = graph_checksum(s) if s.after_cutover else None
     for r in reports:
         _set_state(r["label"], "postgres", {**r, "batch": batch, "cutover_at": at, "before": before[r["label"]],
@@ -313,7 +315,9 @@ def rollback(batch: str, watch: float | None = None) -> dict:
     """Write the batch's Postgres rows back to the graph (including rows written after cutover), check parity,
     and switch the bridge back to the graph. Use with the previous release. Refuses while any instance is live:
     a running app would keep writing Postgres after the switch back (split brain)."""
-    return _exclusive(f"rollback {batch}", watch, lambda freeze: _rollback(batch, freeze))
+    from graph import legacy_writes
+    with legacy_writes():  # the one sanctioned writer of retired labels: it restores them for the previous release
+        return _exclusive(f"rollback {batch}", watch, lambda freeze: _rollback(batch, freeze))
 
 
 def _rollback(batch: str, freeze: dict) -> dict:

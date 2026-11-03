@@ -21,6 +21,9 @@ from shared import db  # noqa: E402
 db.use_test_database("azentio_test_p3")
 
 from graph import q  # noqa: E402
+import graph as _graph  # noqa: E402
+
+_graph.ALLOW_LEGACY_WRITES = True  # this suite recreates an old release's graph nodes; batch E switches it off to test
 
 q("MATCH (n) DETACH DELETE n")
 
@@ -811,8 +814,48 @@ records.save_employee({"id": "E9001", "name": "Kept Name", "email": "kept@x.com"
 templates.upsert({**templates.get("intern"), "subject": "HR edit"})
 owners.upsert([{"email": "it@x.com", "name": "HR renamed desk", "department": "IT", "type": "owner:IT"}])
 counts = {t: db.fetch1(f"SELECT count(*) AS n FROM {t}")["n"] for t in ("owners", "email_templates", "policies", "employees")}
+import main  # noqa: E402  (the graph view route)
+import read_model  # noqa: E402
+from fastapi import HTTPException as _HTTP  # noqa: E402
+from shared import jobs  # noqa: E402,F811
+
+RM_EDGES = ("REPORTS_TO", "HAS_ITEM", "DEPENDS_ON", "OWNED_BY", "SUBMITTED", "HAS_DOC", "MISMATCH")
+
+
+def projection() -> dict:
+    """Everything the read model holds, as comparable data: node properties per label, edge counts, policy sources."""
+    nodes = {lbl: sorted(json.dumps(r["n"], sort_keys=True, default=str) for r in q(f"MATCH (n:{lbl}) RETURN n"))
+             for lbl in ("Employee", "Item", "Owner", "Document")}
+    edges = {r["t"]: r["n"] for r in q("MATCH ()-[r]->() WHERE type(r) IN $t RETURN type(r) AS t, count(r) AS n", t=list(RM_EDGES))}
+    sources = sorted(r["s"] for r in q(f"MATCH (c:{CHUNK}) RETURN DISTINCT c.source AS s"))
+    return {"sha": gm.sha(nodes), "counts": {k: len(v) for k, v in nodes.items()}, "edges": edges, "sources": sources}
+
+
+def run_rebuild_jobs() -> int:
+    done = 0
+    for job in db.fetch("SELECT * FROM jobs WHERE kind='graph.rebuild' AND state='queued' ORDER BY id"):
+        done += asyncio.run(jobs.run_job(job))
+    return done
+
+
+async def _collect(gen):
+    return "".join([p async for p in gen])
+
+
+asyncio.run(read_model.rebuild("baseline"))  # a clean projection to compare the self-healed one with
+before_wipe, graph_view = projection(), main.employee_graph("E9001")
 q("MATCH (n) DETACH DELETE n")  # the graph is lost
 asyncio.run(ingest.seed())
+queued = db.fetch1("SELECT count(*) AS n FROM jobs WHERE kind='graph.rebuild' AND state='queued'")["n"]
+e = raises(lambda: main.employee_graph("E9001"), _HTTP)
+reply = asyncio.run(_collect(chat.hr_answer_stream("What is the notice period?", [], None)))
+check("wiped_graph_is_rebuilt_in_the_background_without_partial_serving",
+      read_model.rebuilding() and queued == 1 and e and "rebuilding" in e and "rebuilding" in reply
+      and raises(lambda: asyncio.run(chat.retrieve("notice period")), read_model.Rebuilding)
+      and read_model.request_rebuild("again") is False and read_model.summary() == "rebuilding", (queued, e, reply))
+check("rebuild_job_restores_the_read_model", run_rebuild_jobs() == 1 and read_model.status()["ok"]
+      and projection() == before_wipe and main.employee_graph("E9001") == graph_view
+      and chat.keyword_retrieve("notice period days", 2), (read_model.status(), projection(), before_wipe))
 check("wiped_graph_keeps_hr_edits", templates.get("intern")["subject"] == "HR edit"
       and owners.get("it@x.com")["name"] == "HR renamed desk" and records.employee("E9001")["name"] == "Kept Name")
 check("wiped_graph_seeds_nothing_over_postgres",
@@ -826,7 +869,69 @@ check("wiped_graph_rebuilds_the_policy_index",
 check("no_drift_after_the_rebuild", all(d["ok"] for d in gm.drift_since_cutover()), gm.drift_since_cutover())
 q(f"MATCH (o:{OWN}) DETACH DELETE o")  # only the owners are lost; employees are still in the graph
 asyncio.run(ingest.seed())
-check("a_start_restores_a_lost_owner_projection", q(f"MATCH (o:{OWN}) RETURN count(o) AS n")[0]["n"] == counts["owners"])
+check("a_start_restores_a_lost_owner_projection", q(f"MATCH (o:{OWN}) RETURN count(o) AS n")[0]["n"] == counts["owners"]
+      and projection() == before_wipe, (projection(), before_wipe))  # with the employees' REPORTS_TO / OWNED_BY edges
+
+# ---------- batch E: the graph is an enforced, self-healing read model ----------
+LEGACY_AUDIT = "AuditLog"
+retired = sorted({s.label for s in gm.load().values() if not s.projection} | {LEGACY_AUDIT})
+writes = ["CREATE (n:{L} {{id:'x'}})", "MERGE (n:{L} {{id:'x'}})", "MATCH (n:{L}) SET n.x = 1", "MATCH (n:{L}) DELETE n",
+          "MATCH (n:{L}) REMOVE n.x", "MATCH (n) WHERE n:{L} DETACH DELETE n"]
+_graph.ALLOW_LEGACY_WRITES = False
+missed = [w.format(L=lbl) for lbl in retired for w in writes
+          if not raises(lambda: q(w.format(L=lbl)), _graph.ReadModelViolation)]
+reads_ok = all(q(f"MATCH (n:{lbl}) RETURN count(n) AS n") is not None for lbl in retired)
+q("MATCH (e:Employee {id:'E9001'}) SET e.probe = 1")
+q("MATCH (e:Employee {id:'E9001'}) REMOVE e.probe")
+with _graph.legacy_writes():
+    q(f"CREATE (n:{EV} {{id:'legacy_ok'}})")
+    q(f"MATCH (n:{EV} {{id:'legacy_ok'}}) DELETE n")
+check("e_runtime_refuses_every_retired_label_write", not missed and reads_ok and len(retired) >= 21
+      and not _graph.ALLOW_LEGACY_WRITES, missed)
+
+DRIFT = db.fetch1("SELECT employee_id AS e FROM items GROUP BY employee_id ORDER BY count(*) DESC, employee_id LIMIT 1")["e"]
+q("MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item) DETACH DELETE i", e=DRIFT)  # the projection drifts
+drifted = read_model.drifting_employees()
+v = read_model.verify()
+check("e_verify_repairs_the_drifting_employee", drifted == {DRIFT} and v["repaired"] == [DRIFT]
+      and read_model.status()["ok"] and projection() == before_wipe, (drifted, v, read_model.status(), {k: (projection()[k], before_wipe[k]) for k in before_wipe if projection()[k] != before_wipe[k]}))
+_project = records.project
+records.project = lambda eid: None  # the repair itself fails
+q("MATCH (:Employee {id:$e})-[:HAS_ITEM]->(i:Item) DETACH DELETE i", e=DRIFT)
+v1, v2 = read_model.verify(), read_model.verify()
+records.project = _project
+ops = db.fetch("SELECT * FROM work_queue WHERE dedupe_key='graph.drift' AND status IN ('open', 'in_progress')")
+check("e_persistent_drift_opens_exactly_one_ops_item", v1["persistent"] == [DRIFT] and v2["persistent"] == [DRIFT]
+      and len(ops) == 1 and ops[0]["kind"] == "ops", (v1, v2, ops))
+read_model.verify()  # repaired for real now
+
+db.execute("UPDATE bridge_state SET source='graph' WHERE record_type='Record'")
+e = raises(read_model.cleanup, RuntimeError)
+db.execute("UPDATE bridge_state SET source='postgres' WHERE record_type='Record'")
+check("e_cleanup_refuses_while_a_label_reads_the_graph", e and "Record" in e, e)
+with _graph.legacy_writes():
+    q(f"CREATE (:{LEGACY_AUDIT} {{id:'legacy_audit', action:'x', ts:1}})")
+    q(f"CREATE (:{REC} {{id:'old_record'}})")  # retired nodes an old graph still holds
+    q(f"CREATE (:{INT} {{id:'old_integration'}})")
+before_labels = {r["l"] for r in q("MATCH (n) UNWIND labels(n) AS l RETURN DISTINCT l")}
+db.execute("INSERT INTO bridge_state (record_type, source, report) VALUES ('Document', 'postgres', '{}') "
+           "ON CONFLICT (record_type) DO NOTHING")
+bridge.SOURCE["Document"] = "graph"  # a fresh CLI process starts at the default: the rebuild must load the real state
+out = read_model.cleanup()
+labels = {r["l"] for r in q("MATCH (n) UNWIND labels(n) AS l RETURN DISTINCT l")}
+check("e_cleanup_leaves_only_the_read_model", {"Record", "Integration", "AuditLog"} <= before_labels
+      and labels <= _graph.READ_MODEL and out["status"]["ok"] and out["status"]["cleaned_at"]
+      and projection() == before_wipe and all(d["ok"] for d in gm.drift_since_cutover())
+      and bridge.SOURCE["Document"] == "postgres", (before_labels, labels))
+with _graph.legacy_writes():
+    q(f"CREATE (:{EV} {{id:'reappeared', ts:1}})")  # e.g. a rollback, then this release started again
+st = read_model.status()
+v = read_model.verify()
+check("e_unexpected_label_after_cleanup_is_drift_and_rebuilt",
+      st["unexpected_labels"] == ["Event"] and "unexpected labels: Event" in read_model.summary(st)
+      and v["action"] == "rebuild" and run_rebuild_jobs() == 1 and read_model.status()["ok"]
+      and not q(f"MATCH (n:{EV}) RETURN n LIMIT 1"), (st, v))
+_graph.ALLOW_LEGACY_WRITES = True
 
 # a spec module that fails to import fails every time, never a silently partial registry
 gm.SPEC_MODULES = gm.SPEC_MODULES + ("no_such_spec_module",)

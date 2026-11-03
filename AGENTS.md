@@ -8,14 +8,14 @@ Azentio Onboard is an HR onboarding agent. For each new joiner it works out whic
 We're hardening it from a demo into governed HR operations in 7 phases: see [docs/plans/2026-11-01-hardening-design.md](docs/plans/2026-11-01-hardening-design.md).
 
 ## Current phase
-**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract), A1 (owners, email templates), A2 (policies), A3 (legacy rules/config retired), B (activity, guardrail hits, eval runs), C (connectors, secrets encrypted at rest) and D (integrations) are done; E (read model enforcement, rebuild, cleanup) follows. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
+**Phases 0, 1 and 2 are complete. Phase 3 (retire graph record storage) is in progress** ([plan](docs/plans/phase-3-retire-graph-records.md), [cutover runbook](docs/runbooks/phase-3-cutover.md)): PR 0 (migration engine, API contract), A1 (owners, email templates), A2 (policies), A3 (legacy rules/config retired), B (activity, guardrail hits, eval runs), C (connectors, secrets encrypted at rest), D (integrations) and E (an enforced, self-healing read model; cleanup) are built, as stacked PRs awaiting merge. References: [Phase 0](docs/plans/phase-0-trust-foundation.md), [Phase 1](docs/plans/phase-1-policy-governance.md), [Phase 2](docs/plans/phase-2-ai-control.md) (each with what changed from its plan).
 
 | Phase | Status |
 |---|---|
 | 0 Trust + foundation (auth, 5 roles, audit chain, jobs/outbox, bootstrap) | **done** |
 | 1 Policy governance + Employee/Item migration | **done** |
 | 2 AI control + Document migration | **done** |
-| 3 Retire graph record storage | **in progress** (PR 0, A1, A2, A3, B, C, D done) |
+| 3 Retire graph record storage | **built** (PR 0, A1–A3, B, C, D, E; PRs #6–#12 awaiting merge in order) |
 | 4 Ops backbone + **Temporal** | planned |
 | 5 Lifecycle (transfer, offboarding, rechecks, contractor/rehire, leave) | planned |
 | 6 HR ops platform (manager view, SLAs, escalations, appeals, analytics) | planned |
@@ -54,12 +54,13 @@ cd backend && uv run python test_core.py      # rules, validation, ingestion, co
 cd backend && uv run python test_phase0.py    # auth, permission matrix, audit chain, jobs, bootstrap
 cd backend && uv run python test_phase1.py    # rule-set versions, approvals, safe replay, rollback, parity, projection
 cd backend && uv run python test_phase2.py    # document routing, provenance, reviews, spot checks, LLM down, thresholds
-cd backend && uv run python test_phase3.py    # migration engine (freeze, cutover, drift, rollback) + API contract check
+cd backend && uv run python test_phase3.py    # migration engine, every batch, read-model enforcement/rebuild/cleanup + API contract
 ```
 - Both use throwaway databases (`azentio_test*`, plus FalkorDB graph `test`) and never touch live data.
 - Each new phase adds `test_phaseN.py`.
 - `backend/.venv/Scripts/python scripts/api_contract.py --check` diffs the response shapes of 24 read endpoints against `backend/tests_snapshots/api_contract.json` (`test_phase3` runs it). Re-capture with `--capture` only for a deliberate API change.
 - `cd backend && uv run python -m graph_migration report|drift|rollback <batch>`: the Phase 3 migration report, drift since cutover, and the rollback tool (see the cutover runbook).
+- `cd backend && uv run python -m read_model status|verify|rebuild|cleanup`: the graph read model's health, the drift repair, a full rebuild from Postgres, and the one-time cleanup of retired labels (`BGSAVE` first; see the runbook).
 - `cd backend && uv run python -m connectors.rotate_key`: re-encrypt connector secrets with the current `SECRETS_KEY` (rotation, ADR 0013). Production needs `SECRETS_KEY` once any connector has credentials; dev falls back to a built-in key.
 - `backend/.venv/Scripts/python scripts/smoke.py --base http://localhost:3000` runs headless Chrome against the running stack. For every role it signs in through the real form, checks the navigation, checks that allowed pages render and forbidden ones are gated, runs one workflow, and refreshes `docs/screenshots/`.
 - Frontend: `cd frontend && npx next typegen && npx tsc --noEmit && npx eslint app components`.
@@ -68,13 +69,14 @@ cd backend && uv run python test_phase3.py    # migration engine (freeze, cutove
 `.github/workflows/ci.yml` runs all of the above on every PR and push to `main`: `backend` (ruff, guard, the three suites, with Postgres and FalkorDB service containers), `frontend` (tsc, eslint), `smoke` (a **production build**, every role, the policy flow and rollback; screenshots as an artifact), then `images`. Images build on every run and are pushed to `ghcr.io/prateek1771/azentio-hr-{backend,frontend}:{sha,latest}` only on a push to `main`. `main` is protected: PRs need `backend`, `frontend` and `smoke` green to merge; force-pushes and deletion are blocked; the repo admin may still push directly. Nothing deploys automatically. The frontend image bakes `BACKEND_URL` in at build time (Next serialises rewrites), default `http://backend:8000`.
 
 **The boundary guard** (`scripts/check_boundaries.py`, stdlib) fails the build when:
-1. Something writes Employee/Item **properties** to the graph outside `records.py`. Relationship writes to graph-owned nodes (documents, connector records) stay allowed until Phases 2–3.
+1. Something writes Employee/Item **properties** to the graph outside `records.py`.
 2. A user-role check appears outside `identity/perms.py`, beyond the allowlisted data-scoping spots (`ROLE_ALLOWLIST`).
 3. An already-applied migration is modified, removed or renamed.
 4. `work_queue.open_item` uses a kind not registered in `work_queue.KINDS`.
 5. Code updates, deletes or truncates `audit_log`, or disables its trigger (tests excepted).
 6. Something writes `Document` nodes or their `HAS_DOC` / `SUBMITTED` / `MISMATCH` edges to the graph outside `documents/store.py`.
 7. Something bulk-sets a document item status (`set_items_status` with a `"document"` key) outside `documents/`.
+8. Cypher in `backend/` or `scripts/` writes a label outside the graph read model (`Employee`, `Item`, `Document`, `Owner`, `PolicyChunk`); in tests, any of the retired record labels. `Owner` is written only in `records.py`, `PolicyChunk` only in `chat.py`. `graph.q()` enforces the same at runtime (`ReadModelViolation`); `graph.legacy_writes()` is the opt-in for the rollback tool and old-release test setups.
 
 ## Where things live
 | Path | Owns |
@@ -86,6 +88,7 @@ cd backend && uv run python test_phase3.py    # migration engine (freeze, cutove
 | `backend/shared/bootstrap.py` | Startup steps, each safe to re-run (incl. the one-time Employee/Item migration gate and the Phase 3 graph batch cutovers) |
 | `backend/graph_migration.py` | **Phase 3 engine:** a `LabelSpec` per graph label; freeze-checked `cutover(batch)`, report, `drift_since_cutover`, `rollback(batch)`, CLI |
 | `backend/documents/` | **Documents (Phase 2).** `store` is the only read/write path for documents, mismatches and decisions (append-only `doc_decisions`); `route` is the pure policy router (`decide`, `ALWAYS_HIGH`, `backtest`) |
+| `backend/read_model.py` | **The graph read model** (Phase 3 E): `status`, the full `rebuild` (job `graph.rebuild`, `request_rebuild`), hourly `verify` drift repair, the one-time `cleanup`. Graph-backed views answer "rebuilding" while it runs |
 | `backend/records.py` | **The only way to read or write employees and checklist items.** Refreshes the graph projection in place after each write |
 | `backend/events.py`, `backend/guardrails.py`, `backend/evals.py` | **Activity events, guardrail hits and eval runs** (Postgres, Phase 3 B). `graph.event()` is the event choke point and calls `events.record` |
 | `backend/owners.py`, `backend/templates.py`, `backend/policies.py` | **The only way to read or write owners, email templates and policies** (Postgres, Phase 3 A1/A2; `chat.index_chunks` builds the `PolicyChunk` index from `policies`). Owner writes re-project graph `Owner` nodes (`records.project_owners`) |

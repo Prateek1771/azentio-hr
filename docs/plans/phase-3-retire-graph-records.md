@@ -1,6 +1,6 @@
 # Phase 3: Retire graph record storage
 
-- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config), B (activity) and C (connectors) are done; D (integrations) are done; E (read model enforcement, rebuild, cleanup) is in progress.
+- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config), B (activity) and C (connectors) are done; D (integrations) and E (an enforced, self-healing read model; cleanup) are done. Every batch is a stacked PR awaiting merge.
 - **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
 - **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
 - **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
@@ -97,8 +97,8 @@
   `normalise_rule` parses a text `compliance` cell. `graph_migration.load()` is never silently partial. Details and the
   upgrade/rollback-to-`main`/two-instance results are in the runbook's "Deep test" section.
 
-## Batch E (the read model, rebuild and cleanup): the plan, written before coding
-Status: **in progress** on branch `phase-3-e`, stacked on `phase-3-d`. Migration `017_graph_state.sql`. After D every
+## Batch E (the read model, rebuild and cleanup): the plan, written before coding, then as built
+Status: **done** on branch `phase-3-e`, stacked on `phase-3-d`. Migration `017_graph_state.sql`. After D every
 record label is in Postgres; E makes the graph a read model that is enforced, self-healing and clean.
 
 **What the graph may hold afterwards:** `Employee`, `Item`, `Document`, `Owner` (the projection) and `PolicyChunk` (the
@@ -205,6 +205,35 @@ retrieval index). Nothing else.
   - a full rollback to `main` serves everything
   - re-upgrade: the retired nodes are removed again by the self-heal
 - CI green on the PR stacked on #11.
+
+**As built** (the plan held; these are the differences and what testing found):
+- `graph.q()` checks every write: write keywords, then node-pattern and `WHERE` labels, with index DDL exempt. The
+  engine's rollback and the C secret scrub run inside `graph.legacy_writes()`; `test_phase3` opts in for its
+  old-release setups and switches it off to test.
+- **Guard rule 8:** in tests it checks only the retired-label inventory, so synthetic engine probes (`P3Probe`) stay
+  legal. The guard and the read-path scan skip the guard's own selftest samples.
+- **Bugs found while building it:**
+  - **Lost owners (from A1):** a start with owners missing from the graph re-projected the owners but never the
+    employees' `REPORTS_TO`/`OWNED_BY` edges. `seed` now re-projects everyone when owners are missing.
+  - **A rebuild in a fresh CLI process skipped documents:** the bridge state wasn't loaded, so `records.project`
+    thought the graph still owned them. `rebuild()` loads it. Found on the dev cleanup; a test now covers it.
+- **`test_phase3` E section** (148 checks in all):
+  - runtime refusal of every retired label for six write shapes, while reads, read-model writes and
+    `legacy_writes()` pass
+  - the wipe and restart: a background rebuild, 503 and "rebuilding" while it runs, then the identical projection
+    (node checksum and edges) and graph view
+  - `verify` repair, and one `ops` item on a persistent failure
+  - the cleanup refuses while a label reads the graph, and otherwise leaves only the read model
+  - an unexpected label afterwards → drift → rebuilt
+- **Dev:**
+  - the read model was `ok` before the cleanup
+  - `python -m read_model cleanup`: Document 32, Owner 8, PolicyChunk 31, Employee 11, Item 167, with no other label
+  - smoke passed
+  - a hand-run wipe (`GRAPH.DELETE hr` and start): `rebuilding`, rebuilt in about a second, the graph view identical
+- **Throwaway stack:**
+  - `main` → E (six batches), then the cleanup leaves the read model only
+  - a full rollback; `main` serves everything
+  - re-upgrade: the self-heal rebuild removed the eight retired labels again
 
 ## Batch D (integrations): the plan, written before coding, then as built
 Status: **done** on branch `phase-3-d`, stacked on `phase-3-c`. The migration file is `016_integrations.sql`,

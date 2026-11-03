@@ -25,6 +25,7 @@ import events as events_store  # noqa: E402  (the route below is named events)
 import ingest  # noqa: E402
 import owners  # noqa: E402
 import pipeline  # noqa: E402
+import read_model  # noqa: E402  (registers the graph.rebuild job)
 import policies as policies_store  # noqa: E402  (the route below is named policies)
 import records  # noqa: E402
 import templates as templates_store  # noqa: E402  (the route below is named templates)
@@ -37,14 +38,21 @@ ls.setup()
 _log = ls.get("api")
 
 
-async def _scheduler(interval: int = 30):
-    """Runs integrations whose schedule is due."""
+async def _scheduler(interval: int = 30, verify_every: int = 3600):
+    """Runs integrations whose schedule is due, and checks the graph read model hourly (read_model.verify)."""
     from integrations.engine import run_due
+    last_verify = time.monotonic()
     while True:
         try:
             await run_due()
         except Exception as e:
             ls.log_event(_log, "scheduler.error", error=type(e).__name__)
+        if time.monotonic() - last_verify >= verify_every:
+            last_verify = time.monotonic()
+            try:
+                await asyncio.to_thread(read_model.verify)
+            except Exception as e:
+                ls.log_event(_log, "scheduler.error", job="graph.verify", error=type(e).__name__)
         await asyncio.sleep(interval)
 
 
@@ -242,6 +250,8 @@ def employee_detail(eid: str):
 @app.get("/api/employees/{eid}/graph")
 def employee_graph(eid: str):
     get_emp(eid)
+    if read_model.rebuilding():  # never serve a partial projection
+        raise HTTPException(503, "The relationship view is rebuilding; try again in a moment")
     nodes, edges = {}, []
     for r in q("""MATCH (e:Employee {id:$e}) OPTIONAL MATCH (e)-[:REPORTS_TO]->(m)
                   RETURN e.id AS id, e.name AS name, m.email AS mid, m.name AS mname""", e=eid):
@@ -578,6 +588,11 @@ def ready():
         import graph_migration
         if checks["postgres"] and checks["graph"] and not all(d["ok"] for d in graph_migration.drift_since_cutover()):
             body["graph_migration"] = "drift"
+    except Exception:
+        pass
+    try:  # informational: records keep serving while the graph read model rebuilds or drifts
+        if checks["postgres"] and checks["graph"]:
+            body["graph_projection"] = read_model.summary()
     except Exception:
         pass
     from llm import unavailable_reason

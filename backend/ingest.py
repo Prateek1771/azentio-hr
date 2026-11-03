@@ -224,7 +224,14 @@ async def seed():
     if not records.employee_ids():
         import_employees("employees.csv", (SEED / "employees.csv").read_bytes())
         demo_progress()
-    if graph_lost:  # rebuild the projection (owners first, then every employee) from Postgres
+    import read_model
+    st = read_model.status()
+    rebuild = "graph lost" if graph_lost else (f"unexpected labels: {', '.join(st['unexpected_labels'])}"
+                                                if st["unexpected_labels"] else "")
+    owners_lost = st["counts"].get("Owner", 0) < len(owners.all())
+    if rebuild:  # self-heal in the background: the worker rebuilds everything from Postgres while records keep serving
+        read_model.request_rebuild(rebuild)
+    elif owners_lost:  # their REPORTS_TO / OWNED_BY edges went with them: re-project everyone, owners first
         records.rebuild_graph()
     else:  # the Owner projection follows Postgres on every start, also for a lost graph with no employees yet
         records.project_owners()
@@ -234,7 +241,7 @@ async def seed():
     if not policies.all():
         for f in sorted((SEED / "policies").glob("*.md")):
             await chat.index_policy(f.name, f.read_text(encoding="utf-8"))
-    elif not q1("MATCH (c:PolicyChunk) RETURN c LIMIT 1"):  # the index was lost (e.g. a wiped graph): rebuild it
+    elif not rebuild and not q1("MATCH (c:PolicyChunk) RETURN c LIMIT 1"):  # only the index was lost: rebuild it
         await chat.reindex_policies()
 
 

@@ -6,6 +6,7 @@ import re
 import guardrails
 import llm
 import logging_setup as ls
+import read_model
 from graph import q, new_id, event
 
 
@@ -69,6 +70,10 @@ def keyword_retrieve(question: str, k: int) -> list[dict]:
 
 
 async def retrieve(question: str, k: int = 5) -> list[dict]:
+    """Policy chunks for a question. Raises read_model.Rebuilding while the index is being rebuilt: answering without
+    sources would look like 'no policy covers this'."""
+    if read_model.rebuilding():
+        raise read_model.Rebuilding("policy search is rebuilding")
     if not llm.EMBED_MODEL:
         return keyword_retrieve(question, k)
     try:
@@ -82,6 +87,9 @@ async def retrieve(question: str, k: int = 5) -> list[dict]:
         pass
     return keyword_retrieve(question, k)
 
+
+REBUILDING = ("Policy search is rebuilding right now, so I can't look up policies for a moment. Please try again "
+              "shortly, or contact {contact}.")
 
 SYSTEM = """You are the Azentio onboarding assistant for a new employee.
 Answer ONLY from the CONTEXT below (approved policies and this employee's personal checklist).
@@ -150,7 +158,11 @@ async def answer_stream(emp: dict, items: list[dict], message: str, history: lis
     if reply := _blocked("Assistant", message, history):
         yield _sources([]) + reply
         return
-    chunks = await retrieve(message, k=4)
+    try:
+        chunks = await retrieve(message, k=4)
+    except read_model.Rebuilding:
+        yield _sources([]) + REBUILDING.format(contact="your HR partner")
+        return
     yield _sources(chunks)
     hr = next((i["owner_email"] for i in items if i["category"] == "HR" and i.get("owner_email")), "your HR partner")
     messages = [{"role": "system", "content": SYSTEM.format(hr=hr) + "\n\nCONTEXT:\n" + build_context(emp, items, chunks)},
@@ -226,7 +238,11 @@ async def hr_answer_stream(message: str, history: list[dict], focus_id: str | No
     if reply := _blocked("HR co-pilot", message, history):
         yield _sources([]) + reply
         return
-    chunks = await retrieve(message, k=4)
+    try:
+        chunks = await retrieve(message, k=4)
+    except read_model.Rebuilding:
+        yield _sources([]) + REBUILDING.format(contact="the onboarding admin")
+        return
     yield _sources(chunks)
     ctx = hr_context(message, chunks, focus_id)
     import records
