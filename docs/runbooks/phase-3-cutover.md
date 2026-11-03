@@ -58,7 +58,7 @@ restore path.**
 | Batch | Labels | Cutover (dev) | Before → after (graph / pg, sha) | Freeze | Rollback drill | Sign-off |
 |---|---|---|---|---|---|---|
 | A1 | Owner (stays as projection), EmailTemplate | 2026-11-02 03:08 UTC | Owner 8/0 → 8/8, EmailTemplate 4/0 → 4/4; sha equal | single writer, 15 s watch | pass | dev |
-| A2 | Policy (PolicyChunk stays as an index) | | | | | |
+| A2 | Policy (PolicyChunk stays as an index) | 2026-11-02 03:37 UTC | Policy 7/0 → 7/7; sha equal | single writer, 15 s watch | pass | dev |
 | A3 | Rule and Config (legacy, removed; Config moved here from A1) | | | | | |
 | B | Event, GuardrailEvent, EvalRun, EvalResult | | | | | |
 | C | Connector, ConnectorInstance, Record, links, CustomField, ImportRun, IntegrationRun (archived) | | | | | |
@@ -98,3 +98,41 @@ still a draft. Fixed in `smoke.py`; the re-run passed.)
 4. Put the dev data back (template from the seed, drill owner removed and re-projected); drift ok afterwards.
 
 **Sign-off:** dev ✓. CI on the PR covers `test_phase3` (A1 section and API contract).
+
+### A2: Policy (dev stack, 2026-11-02)
+
+**Before** (graph / Postgres): Policy 7 / 0, graph sha `7214fd3b…`; 31 `PolicyChunk` nodes (they stay). `BGSAVE` first.
+
+**Cutover** at startup, 03:37:03 UTC:
+
+| Label | source | graph | pg | parity | unmapped keys | read paths left | drift since cutover |
+|---|---|---|---|---|---|---|---|
+| Policy | postgres | 7 | 7 | ok | none | none | ok |
+
+**Freeze evidence** (after the drill's re-cutover): `single_writer: true`, `watched_seconds: 15`,
+`recent_stopped_heartbeats: ["DESKTOP-968RPED:23400"]` (the instance stopped for the drill).
+
+**Feature smoke:** `scripts/smoke.py` passes for every role. Through the app (HR Ops): a policy upload on `/api/ingest`
+lands in `policies` and `/api/policies`, with no new `Policy` node in the graph. `chat.retrieve("drill parking allowance")`
+returns `a2-drill-policy.md § Drill section` first. The portal shows the policy text on E1001's acknowledgement items
+(`infosec_ack`, `coc_ack`; `nda_ack` has no `policy_ref` in the seed rules, as before).
+
+**Rollback drill:**
+1. Uploaded `a2-drill-policy.md` through the app.
+2. Stopped the backend and ran `graph_migration rollback A2`: Policy ok 8 / 8, checksums equal, and the drill policy is a
+   graph node again.
+3. Restarted: cut over again at 03:38:23 UTC, 8 / 8, parity ok, drift ok.
+4. Removed the drill policy from `policies` and its chunks. Its stale graph node stays until PR E's cleanup, so drift
+   stays ok.
+
+**Sign-off:** dev ✓. CI on the PR covers `test_phase3` (A2 section and API contract).
+
+### Fresh install and wiped graph (throwaway stack, 2026-11-02)
+Run on a separate database and graph (`azentio_fresh` / `fresh`, port 8001, Gmail off), after A2:
+- **Fresh install:** A1 and A2 cut over on empty stores (0 / 0). The seed then wrote 8 owners, 4 templates and 7 policies to
+  Postgres, projected 8 `Owner` nodes and built 31 `PolicyChunk` nodes, with no `EmailTemplate` or `Policy` nodes. 22 API and
+  state checks passed: role gates, the audited template save, and quick onboard picking the manager from `owners`.
+- **Wiped graph:** edited a template, an owner and a joiner's name, stopped, ran `GRAPH.DELETE fresh`, and restarted.
+  Every edit survived. The projection was rebuilt from Postgres (7 employees, 101 items, 20 documents, matching
+  `HAS_DOC`/`SUBMITTED` and `REPORTS_TO` edges), the index was rebuilt (31 chunks), drift was ok, and the same 22
+  checks passed. Before the seed fix, this reset all three edits to the seed values.

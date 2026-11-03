@@ -241,6 +241,75 @@ res = gm.cutover("A1", watch=0)
 check("a1_cutover_again_after_rollback", all(r["ok"] for r in res["labels"]) and bridge.SOURCE[TPL] == "postgres"
       and len(templates.all()) == 3 and len(owners.all()) == 4)
 
+# ---------- batch A2: Policy (retired from the graph); PolicyChunk stays as an index rebuilt from Postgres ----------
+import asyncio  # noqa: E402
+import chat  # noqa: E402
+import policies  # noqa: E402
+
+POL, CHUNK = "Policy", "PolicyChunk"
+db.execute("DELETE FROM bridge_state WHERE record_type='Policy'")
+db.execute("TRUNCATE policies")
+q(f"MATCH (n:{POL}) DETACH DELETE n")
+q(f"MATCH (n:{CHUNK}) DETACH DELETE n")
+NOTICE = "# Exit policy\n\n## Notice period\nThe notice period is 30 days.\n\n## Handover\nHand over your laptop.\n"
+q(f"CREATE (p:{POL} {{source:'exit.md', title:'Exit policy', text:$t}})", t=NOTICE)
+q(f"CREATE (p:{POL} {{source:'coc.md', title:'Code of conduct', text:'# Code of conduct\n\n## Respect\nBe kind.'}})")
+
+check("a2_has_no_graph_read_paths_left", gm.read_paths(POL) == [], gm.read_paths(POL))
+res = gm.cutover("A2", watch=0)
+check("a2_cutover_clean", res["labels"][0]["ok"] and res["labels"][0]["pg_count"] == 2
+      and bridge.SOURCE[POL] == "postgres", res["labels"])
+check("a2_policies_read_from_postgres", [p["source"] for p in policies.all()] == ["coc.md", "exit.md"]
+      and policies.texts()["exit.md"] == NOTICE)
+
+asyncio.run(chat.index_policy("leave.md", "# Leave policy\n\n## Annual leave\nYou get 20 days of annual leave.\n"))
+check("a2_index_writes_table_and_chunks_not_policy_nodes", policies.texts().get("leave.md")
+      and q(f"MATCH (c:{CHUNK} {{source:'leave.md'}}) RETURN count(c) AS n")[0]["n"] == 1
+      and not q(f"MATCH (p:{POL} {{source:'leave.md'}}) RETURN p"))
+check("a2_no_drift_after_upload", [d for d in gm.drift_since_cutover() if d["label"] == POL][0]["ok"])
+q(f"MATCH (p:{POL} {{source:'coc.md'}}) SET p.text = 'stray'")
+check("a2_drift_catches_a_stray_policy_write", not [d for d in gm.drift_since_cutover() if d["label"] == POL][0]["ok"])
+q(f"MATCH (p:{POL} {{source:'coc.md'}}) SET p.text = '# Code of conduct\n\n## Respect\nBe kind.'")
+
+asyncio.run(chat.reindex_policies())  # chunks for every row: exit.md (2), coc.md (1), leave.md (1)
+before = [(c["source"], c["section"]) for c in chat.keyword_retrieve("notice period days", 2)]
+q(f"MATCH (c:{CHUNK}) DELETE c")
+check("a2_wiped_index_retrieves_nothing", chat.keyword_retrieve("notice period days", 2) == [])
+n = asyncio.run(chat.reindex_policies())
+after = [(c["source"], c["section"]) for c in chat.keyword_retrieve("notice period days", 2)]
+check("a2_reindex_rebuilds_from_postgres", n == 3 and after == before and after[0] == ("exit.md", "Notice period")
+      and q(f"MATCH (c:{CHUNK}) RETURN count(c) AS n")[0]["n"] == 4, (before, after))
+
+rb = gm.rollback("A2", watch=0)
+check("a2_rollback_writes_new_rows_back", rb["labels"][0]["ok"] and bridge.SOURCE[POL] == "graph"
+      and q(f"MATCH (p:{POL} {{source:'leave.md'}}) RETURN p.title AS t")[0]["t"] == "Leave policy", rb)
+res = gm.cutover("A2", watch=0)
+check("a2_cutover_again_after_rollback", res["labels"][0]["ok"] and res["labels"][0]["pg_count"] == 3
+      and bridge.SOURCE[POL] == "postgres")
+
+# ---------- a lost graph never re-seeds over Postgres; the projection and the index are rebuilt from it ----------
+import ingest  # noqa: E402
+
+records.save_employee({"id": "E9001", "name": "Kept Name", "email": "kept@x.com", "role": "Engineer", "grade": "L2",
+                       "department": "Engineering", "location": "Bengaluru", "manager_email": "mgr.eng@x.com",
+                       "joining_date": "2026-12-01", "token": "tok-e9001", "thread_id": ""})
+templates.upsert({**templates.get("intern"), "subject": "HR edit"})
+owners.upsert([{"email": "it@x.com", "name": "HR renamed desk", "department": "IT", "type": "owner:IT"}])
+counts = {t: db.fetch1(f"SELECT count(*) AS n FROM {t}")["n"] for t in ("owners", "email_templates", "policies", "employees")}
+q("MATCH (n) DETACH DELETE n")  # the graph is lost
+asyncio.run(ingest.seed())
+check("wiped_graph_keeps_hr_edits", templates.get("intern")["subject"] == "HR edit"
+      and owners.get("it@x.com")["name"] == "HR renamed desk" and records.employee("E9001")["name"] == "Kept Name")
+check("wiped_graph_seeds_nothing_over_postgres",
+      counts == {t: db.fetch1(f"SELECT count(*) AS n FROM {t}")["n"] for t in counts}, counts)
+check("wiped_graph_rebuilds_the_projection",
+      q(f"MATCH (:Employee {{id:'E9001'}})-[:REPORTS_TO]->(o:{OWN}) RETURN o.email AS e") == [{"e": "mgr.eng@x.com"}]
+      and q(f"MATCH (o:{OWN}) RETURN count(o) AS n")[0]["n"] == counts["owners"],
+      (q("MATCH (e:Employee) RETURN e.id AS i, e.manager_email AS m"), q(f"MATCH (o:{OWN}) RETURN o.email AS e"), counts))
+check("wiped_graph_rebuilds_the_policy_index",
+      q(f"MATCH (c:{CHUNK}) RETURN count(DISTINCT c.source) AS n")[0]["n"] == counts["policies"])
+check("no_drift_after_the_rebuild", all(d["ok"] for d in gm.drift_since_cutover() if d["label"] == OWN))
+
 # ---------- API contract ----------
 out = subprocess.run([sys.executable, str(ROOT / "scripts" / "api_contract.py"), "--check"], capture_output=True, text=True)
 check("api_contract_unchanged", out.returncode == 0, out.stdout[-3000:] + out.stderr[-3000:])

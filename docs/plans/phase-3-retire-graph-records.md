@@ -1,6 +1,6 @@
 # Phase 3: Retire graph record storage
 
-- **Status:** in progress. PR 0 (tooling) and batch A1 (owners, email templates) are done; A2 → E follow, one PR each.
+- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates) and A2 (policies) are done; A3 → E follow, one PR each.
 - **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
 - **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
 - **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
@@ -52,6 +52,25 @@
   `by_category`, `gmail.render`), the projection following app writes, drift on a stray template write and on an
   out-of-step projection, `rebuild_graph` repairing it, then rollback (the new rows reach the graph) and a second cutover.
 - Dev cutover, freeze and rollback drill: see the runbook's A1 section.
+
+## As built: batch A2 (policies)
+- Migration `012_policies.sql`: `policies (source PK, title, text)`, exactly the old graph properties (contract unchanged).
+- `policies.py` (`all`, `texts`, `upsert`, `title_of`) is the only reader and writer, and registers the `Policy` spec.
+- `chat.index_policy` stores the upload in `policies`, then `index_chunks` rebuilds that file's `PolicyChunk` nodes (the
+  old chunk/embed code, unchanged). It no longer writes `Policy` nodes; the stale ones go in PR E's cleanup.
+- `chat.reindex_policies()` rebuilds the whole index from the table. `ingest.seed` calls it when `policies` has rows
+  but the graph has no chunks, so a wiped graph heals its index on restart. PR E's `rebuild_graph` will call it too.
+- `/api/policies` and the portal's acknowledgement text read the table.
+- `test_phase3` A2 section: cutover, reads, an upload that writes the table and chunks but no `Policy` node, drift on a
+  stray write, a wiped index rebuilt with the same retrieval results, then rollback and a second cutover.
+- **Found in depth testing: a wiped graph re-seeded over Postgres.** `ingest.seed` decided "first run" from a graph
+  `Config` node. Once the graph stopped being the record, losing the graph reset HR's edited templates and owners
+  (A1) and the seeded joiners' fields (since Phase 1) to the seed files. Now each record type is seeded only when its
+  Postgres table is empty, rules only when there's no active version. A lost graph is detected *before* anything
+  writes (a rule replay would project single employees and hide the loss), and the projection is rebuilt instead.
+  `test_phase3` "wiped graph" section: HR edits kept, nothing re-seeded, `REPORTS_TO`→`Owner` and the policy index
+  rebuilt, no drift. This was also run end to end on a throwaway instance: fresh install, then edits, a
+  `GRAPH.DELETE`, and a restart. All 7 employees, 101 items, 20 documents and their edges came back from Postgres.
 
 ## The approved plan
 

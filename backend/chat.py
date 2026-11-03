@@ -29,9 +29,24 @@ async def embed(texts: list[str]) -> list[list[float]]:
 
 
 async def index_policy(source: str, text: str):
+    """Store an uploaded policy (Postgres is the record), then rebuild its retrieval chunks."""
+    import policies
+    policies.upsert(source, text)
+    await index_chunks(source, text)
+
+
+async def reindex_policies() -> int:
+    """Rebuild the whole PolicyChunk index from the policies table (the graph is a recoverable index)."""
+    import policies
+    rows = policies.all()
+    q("MATCH (c:PolicyChunk) DELETE c")
+    for p in rows:
+        await index_chunks(p["source"], p["text"])
+    return len(rows)
+
+
+async def index_chunks(source: str, text: str):
     q("MATCH (c:PolicyChunk {source:$s}) DELETE c", s=source)
-    q("MERGE (p:Policy {source:$s}) SET p.text=$t, p.title=$title", s=source, t=text,
-      title=next((l[2:].strip() for l in text.splitlines() if l.startswith("# ")), source))
     chunks = chunk_markdown(source, text)
     try:
         vecs = await embed([c["text"] for c in chunks])
