@@ -1,6 +1,6 @@
 # Phase 3: Retire graph record storage
 
-- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config), B (activity) and C (connectors) are done; D (integrations) are done; E (read model and cleanup) follows.
+- **Status:** in progress. PR 0 (tooling), A1 (owners, email templates), A2 (policies), A3 (rules, config), B (activity) and C (connectors) are done; D (integrations) are done; E (read model enforcement, rebuild, cleanup) is in progress.
 - **Depends on:** Phases 0–2 (Employee, Item, Rule and Document are in Postgres).
 - **Branches:** `phase-3-pr0-tooling`, then `phase-3-<batch>` per batch.
 - **Cutover checklist and results:** [docs/runbooks/phase-3-cutover.md](../runbooks/phase-3-cutover.md).
@@ -96,6 +96,115 @@
   `Owner` projection. A projection label's cutover rebuilds the projection once. An emptied retired label isn't drift.
   `normalise_rule` parses a text `compliance` cell. `graph_migration.load()` is never silently partial. Details and the
   upgrade/rollback-to-`main`/two-instance results are in the runbook's "Deep test" section.
+
+## Batch E (the read model, rebuild and cleanup): the plan, written before coding
+Status: **in progress** on branch `phase-3-e`, stacked on `phase-3-d`. Migration `017_graph_state.sql`. After D every
+record label is in Postgres; E makes the graph a read model that is enforced, self-healing and clean.
+
+**What the graph may hold afterwards:** `Employee`, `Item`, `Document`, `Owner` (the projection) and `PolicyChunk` (the
+retrieval index). Nothing else.
+
+### 1. Enforcement
+- **Runtime (`graph.q`):**
+  - A query that writes (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) and names any label outside the read model
+    raises `ReadModelViolation`. Labels are found in node patterns and `WHERE` label tests, the same parsing as the
+    read-path scan.
+  - Reads are untouched.
+  - **Legitimate legacy writers** opt in with `graph.legacy_writes()`: the rollback tool, the batch C secret scrub, and
+    test setups that recreate an old release's nodes.
+- **Static (guard rule 8):**
+  - No Cypher string anywhere in `backend/` or `scripts/` may write a label outside the read model.
+  - `Owner` may be written only in `records.py`; `PolicyChunk` only in `chat.py`. `Employee`/`Item` and `Document`
+    keep rules 1 and 6.
+  - The selftest has a bad snippet for each case.
+
+### 2. The read-model state and rebuild (`read_model.py`, new)
+- `graph_state` (one row): `state` (`ready` or `rebuilding`), `reason`, `started_at`, `finished_at`, `cleaned_at`,
+  `report`.
+- **`rebuild()`, the full rebuild:**
+  1. Sets `rebuilding` and wipes the graph (`MATCH (n) DETACH DELETE n`).
+  2. Recreates the indexes and projects owners, then every employee (with items and documents).
+  3. Re-indexes `PolicyChunk` from `policies`.
+  4. Sets `ready` with per-label counts.
+  - It runs as the job `graph.rebuild`. `request_rebuild(reason)` sets `rebuilding` and enqueues it once (it's a no-op
+    while a rebuild is pending).
+- **No partial projection is served:**
+  - While `rebuilding`, `GET /api/employees/{id}/graph` returns 503 "The relationship view is rebuilding; try again in
+    a moment".
+  - Policy retrieval raises `Rebuilding`, and the assistants answer "policy search is rebuilding" instead of answering
+    without sources.
+  - Records and every other page are unaffected.
+- **Self-heal at startup:** `ingest.seed` stops rebuilding inline. A lost graph (employees in Postgres, no `Employee`
+  node) or, after the cleanup, an unexpected label calls `request_rebuild`. The worker runs the job once the app is
+  serving.
+- **`status()`:**
+  - the state
+  - graph label counts against what Postgres says they should be (employees, items, owners, policy sources)
+  - unexpected labels (checked only after the cleanup)
+  - `ok`
+- `/ready` gains `graph_projection: ok | rebuilding | drift (…)`. It's informational and never a 503: records still
+  serve.
+
+### 3. Drift repair (`read_model.verify()`, hourly from the scheduler)
+- **Skipped** while a rebuild is running.
+- **Lost graph or unexpected labels:** `request_rebuild`.
+- **Otherwise, per employee:** a missing `Employee` node or an item count that differs from Postgres means that
+  employee is re-projected (`records.rebuild_graph(eid)`), then re-checked.
+- **If drift persists:** exactly one `ops` work item, deduped by `graph.drift`.
+- The test forces the re-projection to fail and expects one item, even after two `verify` runs.
+
+### 4. Cleanup (an explicit, one-time step: `python -m read_model cleanup`)
+- **Refuses** unless:
+  - every registered label is `postgres`
+  - the legacy `AuditLog` rows are already in `audit_log` (the Phase 0 import ran)
+- **Then:**
+  1. Records `cleaned_at`.
+  2. Runs the full rebuild synchronously (the wipe removes every retired node and `AuditLog`).
+  3. Checks that the label scan shows only the read model.
+- **Runbook:** `BGSAVE` first. That snapshot plus `graph_migration rollback` stays the rollback point.
+- **After the cleanup:** a retired label reappearing (for example, a rollback followed by a re-upgrade) is treated as
+  unexpected, and the self-heal rebuild removes it again.
+
+### Tests (`test_phase3` E section)
+- **Enforcement:**
+  - `q()` refuses a write of every retired label (create, merge, set, delete, remove)
+  - read-model writes and reads of retired labels pass
+  - `legacy_writes()` allows them
+- **Wipe and restart:**
+  1. Snapshot the counts and a projection checksum (Employee, Item, Owner, Document properties; PolicyChunk sources).
+  2. Wipe the graph, then run `seed`.
+  3. Check `rebuilding`: the graph view 503s and retrieval says rebuilding.
+  4. Run the job.
+  5. Check `status().ok`, equal counts and checksum, chunks retrieved, and the graph view equal to before.
+- **Drift repair:**
+  - an employee's items deleted from the graph are re-projected by `verify`
+  - a forced failure gives exactly one `ops` item
+- **Cleanup:**
+  - refuses while a label is still on the graph
+  - otherwise removes every retired node and `AuditLog`, leaving the label scan at the read model only
+  - an unexpected node afterwards → `status` drift → `verify` → rebuild → gone
+  - drift since cutover stays ok (emptied labels)
+- The existing wiped-graph checks move to the job.
+- The API contract is unchanged.
+
+### Docs
+- The runbook E section: cleanup, the hand-run wipe drill, and rollback after cleanup.
+- LLD §12.4 / §4.2: the read model and its enforcement.
+- ADR 0006 updated (enforced, self-healing).
+- AGENTS.md: guard rule 8, runtime enforcement, the cleanup command, and Phase 3 status.
+
+### Gate
+- ruff, the guard and its selftest, every suite, smoke.
+- **Dev:**
+  - `BGSAVE`, `python -m read_model cleanup`, restart
+  - the label scan shows only the read model, and the app works
+  - the hand-run drill: stop, `GRAPH.DELETE hr`, start; the rebuild job restores counts, the graph view and policy
+    retrieval
+- **Throwaway stack:**
+  - `main` → E, then the cleanup
+  - a full rollback to `main` serves everything
+  - re-upgrade: the retired nodes are removed again by the self-heal
+- CI green on the PR stacked on #11.
 
 ## Batch D (integrations): the plan, written before coding, then as built
 Status: **done** on branch `phase-3-d`, stacked on `phase-3-c`. The migration file is `016_integrations.sql`,
