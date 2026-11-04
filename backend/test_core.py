@@ -96,7 +96,10 @@ assert _G.name == "test", "test_core must run on the test graph"
 from connectors.seed import seed_connectors  # noqa: E402
 import checklist as _cl  # noqa: E402
 ensure_indexes()
-gq("MERGE (c:Config {key:'departments'}) SET c.value=$v", v=json.dumps(cfg["departments"]))
+import ingest as _ingest  # noqa: E402
+from policy import store as _pstore  # noqa: E402
+if not _pstore.active_version():  # the rule set (and its config: departments, locations, doc types, roles) is v1
+    _ingest.import_requirements("requirements.json", (Path(__file__).parent / "seed" / "requirements.json").read_bytes())
 seed_connectors()
 hr_id = gq1("MATCH (i:ConnectorInstance {key:'hr_portal'}) RETURN i.id AS id")["id"]
 hr = HrPortal()
@@ -168,18 +171,12 @@ from integrations.store import SetupError  # noqa: E402
 gq("MATCH (n) WHERE n:Employee OR n:Item DETACH DELETE n")
 gq("MATCH (r:Record)-[:IN]->(:ConnectorInstance)-[:OF]->(:Connector {role:'app'}) DETACH DELETE r")
 gq("MATCH (n) WHERE n:Integration OR n:IntegrationCandidate OR n:WorkflowRun OR n:IntegrationLogRecord OR n:AgentMessage OR n:OutboundMessage DETACH DELETE n")
-gq("MERGE (c:Config {key:'locations'}) SET c.value=$v", v=json.dumps(cfg["locations"]))
-gq("MERGE (c:Config {key:'doc_types'}) SET c.value=$v", v=json.dumps(cfg["doc_types"]))
-gq("MERGE (c:Config {key:'roles'}) SET c.value=$v", v=json.dumps(cfg["roles"]))
-import ingest as _ingest  # noqa: E402
 import tempfile  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
 from documents import service as _docsvc  # noqa: E402
 from documents.seed import accept_for_demo  # noqa: E402
 
 _docsvc.UPLOADS = _Path(tempfile.mkdtemp(prefix="azentio-core-"))  # demo documents never land in the real uploads folder
-if not gq1("MATCH (r:Rule) RETURN r LIMIT 1"):
-    _ingest.import_requirements("requirements.json", (Path(__file__).parent / "seed" / "requirements.json").read_bytes())
 import owners as _owners  # noqa: E402
 if not _owners.emails("manager"):
     _ingest.import_owners("owners.csv", (Path(__file__).parent / "seed" / "owners.csv").read_bytes())

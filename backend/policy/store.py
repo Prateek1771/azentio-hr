@@ -38,7 +38,14 @@ def normalise_rule(r: dict) -> dict:
     return {"id": str(r["id"]).strip(), "item": str(r["item"]).strip(), "name": r.get("name") or "",
             "kind": r["kind"], "category": r["category"], "match": match, "offset_days": int(r.get("offset_days") or 0),
             "depends_on": list(deps), "description": r["description"], "policy_ref": r.get("policy_ref") or "",
-            "auto": r.get("auto") or "", "compliance": bool(r.get("compliance"))}
+            "auto": r.get("auto") or "", "compliance": _flag(r.get("compliance"))}
+
+
+def _flag(v) -> bool:
+    """A CSV cell is text: "false", "no", "0" and "" are False."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "yes", "y", "1")
+    return bool(v)
 
 
 # ---------- reads ----------
@@ -227,35 +234,3 @@ def touches_compliance(d: dict, old: list[dict], new: list[dict]) -> bool:
     comp = {r["id"] for r in old + new if r.get("compliance")}
     ids = {r["id"] for r in d["added"]} | {r["id"] for r in d["removed"]} | {c["id"] for c in d["changed"]}
     return bool(ids & comp)
-
-
-# ---------- v1 from the legacy graph ----------
-
-def ensure_active() -> dict | None:
-    """Create v1 (active, authored by system) from the graph's Rule nodes + Config if no version exists yet.
-    This is the one-time migration of rules: the active version matches the old behaviour exactly."""
-    act = active_version()
-    if act:
-        return act
-    from graph import q, q1
-    rules = []
-    for row in q("MATCH (r:Rule) RETURN r ORDER BY r.ord"):
-        r = row["r"]
-        rules.append({**r, "match": json.loads(r.get("match") or "{}"), "depends_on": list(r.get("depends_on") or []),
-                      "compliance": r["id"] in COMPLIANCE_DEFAULT})
-    if not rules:
-        return None  # nothing seeded yet; v1 is created on the first read after seeding
-    config = {}
-    for k in CONFIG_KEYS:
-        row = q1("MATCH (c:Config {key:$k}) RETURN c.value AS v", k=k)
-        config[k] = json.loads(row["v"]) if row else ({} if k in ("doc_types", "locations") else [])
-    with db.tx() as c:
-        c.execute("SELECT pg_advisory_xact_lock(7243010)")
-        if active_version(conn=c):
-            return active_version(conn=c)
-        create_version("active", "Initial rule set (migrated)", config, rules, None, c,
-                       reason="Created from the rules and configuration in use before versioning")
-        import audit
-        audit.record_audit("policy.published", "rule_set_version", "v1",
-                           f"Rule set v1 created from {len(rules)} existing rules", actor="system", conn=c)
-    return active_version()

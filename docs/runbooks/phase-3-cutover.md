@@ -136,3 +136,32 @@ Run on a separate database and graph (`azentio_fresh` / `fresh`, port 8001, Gmai
   Every edit survived. The projection was rebuilt from Postgres (7 employees, 101 items, 20 documents, matching
   `HAS_DOC`/`SUBMITTED` and `REPORTS_TO` edges), the index was rebuilt (31 chunks), drift was ok, and the same 22
   checks passed. Before the seed fix, this reset all three edits to the seed values.
+
+### Deep test of A1 + A2 + A3 together (throwaway stack, 2026-11-02)
+Database `azentio_deep`, graph `deep`; the previous release ran from a `main` worktree.
+
+| Step | Result |
+|---|---|
+| Baseline: ruff, guard + selftest, `test_core`, `test_phase0..3`, `tsc`, `eslint` | pass |
+| Upgrade `main` → A3 with HR edits made on `main` (template, mixed-case owner email, policy) | A1, A2, A3 cut over in one start, before the worker; parity, schema and read paths clean; edits served; new joiner `REPORTS_TO` the `main`-era owner; retrieval finds the `main`-era policy |
+| Writes on the new release (template, owner, policy, a two-approver rule version published) | pass |
+| Full rollback (`rollback A3`, `A2`, `A1`), then start `main` on the same data | each rollback at parity; `main` serves every new-release edit and rule set v2 |
+| Re-upgrade after an edit on `main` | clean second cutover of all three; the edit carried over |
+| Two instances started at once | one cut over; the other refused ("another instance is cutting over… nothing was switched"); restarted, it found nothing pending |
+| Wiped graph after an upgrade | edits kept, projection rebuilt, no false drift |
+| Dev stack: `smoke.py`, drift, `/ready` | pass |
+
+**Independent review:** 8 findings; 7 fixed with regression tests in `test_phase3`, 1 noted:
+1. An upgrade from before rule-set versions would have published the sample rules over HR's own: `seed_rules` now
+   builds v1 from the archived graph rules (`policy.legacy.archived_requirements`).
+2. A lost graph with no employees never re-projected owners: every start now refreshes the `Owner` projection.
+3. A legacy mixed-case `Owner` node passed parity (case-folded), and the next owner write would drop it and its
+   edges: a projection label's cutover now rebuilds the projection once.
+4. A wiped graph reported drift on retired labels forever: an emptied retired label isn't drift.
+5. A CSV `compliance` cell of "false", "no" or "0" counted as true: it's parsed as text now.
+6. Noted, not changed: an owner import commits, then refreshes the graph. With FalkorDB down it returns 500 after
+   saving. That's the same pattern as every employee write; the next start's owner refresh heals the projection.
+7. One failing spec module left a silently partial registry: `load()` now marks itself loaded only after every module
+   imports.
+8. The loser of a first-run import race reported rows imported and re-ran checklists: it now returns `imported: 0` and
+   does nothing.

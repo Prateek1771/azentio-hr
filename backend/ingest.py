@@ -13,7 +13,7 @@ import checklist
 import owners
 import records
 import templates
-from graph import q, q1, event
+from graph import q1, event
 
 SEED = Path(__file__).parent / "seed"
 EMP_REQUIRED = ["name", "email", "role", "grade", "department", "location", "manager_email", "joining_date"]
@@ -129,32 +129,10 @@ def import_owners(filename: str, data: bytes) -> dict:
     return {"kind": "owners", "total": len(rows), "imported": n, "errors": errors}
 
 
-def import_requirements(filename: str, data: bytes) -> dict:
-    obj = json.loads(data) if filename.endswith(".json") else {"rules": read_table(filename, data)}
-    for key in ("departments", "locations", "doc_types", "roles"):
-        if key in obj:
-            q("MERGE (c:Config {key:$k}) SET c.value=$v", k=key, v=json.dumps(obj[key]))
-    errors = []
-    rules = obj.get("rules", [])
-    for i, r in enumerate(rules, start=1):
-        if isinstance(r.get("match"), str):
-            r["match"] = json.loads(r["match"] or "{}")
-        if isinstance(r.get("depends_on"), str):
-            r["depends_on"] = [d.strip() for d in r["depends_on"].split(",") if d.strip()]
-        miss = [f for f in ("id", "item", "kind", "category", "description") if not r.get(f)]
-        if miss:
-            errors += [{"row": i, "field": f, "message": "Missing mandatory field", "name": r.get("id", "")} for f in miss]
-            continue
-        save_rule(r, ord_=i)
-    for eid in records.employee_ids():
-        checklist.regenerate(eid, "requirements updated")
-    return {"kind": "requirements", "total": len(rules), "imported": len(rules) - len({e['row'] for e in errors}), "errors": errors}
-
-
-def import_requirements_draft(filename: str, data: bytes, user: dict) -> dict:
-    """An uploaded requirements file becomes a draft rule set (it reaches joiners only once approved and published)."""
+def _parse_requirements(filename: str, data: bytes) -> tuple[dict, list[dict], list[dict]]:
+    """A requirements file (JSON with rules + config, or a rules table) -> (file object, normalised rules, row errors).
+    `compliance` defaults to store.COMPLIANCE_DEFAULT unless the row sets it, so re-importing a file keeps the flags."""
     from policy import store
-    from shared import db
     obj = json.loads(data) if filename.endswith(".json") else {"rules": read_table(filename, data)}
     errors, rules = [], []
     for i, r in enumerate(obj.get("rules", []), start=1):
@@ -162,10 +140,51 @@ def import_requirements_draft(filename: str, data: bytes, user: dict) -> dict:
         if miss:
             errors += [{"row": i, "field": f, "message": "Missing mandatory field", "name": r.get("id", "")} for f in miss]
             continue
+        if str(r.get("compliance") or "").strip() == "":
+            r = {**r, "compliance": str(r["id"]).strip() in store.COMPLIANCE_DEFAULT}
         rules.append(store.normalise_rule(r))
+    return obj, rules, errors
+
+
+def import_requirements(filename: str, data: bytes, user: dict | None = None) -> dict:
+    """The one way a requirements file enters the system (ADR 0009). With no active rule set yet (a fresh install), it
+    becomes v1 directly, authored by `user` or the system. Once one is active, it opens a governed draft instead: it
+    reaches joiners only after approval and publishing."""
+    from policy import store
+    from shared import db
+    if store.active_version():
+        if not user:
+            raise ValueError("A rule set is already active: upload requirements on the import page to open a draft.")
+        return import_requirements_draft(filename, data, user)
+    obj, rules, errors = _parse_requirements(filename, data)
+    config = {k: obj.get(k, {} if k in ("doc_types", "locations", "doc_policy") else []) for k in store.CONFIG_KEYS}
+    created = False
+    with db.tx() as c:
+        c.execute("SELECT pg_advisory_xact_lock(7243010)")  # one v1, even if two starts race
+        if not store.active_version(conn=c):
+            created = True
+            store.create_version("active", f"Initial rule set (imported from {filename})", config, rules,
+                                 user["id"] if user else None, c, reason="First rule set on a new install")
+            import audit
+            audit.record_audit("policy.published", "rule_set_version", "v1",
+                               f"Rule set v1 created from {len(rules)} imported rules",
+                               actor="HR" if user else "system", conn=c)
+    if not created:  # another starter won the race: its v1 stands, nothing was imported here
+        return {"kind": "requirements", "total": len(obj.get("rules", [])), "imported": 0, "errors": errors,
+                "message": "A rule set became active meanwhile; nothing imported."}
+    for eid in records.employee_ids():
+        checklist.regenerate(eid, "requirements updated")
+    return {"kind": "requirements", "total": len(obj.get("rules", [])), "imported": len(rules), "errors": errors}
+
+
+def import_requirements_draft(filename: str, data: bytes, user: dict) -> dict:
+    """An uploaded requirements file becomes a draft rule set (it reaches joiners only once approved and published)."""
+    from policy import store
+    from shared import db
+    obj, rules, errors = _parse_requirements(filename, data)
     if store.open_version():
         raise ValueError("A rule-set draft is already open. Finish or discard it before importing requirements.")
-    act = store.ensure_active()
+    act = store.active_version()
     config = {**(act["config"] if act else {}), **{k: obj[k] for k in store.CONFIG_KEYS if k in obj}}
     with db.tx() as c:
         vid = store.create_version("draft", f"Imported from {filename}", config, rules, user["id"], c,
@@ -176,14 +195,16 @@ def import_requirements_draft(filename: str, data: bytes, user: dict) -> dict:
             "message": f"Saved as draft v{num}. Preview its impact and submit it for approval under Requirement rules."}
 
 
-def save_rule(r: dict, ord_: int | None = None):
-    p = {"id": r["id"], "item": r["item"], "name": r.get("name", ""), "kind": r["kind"], "category": r["category"],
-         "match": json.dumps(r.get("match") or {}), "offset_days": int(r.get("offset_days") or 0),
-         "depends_on": list(r.get("depends_on") or []), "description": r["description"],
-         "policy_ref": r.get("policy_ref", ""), "auto": r.get("auto", "")}
-    if ord_ is not None:
-        p["ord"] = ord_
-    q("MERGE (r:Rule {id:$id}) SET r += $p", id=r["id"], p=p)
+def seed_rules() -> dict | None:
+    """The first rule set, if there's none yet: HR's own archived graph rules on an upgrade from before rule-set
+    versions (what `ensure_active` used to build v1 from), otherwise the sample file. None if one is already active."""
+    from policy import legacy, store
+    if store.active_version():
+        return None
+    archived = legacy.archived_requirements()
+    if archived:
+        return import_requirements("legacy-graph-rules.json", json.dumps(archived).encode())
+    return import_requirements("requirements.json", (SEED / "requirements.json").read_bytes())
 
 
 async def seed():
@@ -191,12 +212,10 @@ async def seed():
     alone (lost or wiped) must never re-seed over HR's data. It rebuilds the projection instead."""
     import chat
     from graph import ensure_indexes
-    from policy import store
     ensure_indexes()
     # Decided before anything below writes: a replay would project single employees and hide the loss.
     graph_lost = bool(records.employee_ids()) and not q1("MATCH (e:Employee) RETURN e LIMIT 1")
-    if not store.active_version() and not q1("MATCH (c:Config {key:'doc_types'}) RETURN c"):
-        import_requirements("requirements.json", (SEED / "requirements.json").read_bytes())  # ponytail: graph rules until A3
+    seed_rules()
     if not owners.all():
         import_owners("owners.csv", (SEED / "owners.csv").read_bytes())
     if not templates.all():
@@ -205,13 +224,12 @@ async def seed():
     if not records.employee_ids():
         import_employees("employees.csv", (SEED / "employees.csv").read_bytes())
         demo_progress()
-    elif graph_lost:  # rebuild the projection (owners first, then every employee) from Postgres
+    if graph_lost:  # rebuild the projection (owners first, then every employee) from Postgres
         records.rebuild_graph()
+    else:  # the Owner projection follows Postgres on every start, also for a lost graph with no employees yet
+        records.project_owners()
     from connectors.seed import seed_connectors
     seed_connectors()
-    if not q1("MATCH (c:Config {key:'roles'}) RETURN c"):  # top-up for graphs seeded before roles existed
-        roles = json.loads((SEED / "requirements.json").read_text(encoding="utf-8"))["roles"]
-        q("MERGE (c:Config {key:'roles'}) SET c.value=$v", v=json.dumps(roles))
     import policies
     if not policies.all():
         for f in sorted((SEED / "policies").glob("*.md")):
